@@ -655,6 +655,91 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
   });
 
+  const sshExecTool = tool({
+    name: "ssh_exec",
+    description: text`
+      Executes a command on a remote machine via SSH (password-based auth).
+      Returns exit code, stdout, stderr. Requires sshpass to be installed.
+      Use for remote server management, checking remote services, or running commands
+      on machines that aren't directly accessible.
+    `,
+    parameters: {
+      host: z.string().min(1).describe("Remote host IP or hostname"),
+      user: z.string().min(1).describe("SSH username"),
+      password: z.string().min(1).describe("SSH password"),
+      command: z.string().min(1).max(5000).describe("Command to execute remotely"),
+      port: z.number().int().min(1).max(65535).optional().default(22).describe("SSH port (default 22)"),
+      timeout: z.number().int().min(5000).max(120000).optional().default(30000).describe("Timeout ms (default 30000)"),
+    },
+    implementation: async ({ host, user, password, command, port, timeout }) => {
+      try {
+        const { execSync } = await import("child_process");
+        const sshCmd = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${port} ${user}@${host} ${command.split(" ").map(s => `'${s.replace(/'/g, "'\\''")}'`).join(" ")}`;
+        const result = execSync(sshCmd, { encoding: "utf-8", timeout, maxBuffer: 10 * 1024 * 1024 });
+        return ok({ exitCode: 0, stdout: result.trim(), stderr: "" });
+      } catch (e: unknown) {
+        const err = e as { status?: number; stdout?: string; stderr?: string; message?: string; killed?: boolean };
+        return ok({
+          exitCode: err.status ?? 1,
+          stdout: (err.stdout || "").toString().trim(),
+          stderr: (err.stderr || "").toString().trim(),
+          error: err.message || String(e),
+          killed: !!err.killed,
+        });
+      }
+    },
+  });
+
+  const checkServiceTool = tool({
+    name: "check_service",
+    description: text`
+      Checks if a network service is reachable by attempting a TCP connection.
+      Returns whether the port is open, connection latency, and optionally fetches
+      a status endpoint if an HTTP URL is provided.
+
+      Use this to verify that servers, databases, APIs, tunnels, and other services
+      are running before attempting to use them.
+    `,
+    parameters: {
+      host: z.string().default("localhost").describe("Hostname or IP to check"),
+      port: z.number().int().min(1).max(65535).describe("TCP port to check"),
+      httpPath: z.string().optional().describe("HTTP path to fetch for additional status (e.g. '/api/tags')"),
+      timeout: z.number().int().min(1000).max(30000).optional().default(5000).describe("Connection timeout ms (default 5000)"),
+    },
+    implementation: async ({ host, port, httpPath, timeout }) => {
+      const start = Date.now();
+      const reachable = await new Promise<boolean>((res) => {
+        const { Socket } = require("net");
+        const s = new Socket();
+        s.setTimeout(timeout);
+        s.on("connect", () => { s.destroy(); res(true); });
+        s.on("error", () => { s.destroy(); res(false); });
+        s.on("timeout", () => { s.destroy(); res(false); });
+        s.connect(port, host);
+      });
+      const latencyMs = Date.now() - start;
+
+      let httpStatus: number | null = null;
+      let httpBody: string | null = null;
+      if (reachable && httpPath) {
+        try {
+          const resp = await fetch(`http://${host}:${port}${httpPath}`, { signal: AbortSignal.timeout(timeout) });
+          httpStatus = resp.status;
+          httpBody = (await resp.text()).slice(0, 2000);
+        } catch {}
+      }
+
+      return ok({
+        host,
+        port,
+        reachable,
+        latencyMs,
+        httpStatus,
+        httpBody,
+      });
+    },
+  });
+
   const clearMemoriesTool = tool({
     name: "clear_memories",
     description: text`
@@ -681,12 +766,12 @@ export async function toolsProvider(ctl: ToolsProviderController) {
   const consultExpertTool = tool({
     name: "consult_expert",
     description: text`
-      Delegates a complex task to a specialist sub-agent. Roles: coder, debugger, architect, reviewer, writer, analyst, researcher, data_scientist, knowledge_keeper.
+      Delegates a complex task to a specialist sub-agent. Roles: coder, debugger, architect, reviewer, writer, analyst, researcher, data_scientist, knowledge_keeper, infrastructure.
       The sub-agent runs autonomously with full tool access and returns results.
     `,
     parameters: {
       task: z.string().min(1).max(10000).describe("Detailed task instructions"),
-      expertRole: z.enum(["coder", "debugger", "architect", "reviewer", "writer", "analyst", "researcher", "data_scientist", "knowledge_keeper"]).optional().default("coder").describe("Expert persona"),
+      expertRole: z.enum(["coder", "debugger", "architect", "reviewer", "writer", "analyst", "researcher", "data_scientist", "knowledge_keeper", "infrastructure"]).optional().default("coder").describe("Expert persona"),
       context: z.string().max(20000).optional().default("").describe("Background context for the expert"),
     },
     implementation: async ({ task, expertRole, context }) => {
@@ -700,6 +785,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
         researcher: "You are a research specialist. Do deep multi-source web research. Cross-reference and verify all facts. Save results as .md or .jsonl files using write_file with descriptive filenames.",
         data_scientist: "You are a data scientist and Python/pandas expert. Analyze data, create .ipynb notebooks, run Python via bash_terminal. Use pandas, numpy, matplotlib. Save results as .csv, .json, .md, .png. Document methodology in .md files.\n\nCheck: python3 -c 'import pandas, numpy, matplotlib; print(\"ready\")'\nCheck jupyter: python3 -c 'import nbformat; print(\"nbformat ready\")'\nIf missing: pip install jupyter nbformat",
         knowledge_keeper: "You are a knowledge base librarian. Store, organize, retrieve, and maintain information using save_memory, search_memory, list_memories, update_memory, delete_memory. Save project configs, code patterns, research findings, and decisions with descriptive tags.",
+        infrastructure: "You are an infrastructure specialist. Manage remote servers, SSH connections, and network services using ssh_exec and check_service. Set up and verify SSH tunnels to remote machines. Check if services are healthy, deploy updates, monitor system resources. Use bash_terminal for local operations, ssh_exec for remote operations. Always verify a service is reachable after setting it up.",
       };
       const systemPrompt = expertPrompts[expertRole] || expertPrompts.coder;
       const fullPrompt = context ? `Context:\n${context}\n\n---\n\nTask:\n${task}` : task;
@@ -709,6 +795,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
         "bash_terminal", "web_search",
         "generate_uuid", "generate_password", "encode_base64", "decode_base64",
         "save_memory", "search_memory", "list_memories", "delete_memory", "update_memory", "clear_memories",
+        "ssh_exec", "check_service",
       ];
 
       async function execTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -891,6 +978,50 @@ export async function toolsProvider(ctl: ToolsProviderController) {
             writeKnowledgeBase([]);
             return { deletedCount: all.length };
           }
+          case "check_service": {
+            try {
+              const host = String(args.host || "localhost");
+              const port = Number(args.port) || 0;
+              const to = Number(args.timeout) || 5000;
+              const reachable = await new Promise<boolean>((res) => {
+                const { Socket } = require("net");
+                const s = new Socket();
+                s.setTimeout(to);
+                s.on("connect", () => { s.destroy(); res(true); });
+                s.on("error", () => { s.destroy(); res(false); });
+                s.on("timeout", () => { s.destroy(); res(false); });
+                s.connect(port, host);
+              });
+              let httpStatus: number | null = null;
+              let httpBody: string | null = null;
+              const httpPath = String(args.httpPath || "");
+              if (reachable && httpPath) {
+                try {
+                  const resp = await fetch(`http://${host}:${port}${httpPath}`, { signal: AbortSignal.timeout(to) });
+                  httpStatus = resp.status;
+                  httpBody = (await resp.text()).slice(0, 2000);
+                } catch {}
+              }
+              return { host, port, reachable, httpStatus, httpBody };
+            } catch (e) { return String(e); }
+          }
+          case "ssh_exec": {
+            try {
+              const { execSync } = require("child_process");
+              const host = String(args.host || "");
+              const user = String(args.user || "");
+              const pass = String(args.password || "").replace(/'/g, "'\\''");
+              const cmd = String(args.command || "");
+              const port = Number(args.port) || 22;
+              const to = Number(args.timeout) || 30000;
+              const sshCmd = `sshpass -p '${pass}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${port} ${user}@${host} '${cmd.replace(/'/g, "'\\''")}'`;
+              const result = execSync(sshCmd, { encoding: "utf-8", timeout: to, maxBuffer: 10 * 1024 * 1024 });
+              return { exitCode: 0, stdout: (result || "").toString().trim() };
+            } catch (e: unknown) {
+              const err = e as { status?: number; stdout?: string; stderr?: string };
+              return { exitCode: err.status ?? 1, stdout: (err.stdout || "").toString().trim(), stderr: (err.stderr || "").toString().trim() };
+            }
+          }
           default: return `Unknown tool: ${name}`;
         }
       }
@@ -946,6 +1077,8 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     updateMemoryTool,
     deleteMemoryTool,
     clearMemoriesTool,
+    sshExecTool,
+    checkServiceTool,
     consultExpertTool,
     webFetchTool,
     calculateTool,
