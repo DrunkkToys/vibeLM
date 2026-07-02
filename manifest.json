@@ -1,0 +1,7 @@
+{
+  "type": "plugin",
+  "runner": "node",
+  "owner": "drunkktoys",
+  "name": "agentic-tools",
+  "revision": 2
+}
