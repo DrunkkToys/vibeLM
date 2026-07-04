@@ -7,6 +7,7 @@
     "dev": "lms dev",
     "push": "lms push",
     "build": "tsc",
+    "build:prod": "./build.sh",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:watch": "node --import tsx --test --watch tests/*.test.ts"
   },
