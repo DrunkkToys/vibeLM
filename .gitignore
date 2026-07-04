@@ -1,4 +1,5 @@
-.lmstudio
+.lmstudio/production.js
+.lmstudio/dev.js
 node_modules
 dist
 config.json
