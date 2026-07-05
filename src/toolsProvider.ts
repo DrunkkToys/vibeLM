@@ -152,7 +152,16 @@ function writeConfigSync(config: Record<string, unknown>): void {
 
 function getWorkspace(sessionDir?: string): string {
   const config = readConfigSync();
-  return (config.workspacePath || sessionDir || process.cwd()).trim();
+  const ws = config.workspacePath?.trim();
+  if (ws) return ws;
+  if (sessionDir) return sessionDir.trim();
+  return "";
+}
+
+function requireWorkspace(ctl: any): string {
+  const ws = requireWorkspace(ctl);
+  if (!ws) throw new Error("No workspace set. Call set_workspace first.");
+  return ws;
 }
 
 function sandboxPath(workspace: string, requestedPath: string): string {
@@ -840,7 +849,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     implementation: async () => {
       const config = readConfigSync();
       return ok({
-        workspace: getWorkspace(ctl.getWorkingDirectory()),
+        workspace: requireWorkspace(ctl),
         configFile: CONFIG_PATH,
         configFileExists: existsSync(CONFIG_PATH),
         config,
@@ -911,7 +920,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ path }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const dir = sandboxPath(ws, path);
         const entries = readdirSync(dir, { withFileTypes: true });
         return ok({
@@ -938,7 +947,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ filePath, maxChars }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const resolved = sandboxPath(ws, filePath);
         if (!existsSync(resolved)) return fail(`File not found: ${resolved}`);
         const st = statSync(resolved);
@@ -960,7 +969,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ filePath, content }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const resolved = sandboxPath(ws, filePath);
         const parent = dirname(resolved);
         if (!existsSync(parent)) await mkdir(parent, { recursive: true });
@@ -979,7 +988,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ filePath, content }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const resolved = sandboxPath(ws, filePath);
         const parent = dirname(resolved);
         if (!existsSync(parent)) await mkdir(parent, { recursive: true });
@@ -999,7 +1008,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ sourcePath, destPath }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const src = sandboxPath(ws, sourcePath);
         const dst = sandboxPath(ws, destPath);
         if (!existsSync(src)) return fail(`Source not found: ${sourcePath}`);
@@ -1023,7 +1032,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ pattern, path, include, maxResults }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const dir = sandboxPath(ws, path);
         const q = pattern.toLowerCase();
         const results: Array<{ file: string; line: number; content: string }> = [];
@@ -1066,7 +1075,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     },
     implementation: async ({ path }) => {
       try {
-        const ws = getWorkspace(ctl.getWorkingDirectory());
+        const ws = requireWorkspace(ctl);
         const resolved = sandboxPath(ws, path);
         if (!existsSync(resolved)) return fail(`Not found: ${resolved}`);
         const st = statSync(resolved);
@@ -1091,7 +1100,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
       try {
         const { exec } = await import("child_process");
         return await new Promise((res) => {
-          exec(command, { cwd: getWorkspace(ctl.getWorkingDirectory()), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          exec(command, { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
             res(ok({ exitCode: err?.code ?? 0, stdout: stdout || "", stderr: stderr || "", killed: !!err?.killed, signal: err?.signal ?? null }));
           });
         });

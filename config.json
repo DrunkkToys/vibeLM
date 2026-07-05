@@ -1,5 +1,4 @@
 {
-  "workspacePath": "/Users/drunkktoys/Desktop/vibeLM",
   "preferredModel": "qwen/qwen3-4b",
   "maxTokensPerCall": 2048,
   "maxOrchestratorTurns": 10,
