@@ -1,7 +1,7 @@
 console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage } from "@lmstudio/sdk";
-import { toolsProvider } from "./toolsProvider";
+import { toolsProvider, preprocessMessage } from "./toolsProvider";
 
 export async function main(context: PluginContext) {
   console.log("[AgenticTools] main() called");
@@ -20,5 +20,17 @@ export async function main(context: PluginContext) {
 
   console.log("[AgenticTools] Registering tools provider...");
   context.withToolsProvider(toolsProvider);
+
+  console.log("[AgenticTools] Registering prompt preprocessor...");
+  context.withPromptPreprocessor(async (ctl: any, userMessage: ChatMessage) => {
+    const text = userMessage.getText();
+    if (!text) return userMessage;
+
+    const processed = await preprocessMessage(text);
+    if (processed) return processed;
+
+    return userMessage;
+  });
+
   console.log("[AgenticTools] Tools provider registered.");
 }

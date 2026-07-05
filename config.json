@@ -1,0 +1,14 @@
+{
+  "workspacePath": "/Users/drunkktoys/Desktop/vibeLM",
+  "preferredModel": "qwen/qwen3-4b",
+  "maxTokensPerCall": 2048,
+  "maxOrchestratorTurns": 10,
+  "skipQualityEval": true,
+  "maxResearchTurns": 2,
+  "enabledTools": [
+    "set_workspace", "get_config", "save_memory", "search_memory",
+    "consult_expert", "web_fetch", "web_search",
+    "read_file", "list_files", "search_files", "bash_terminal",
+    "calculate", "get_current_datetime", "write_file"
+  ]
+}
