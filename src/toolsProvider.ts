@@ -691,7 +691,13 @@ export async function orchestratorLoop(
     // Prune old turns from memory — they live on disk in the session log
     if (storedTurns.length > MAX_CONTEXT_TURNS * 2) {
       const pruned = storedTurns.splice(0, storedTurns.length - MAX_CONTEXT_TURNS);
-      session.saveCheckpoint(`Pruned ${pruned.length} old turns from memory`, ["orchestrator", "prune"], turns, sessionId);
+      const summary = pruned.map(t => {
+        const content = (t.assistant.content as string) || "";
+        const tools = t.toolResults.map(r => (r as any).tool_call_id || "tool").join(", ");
+        return `${content.slice(0, 200)}${tools ? ` [used: ${tools}]` : ""}`;
+      }).join("; ");
+      session.saveCheckpoint(summary.slice(0, 500), ["orchestrator", "prune"], turns, sessionId);
+      logEntries.push(`Checkpoint: pruned ${pruned.length} turns — ${summary.slice(0, 120)}`);
     }
 
     if (turns % 5 === 0) {
@@ -839,6 +845,16 @@ export async function orchestratorLoop(
 
   session.saveCheckpoint(`Completed with quality score ${qualityScore}: ${qualityReason.slice(0, 100)}`, ["orchestrator", "done"], turns, sessionId);
   logEntries.push(`Checkpoint: Quality ${qualityScore} — ${qualityReason.slice(0, 100)}`);
+
+  // Auto-save findings to disk memory
+  if (finalText && finalText.length > 50) {
+    const saveContent = finalText.slice(0, 2000);
+    session.saveMemory(
+      ["orchestrator", "result", userPrompt.slice(0, 60)],
+      saveContent,
+    );
+    logEntries.push(`Auto-saved findings to memory: ${saveContent.slice(0, 100)}`);
+  }
 
   return { result: finalText, turns, qualityScore, qualityReason, researchDone, completed, sessionsUsed: 0, sessionLog: logEntries };
 }
