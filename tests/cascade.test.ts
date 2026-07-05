@@ -1,107 +1,364 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, readFileSync, existsSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
-const TEST_DIR = join(tmpdir(), "vibeLM-cascade-test");
-const CONFIG_PATH = join(TEST_DIR, ".vibeLM-config.json");
+const TEST_DIR = join(tmpdir(), "vibeLM-cascade-test-" + Date.now());
+const REAL_CONFIG = join(process.env.HOME!, ".lmstudio", "extensions", "plugins", "drunkktoys", "agentic-tools", "config.json");
+const BACKUP_CONFIG = REAL_CONFIG + ".backup";
+const JSONL_PATH = join(process.env.HOME!, ".lmstudio", "extensions", "plugins", "drunkktoys", "agentic-tools", "session-log.jsonl");
 
+function setupWorkspace() {
+  rmSync(TEST_DIR, { recursive: true, force: true });
+  mkdirSync(TEST_DIR, { recursive: true });
+  writeFileSync(join(TEST_DIR, "hello.txt"), "Hello World\n");
+  writeFileSync(join(TEST_DIR, "data.json"), '{"key":"value"}\n');
+  mkdirSync(join(TEST_DIR, "src"));
+  writeFileSync(join(TEST_DIR, "src", "main.ts"), "export const x = 1;\n");
+}
+
+function writeTestConfig(obj: Record<string, any>) {
+  const dir = dirname(REAL_CONFIG);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(REAL_CONFIG, JSON.stringify(obj, null, 2));
+}
+
+function restoreConfig() {
+  if (existsSync(BACKUP_CONFIG)) {
+    copyFileSync(BACKUP_CONFIG, REAL_CONFIG);
+    rmSync(BACKUP_CONFIG);
+  }
+}
+
+function jsonlSize(): number {
+  try { return readFileSync(JSONL_PATH).length; } catch { return 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: full plugin flow — file ops, memory, tools
+// ═══════════════════════════════════════════════════════════════════════════════
 describe("Cascade: full plugin flow", () => {
   let execToolByName: any;
 
   before(async () => {
-    rmSync(TEST_DIR, { recursive: true, force: true });
-    mkdirSync(TEST_DIR, { recursive: true });
-    writeFileSync(join(TEST_DIR, "hello.txt"), "Hello World\n");
-    writeFileSync(join(TEST_DIR, "data.json"), '{"key":"value"}\n');
-    mkdirSync(join(TEST_DIR, "src"));
-    writeFileSync(join(TEST_DIR, "src", "main.ts"), "export const x = 1;\n");
-
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify({ workspacePath: TEST_DIR }));
-
-    process.env.AGENTIC_SEARCH_ENDPOINT = "http://localhost:8394/search";
-    
+    setupWorkspace();
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR });
     const mod = await import("../src/toolsProvider");
-    const exp = (mod as any).default || mod;
-    execToolByName = exp.execToolByName;
+    execToolByName = (mod as any).execToolByName;
   });
 
-  after(() => {
-    rmSync(TEST_DIR, { recursive: true, force: true });
-    try { rmSync(dirname(CONFIG_PATH), { recursive: true, force: true }); } catch {}
+  after(() => { restoreConfig(); rmSync(TEST_DIR, { recursive: true, force: true }); });
+
+  it("list_files returns actual file entries", async () => {
+    const files = await execToolByName("list_files", { path: "" }) as any[];
+    assert.ok(Array.isArray(files), "returns array");
+    assert.ok(files.length >= 3, "finds entries");
+    const names = files.map((f: any) => f.name);
+    assert.ok(names.includes("hello.txt"), "finds hello.txt");
+    assert.ok(names.includes("src"), "finds src/");
   });
 
-  it("cascade: list_files returns array", async () => {
-    const files = await execToolByName("list_files", { path: "" });
-    assert.ok(Array.isArray(files), "list_files returns array");
-    assert.ok(files.length > 0, "list_files returns results");
+  it("read_file returns actual file content", async () => {
+    const content = await execToolByName("read_file", { filePath: "hello.txt", maxChars: 100 }) as string;
+    assert.equal(content, "Hello World\n");
   });
 
-  it("cascade: read_file returns content", async () => {
-    const content = await execToolByName("read_file", { filePath: "hello.txt", maxChars: 100 });
-    const text = typeof content === "string" ? content : JSON.stringify(content);
-    assert.ok(text.includes("Hello World") || text.includes("hello.txt"), "read_file returns file content");
+  it("search_files finds text in files", async () => {
+    const results = await execToolByName("search_files", { pattern: "Hello", path: "" }) as any;
+    assert.ok(JSON.stringify(results).includes("hello.txt"));
   });
 
-  it("cascade: search_files returns results object", async () => {
-    const results = await execToolByName("search_files", { pattern: "Hello", path: "" });
-    assert.ok(results !== undefined, "search_files returns a value");
-    const text = JSON.stringify(results);
-    assert.ok(text.includes("results") || text.includes("Hello"), "search_files returns results");
-  });
-
-  it("cascade: bash_terminal returns output", async () => {
-    const result = await execToolByName("bash_terminal", { command: "echo cascade_test_output" });
+  it("bash_terminal returns stdout", async () => {
+    const result = await execToolByName("bash_terminal", { command: "echo -n CASCADE_TEST_98765" }) as any;
     const text = typeof result === "string" ? result : JSON.stringify(result);
-    assert.ok(text.includes("cascade_test_output"), "bash_terminal returns output");
+    assert.ok(text.includes("CASCADE_TEST_98765"), `got: ${text}`);
   });
 
-  it("cascade: write_file and read_file roundtrip", async () => {
-    await execToolByName("write_file", { filePath: "cascade.txt", content: "cascade data" });
-    const readResult = await execToolByName("read_file", { filePath: "cascade.txt", maxChars: 100 });
-    const text = typeof readResult === "string" ? readResult : JSON.stringify(readResult);
-    assert.ok(text.includes("cascade data"), "write_file → read_file roundtrip works");
+  it("write_file creates file, read_file reads it back", async () => {
+    await execToolByName("write_file", { filePath: "roundtrip.txt", content: "roundtrip data" });
+    const content = await execToolByName("read_file", { filePath: "roundtrip.txt", maxChars: 100 }) as string;
+    assert.equal(content, "roundtrip data");
+    rmSync(join(TEST_DIR, "roundtrip.txt"));
   });
 
-  it("cascade: calculate computes correctly", async () => {
-    const result = await execToolByName("calculate", { expression: "2 + 2" });
-    const text = typeof result === "string" ? result : JSON.stringify(result);
-    assert.ok(text.includes("4"), "calculate computes 2+2=4");
+  it("calculate computes math expressions", async () => {
+    const r = await execToolByName("calculate", { expression: "2 + 2" }) as string;
+    assert.ok(r.includes("4"));
   });
 
-  it("cascade: generate_uuid returns value", async () => {
-    const uuid = await execToolByName("generate_uuid", {});
-    assert.ok(uuid !== undefined, "generate_uuid returns a value");
+  it("get_current_datetime returns ISO string", async () => {
+    const dt = await execToolByName("get_current_datetime", {}) as string;
+    assert.ok(dt.includes("T"));
   });
 
-  it("cascade: generate_password returns value", async () => {
-    const pass = await execToolByName("generate_password", { length: 32 });
-    assert.ok(pass !== undefined, "generate_password returns a value");
+  it("generate_uuid returns valid format", async () => {
+    const uuid = await execToolByName("generate_uuid", {}) as string;
+    assert.ok(uuid.includes("-"));
   });
 
-  it("cascade: encode_base64 returns value", async () => {
-    const encoded = await execToolByName("encode_base64", { text: "cascade test" });
-    assert.ok(encoded !== undefined, "encode_base64 returns a value");
+  it("generate_password returns correct length", async () => {
+    const pass = await execToolByName("generate_password", { length: 32 }) as any;
+    const len = typeof pass === "string" ? pass.length : pass.password?.length || pass.length;
+    assert.equal(len, 32);
   });
 
-  it("cascade: get_current_datetime returns ISO format", async () => {
-    const result = await execToolByName("get_current_datetime", {});
-    const text = typeof result === "string" ? result : JSON.stringify(result);
-    assert.ok(text.includes("T"), "get_current_datetime returns ISO format with T");
-  });
-
-  it("cascade: all 10 tool names are callable via execToolByName", async () => {
+  it("all core tools return non-undefined values", async () => {
     const toolNames = [
       "read_file", "write_file", "list_files", "search_files",
-      "bash_terminal", "web_search", "web_fetch", "save_memory",
-      "calculate", "get_current_datetime"
+      "bash_terminal", "calculate", "get_current_datetime",
+      "generate_uuid", "generate_password", "encode_base64"
     ];
     for (const name of toolNames) {
       const args = name === "bash_terminal" ? { command: "echo ok" } : {};
       const result = await execToolByName(name, args);
-      assert.ok(result !== undefined, `execToolByName("${name}") returns a value`);
+      assert.ok(result !== undefined, `${name} returns a value`);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: pickBestModel — VLM filtering and preferred model selection
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: pickBestModel", () => {
+  let pickBestModel: any;
+  let VLM_PATTERNS: RegExp;
+
+  before(async () => {
+    const mod = await import("../src/toolsProvider");
+    pickBestModel = (mod as any).pickBestModel;
+    VLM_PATTERNS = (mod as any).VLM_PATTERNS;
+  });
+
+  it("returns null for empty model list", () => {
+    assert.equal(pickBestModel([], undefined), null);
+  });
+
+  it("skips VLM models and picks text model", () => {
+    const models = [
+      { id: "zai-org/glm-4.6v-flash" },
+      { id: "qwen/qwen3-4b" },
+    ];
+    assert.equal(pickBestModel(models, undefined), "qwen/qwen3-4b");
+  });
+
+  it("prefers exact preferredModel match", () => {
+    const models = [
+      { id: "zai-org/glm-4.6v-flash" },
+      { id: "llama-3.2-3b-instruct" },
+    ];
+    assert.equal(pickBestModel(models, "llama-3.2-3b-instruct"), "llama-3.2-3b-instruct");
+  });
+
+  it("prefers partial preferredModel match", () => {
+    const models = [
+      { id: "zai-org/glm-4.6v-flash" },
+      { id: "qwen/qwen3.5-9b" },
+    ];
+    assert.equal(pickBestModel(models, "qwen"), "qwen/qwen3.5-9b");
+  });
+
+  it("falls back to first text model if preferred not found", () => {
+    const models = [
+      { id: "zai-org/glm-4.6v-flash" },
+      { id: "qwen/qwen3-4b" },
+    ];
+    assert.equal(pickBestModel(models, "nonexistent"), "qwen/qwen3-4b");
+  });
+
+  it("no text models - picks first VLM anyway", () => {
+    const models = [
+      { id: "zai-org/glm-4.6v-flash" },
+      { id: "llava-1.6-vision" },
+    ];
+    assert.equal(pickBestModel(models, undefined), "zai-org/glm-4.6v-flash");
+  });
+
+  it("VLM_PATTERNS regex matches VLM names", () => {
+    assert.ok(VLM_PATTERNS.test("zai-org/glm-4.6v-flash"), "4.6v-flash matched");
+    assert.ok(VLM_PATTERNS.test("llava-1.6-vision"), "vision matched");
+    assert.ok(VLM_PATTERNS.test("gpt-4-vision-preview"), "gpt-4-vision matched");
+    assert.ok(VLM_PATTERNS.test("qwen-vlm"), "vlm matched");
+    assert.ok(!VLM_PATTERNS.test("qwen/qwen3-4b"), "qwen3-4b is NOT VLM");
+    assert.ok(!VLM_PATTERNS.test("llama-3.2-3b-instruct"), "llama is NOT VLM");
+    assert.ok(!VLM_PATTERNS.test("ibm/granite-4-h-tiny"), "granite is NOT VLM");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: callLLM — token budget and memory ceiling
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: callLLM token budget", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let callLLM: any;
+
+  before(async () => {
+    originalFetch = globalThis.fetch;
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR, preferredModel: "test-model", maxTokensPerCall: 1024 });
+    const mod = await import("../src/toolsProvider");
+    callLLM = (mod as any).callLLM;
+  });
+
+  after(() => { globalThis.fetch = originalFetch; restoreConfig(); });
+
+  it("uses maxTokensPerCall from config (1024)", async () => {
+    let capturedBody: any = null;
+    globalThis.fetch = async (url: string, opts?: any) => {
+      if (typeof url === "string" && url.includes("/v1/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      }
+      capturedBody = JSON.parse(typeof opts?.body === "string" ? opts.body : "{}");
+      return new Response(JSON.stringify({ choices: [{ message: { content: "OK" } }] }), { status: 200 });
+    };
+    await callLLM([{ role: "user", content: "hi" }], false, 0.3);
+    assert.equal(capturedBody.max_tokens, 1024);
+  });
+
+  it("rejects prompt larger than 85% context window", async () => {
+    globalThis.fetch = async (url: string) => {
+      return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 200 }] }), { status: 200 });
+    };
+    const bigContent = "x".repeat(800);
+    const result = await callLLM([{ role: "user", content: bigContent }], false, 0.3);
+    assert.equal(result, null);
+  });
+
+  it("returns null on API failure", async () => {
+    globalThis.fetch = async () => { throw new Error("API down"); };
+    const result = await callLLM([{ role: "user", content: "hi" }], false, 0.3);
+    assert.equal(result, null);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: orchestratorLoop — memory ceiling and skipQuality
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: orchestratorLoop", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let orchestratorLoop: any;
+
+  before(async () => {
+    originalFetch = globalThis.fetch;
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR, preferredModel: "test-model", maxTokensPerCall: 1024 });
+    const mod = await import("../src/toolsProvider");
+    orchestratorLoop = (mod as any).orchestratorLoop;
+  });
+
+  after(() => { globalThis.fetch = originalFetch; restoreConfig(); });
+
+  it("skipQuality=true reduces LLM calls", async () => {
+    let callsNoSkip = 0;
+    let callsSkip = 0;
+
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      callsNoSkip++;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":0.9,"reason":"ok"}' } }] }), { status: 200 });
+    };
+    await orchestratorLoop("sys", "task", 2, false, 0.5, 0, false);
+
+    callsSkip = 0;
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      callsSkip++;
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":0.9,"reason":"ok"}' } }] }), { status: 200 });
+    };
+    await orchestratorLoop("sys", "task", 2, false, 0.5, 0, true);
+
+    assert.ok(callsSkip < callsNoSkip, `skipQuality=${callsSkip} calls < ${callsNoSkip} without`);
+  });
+
+  it("stops when context ceiling reached", async () => {
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 500 }] }), { status: 200 });
+      return new Response(JSON.stringify({ choices: [{ message: { content: "x".repeat(2000) } }] }), { status: 200 });
+    };
+    const result = await orchestratorLoop("sys", "task", 20, false, 0.5, 500, true);
+    assert.ok(result.turns < 20, `stopped early at turn ${result.turns}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: config-driven tool filtering
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: configurable tool list", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  before(() => {
+    originalFetch = globalThis.fetch;
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+  });
+
+  after(() => { globalThis.fetch = originalFetch; restoreConfig(); });
+
+  it("toolsProvider returns tools array from config", async () => {
+    writeTestConfig({ workspacePath: TEST_DIR });
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    };
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    assert.ok(Array.isArray(tools), "returns array");
+    const names = tools.map((t: any) => t.spec?.name ?? t.name ?? "?");
+    assert.ok(names.includes("read_file"), "read_file included");
+    assert.ok(names.includes("consult_expert"), "consult_expert included");
+    assert.ok(!names.includes("ssh_exec"), "ssh_exec excluded by default");
+    assert.ok(!names.includes("encode_base64"), "encode_base64 excluded by default");
+  });
+
+  it("enabledTools config overrides defaults", async () => {
+    writeTestConfig({ workspacePath: TEST_DIR, enabledTools: ["read_file", "bash_terminal"] });
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const names = tools.map((t: any) => t.spec?.name ?? t.name ?? "?");
+    assert.equal(names.length, 2, `expected 2 tools, got ${names.length}: ${names.join(",")}`);
+    assert.ok(names.includes("read_file"));
+    assert.ok(names.includes("bash_terminal"));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: preprocessMessage — prompt interception
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: preprocessMessage", () => {
+  before(async () => {
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR });
+  });
+
+  after(() => { restoreConfig(); });
+
+  it("returns null for plain text", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const result = await (preprocessMessage as any)("hello world");
+    assert.equal(result, null);
+  });
+
+  it("intercepts search pattern", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const result = await (preprocessMessage as any)("search typescript generics");
+    assert.ok(result !== null);
+    assert.ok(result.includes("web_search"));
+  });
+
+  it("intercepts calculate pattern", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const result = await (preprocessMessage as any)("calculate 2+2");
+    assert.ok(result !== null);
+    assert.ok(result.includes("calculate"));
+  });
+
+  it("returns null for empty string", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const result = await (preprocessMessage as any)("");
+    assert.equal(result, null);
   });
 });

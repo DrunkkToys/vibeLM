@@ -26,7 +26,11 @@ async function getContextWindow(): Promise<number> {
   try {
     const resp = await fetch(`${LM_STUDIO_URL}/v1/models`);
     const data = await resp.json() as any;
-    const model = data?.data?.[0];
+    const models = data?.data || [];
+    const config = readConfigSync();
+    const preferred = (config as any).preferredModel;
+    const target = pickBestModel(models, preferred);
+    const model = models.find((m: any) => m.id === target) || models[0];
     const ctx = model?.max_context_length;
     if (typeof ctx === "number" && ctx > 0) return ctx;
   } catch {}
@@ -94,6 +98,19 @@ function binaryExtCheck(p: string): boolean {
   return BINARY_EXTS.has(extname(p).toLowerCase());
 }
 
+const VLM_PATTERNS = /vlm|vision|\d+v\b|video|multimodal|image/i;
+
+function pickBestModel(models: Array<{ id: string }>, preferred?: string): string | null {
+  if (!models.length) return null;
+  if (preferred) {
+    const match = models.find(m => m.id === preferred || m.id.includes(preferred));
+    if (match) return match.id;
+  }
+  const textModels = models.filter(m => !VLM_PATTERNS.test(m.id));
+  if (textModels.length) return textModels[0].id;
+  return models[0].id;
+}
+
 async function getModel(): Promise<string | null> {
   try {
     const resp = await fetch(`${API_BASE}/v1/models`, { signal: AbortSignal.timeout(5000) });
@@ -106,7 +123,10 @@ async function getModel(): Promise<string | null> {
       console.warn(`[AgenticTools] No models loaded via API. Load a model in LM Studio first.`);
       return null;
     }
-    return data.data[0].id;
+    const config = readConfigSync();
+    const model = pickBestModel(data.data, (config as any).preferredModel);
+    console.log(`[AgenticTools] Using model: ${model}`);
+    return model;
   } catch (e) {
     console.error(`[AgenticTools] Cannot reach LM Studio API at ${API_BASE}. Run 'lms server start'`);
     return null;
@@ -249,13 +269,24 @@ async function callLLM(
   messages: Array<Record<string, unknown>>,
   tools: boolean = false,
   temperature: number = 0.3,
+  maxTokens: number = 0,
 ): Promise<{ content: string; tool_calls?: Array<{ type: string; function: { name: string; arguments: string } }> } | null> {
   const model = await getModel();
   if (!model) {
-    console.error(`[AgenticTools] callLLM: no model available. Load a model in LM Studio and ensure 'lms server' is running.`);
+    console.error(`[AgenticTools] callLLM: no model available.`);
     return null;
   }
-  const body: Record<string, unknown> = { model, messages, max_tokens: 4096, temperature };
+  const config = readConfigSync();
+  const tokenBudget = maxTokens || (config as any).maxTokensPerCall || 2048;
+  const estimatedTokens = messages.reduce(
+    (s, m: any) => s + Math.ceil((typeof m.content === "string" ? m.content : JSON.stringify(m)).length / 4), 0
+  );
+  const contextWindow = await getContextWindow();
+  if (estimatedTokens > contextWindow * 0.85) {
+    console.warn(`[AgenticTools] callLLM: prompt too large (${estimatedTokens}/${contextWindow}). Skipping.`);
+    return null;
+  }
+  const body: Record<string, unknown> = { model, messages, max_tokens: tokenBudget, temperature };
   if (tools) body.tools = ORCHESTRATOR_TOOL_DEFS;
   const resp = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: "POST",
@@ -263,7 +294,7 @@ async function callLLM(
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
-    console.error(`[AgenticTools] LLM API call failed: HTTP ${resp.status} on ${API_BASE}/v1/chat/completions`);
+    console.error(`[AgenticTools] LLM API call failed: HTTP ${resp.status}`);
     return null;
   }
   const data = await resp.json() as { choices?: Array<{ message?: { content?: string; tool_calls?: Array<any> } }> };
@@ -393,6 +424,7 @@ async function execToolByName(name: string, args: Record<string, unknown>): Prom
     case "encode_base64": return Buffer.from(String(args.text || "")).toString("base64");
     case "decode_base64": try { return Buffer.from(String(args.base64 || ""), "base64").toString("utf-8"); } catch (e) { return String(e); }
     case "save_memory": {
+      console.log("[DEBUG] save_memory called with:", JSON.stringify(args));
       getSessionLog().saveMemory((args.tags as string[]) || [], String(args.content || ""));
       return { success: true };
     }
@@ -482,7 +514,7 @@ async function execToolByName(name: string, args: Record<string, unknown>): Prom
   }
 }
 
-export { execToolByName, webSearch, binaryExtCheck, callLLM };
+export { execToolByName, webSearch, binaryExtCheck, callLLM, pickBestModel, VLM_PATTERNS };
 
 export async function orchestratorLoop(
   systemPrompt: string,
@@ -491,6 +523,7 @@ export async function orchestratorLoop(
   autoWebSearch: boolean,
   qualityThreshold: number,
   contextWindow: number = 0,
+  skipQuality: boolean = false,
 ): Promise<{
   result: string;
   turns: number;
@@ -520,6 +553,14 @@ export async function orchestratorLoop(
   while (turns < maxTurns) {
     turns++;
     const contextMsgs = buildContextMessages(enrichedSystemPrompt, userPrompt, storedTurns, MAX_CONTEXT_TURNS, contextWindow, sessionId);
+    const estimatedTokens = contextMsgs.reduce(
+      (s, m: any) => s + Math.ceil((typeof m.content === "string" ? m.content : JSON.stringify(m)).length / 4), 0
+    );
+    if (estimatedTokens > contextWindow * 0.80) {
+      console.warn(`[AgenticTools] orchestratorLoop: context full (${estimatedTokens}/${contextWindow}) at turn ${turns}. Stopping.`);
+      logEntries.push(`Turn ${turns}: stopped — context ceiling reached`);
+      break;
+    }
     const resp = await callLLM(contextMsgs, true, 0.3);
     if (!resp) {
       console.error(`[AgenticTools] orchestratorLoop: callLLM returned null at turn ${turns}. Aborting.`);
@@ -639,26 +680,28 @@ export async function orchestratorLoop(
   }
 
   // Quality check
-  const qMessages: Array<Record<string, unknown>> = [
-    {
-      role: "system",
-      content: "You are a quality evaluator. Rate the following result against the original task. Return a JSON object with: score (0.0-1.0), reason (2-3 sentence explanation). Only return valid JSON, no other text.",
-    },
-    {
-      role: "user",
-      content: `Task: ${userPrompt}\n\nResult:\n${finalText.slice(0, 8000)}`,
-    },
-  ];
   let qualityScore = 0.5;
-  let qualityReason = "Quality evaluation not available";
-  const qResp = await callLLM(qMessages, false, 0.1);
-  if (qResp) {
-    try {
-      const parsed = JSON.parse(qResp.content);
-      if (typeof parsed.score === "number") qualityScore = parsed.score;
-      if (typeof parsed.reason === "string") qualityReason = parsed.reason;
-    } catch (e) {
-      console.warn(`[AgenticTools] quality evaluation JSON parse failed:`, e);
+  let qualityReason = "Quality evaluation skipped";
+  if (!skipQuality) {
+    const qMessages: Array<Record<string, unknown>> = [
+      {
+        role: "system",
+        content: "You are a quality evaluator. Rate the following result against the original task. Return a JSON object with: score (0.0-1.0), reason (2-3 sentence explanation). Only return valid JSON, no other text.",
+      },
+      {
+        role: "user",
+        content: `Task: ${userPrompt}\n\nResult:\n${finalText.slice(0, 8000)}`,
+      },
+    ];
+    const qResp = await callLLM(qMessages, false, 0.1);
+    if (qResp) {
+      try {
+        const parsed = JSON.parse(qResp.content);
+        if (typeof parsed.score === "number") qualityScore = parsed.score;
+        if (typeof parsed.reason === "string") qualityReason = parsed.reason;
+      } catch (e) {
+        console.warn(`[AgenticTools] quality evaluation JSON parse failed:`, e);
+      }
     }
   }
 
@@ -675,7 +718,9 @@ export async function orchestratorLoop(
       },
     ];
     let rTurns = 0;
-    while (rTurns < 5) {
+    const config2 = readConfigSync();
+    const maxResearchTurns = (config2 as any).maxResearchTurns || 2;
+    while (rTurns < maxResearchTurns) {
       rTurns++;
       const rResp = await callLLM(researchMessages, true, 0.4);
       if (!rResp) break;
@@ -1293,7 +1338,15 @@ RULES:
 After completing ALL steps, respond:
 COMPLETE: <your final analysis>
 
-Available tools: read_file, list_files, search_files, bash_terminal, web_search, web_fetch, save_memory.`;
+Available tools: read_file, list_files, search_files, bash_terminal, web_search, web_fetch, save_memory.
+
+MEMORY RULES (MANDATORY):
+- You MUST call save_memory after EVERY task with your findings. No exceptions.
+- Format: save_memory(content: "your findings", tags: ["task", "result"])
+- Before starting, call search_memory to check for prior context
+- If you find something important, save it IMMEDIATELY with save_memory
+- NEVER complete a task without calling save_memory first
+- Tags organize memories: use ["task", "result"], ["bug", "location"], ["feature", "implementation"]`;
 
       const result = await orchestratorLoop(
         systemPrompt,
@@ -1301,6 +1354,8 @@ Available tools: read_file, list_files, search_files, bash_terminal, web_search,
         maxTurns,
         autoSearch,
         qualityThreshold,
+        0,
+        (readConfigSync() as any).skipQualityEval !== false,
       );
 
       // Save result to persistent memory
@@ -1319,35 +1374,48 @@ Available tools: read_file, list_files, search_files, bash_terminal, web_search,
     },
   });
 
-  const allTools: any[] = [
-    setWorkspaceTool,
-    getConfigTool,
-    saveMemoryTool,
-    searchMemoryTool,
-    listMemoriesTool,
-    updateMemoryTool,
-    deleteMemoryTool,
-    clearMemoriesTool,
-    sshExecTool,
-    checkServiceTool,
-    consultExpertTool,
-    webFetchTool,
-    calculateTool,
-    currentDateTimeTool,
-    listFilesTool,
-    readFileTool,
-    writeFileTool,
-    appendFileTool,
-    renameFileTool,
-    searchFilesTool,
-    deleteFileTool,
-    bashTerminalTool,
-    webSearchTool,
-    generateUuidTool,
-    generatePasswordTool,
-    encodeBase64Tool,
-    decodeBase64Tool,
+  const ALL_TOOL_MAP: Record<string, any> = {
+    set_workspace: setWorkspaceTool,
+    get_config: getConfigTool,
+    save_memory: saveMemoryTool,
+    search_memory: searchMemoryTool,
+    list_memories: listMemoriesTool,
+    update_memory: updateMemoryTool,
+    delete_memory: deleteMemoryTool,
+    clear_memories: clearMemoriesTool,
+    ssh_exec: sshExecTool,
+    check_service: checkServiceTool,
+    consult_expert: consultExpertTool,
+    web_fetch: webFetchTool,
+    calculate: calculateTool,
+    get_current_datetime: currentDateTimeTool,
+    list_files: listFilesTool,
+    read_file: readFileTool,
+    write_file: writeFileTool,
+    append_file: appendFileTool,
+    rename_file: renameFileTool,
+    search_files: searchFilesTool,
+    delete_file: deleteFileTool,
+    bash_terminal: bashTerminalTool,
+    web_search: webSearchTool,
+    generate_uuid: generateUuidTool,
+    generate_password: generatePasswordTool,
+    encode_base64: encodeBase64Tool,
+    decode_base64: decodeBase64Tool,
+  };
+
+  const DEFAULT_ENABLED = [
+    "set_workspace", "get_config", "save_memory", "search_memory",
+    "consult_expert", "web_fetch", "web_search",
+    "read_file", "list_files", "search_files", "bash_terminal",
+    "calculate", "get_current_datetime", "write_file",
   ];
+
+  const configTools = readConfigSync();
+  const enabledNames = (configTools as any).enabledTools || DEFAULT_ENABLED;
+  const allTools = enabledNames
+    .filter((name: string) => ALL_TOOL_MAP[name])
+    .map((name: string) => ALL_TOOL_MAP[name]);
 
   for (const t of allTools) {
     const name = t.spec?.name ?? t.name ?? "?";
