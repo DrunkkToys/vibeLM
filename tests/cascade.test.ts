@@ -362,3 +362,222 @@ describe("Cascade: preprocessMessage", () => {
     assert.equal(result, null);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: smart truncation and read_file offset (via tool implementation)
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: smart truncation and read_file offset", () => {
+  let allTools: any[];
+  let localFetch: typeof globalThis.fetch;
+  const BIG_FILE = join(TEST_DIR, "bigfile.txt");
+
+  before(async () => {
+    setupWorkspace();
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR });
+    writeFileSync(BIG_FILE, "A".repeat(5000));
+    localFetch = globalThis.fetch;
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    };
+    const { toolsProvider } = await import("../src/toolsProvider");
+    allTools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+  });
+
+  after(() => { globalThis.fetch = localFetch; restoreConfig(); rmSync(TEST_DIR, { recursive: true, force: true }); });
+
+  function findTool(name: string) {
+    return allTools.find((t: any) => (t.spec?.name ?? t.name) === name);
+  }
+
+  it("read_file truncates and marks truncated", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "bigfile.txt", maxChars: 1000 }) as any;
+    assert.equal(result.data.content.length, 1000, "content is 1000 chars");
+    assert.equal(result.data.truncated, true, "marked as truncated");
+    assert.equal(result.data.originalLength, 5000, "original length recorded");
+  });
+
+  it("read_file with offset reads from middle", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "bigfile.txt", maxChars: 100, offset: 2500 }) as any;
+    assert.equal(result.data.content.length, 100);
+    assert.equal(result.data.content, "A".repeat(100));
+  });
+
+  it("read_file with offset near end returns partial", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "bigfile.txt", maxChars: 100, offset: 4950 }) as any;
+    assert.equal(result.data.content.length, 50, "only 50 chars left");
+  });
+
+  it("read_file with offset past end returns empty", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "bigfile.txt", maxChars: 100, offset: 10000 }) as any;
+    assert.equal(result.data.content.length, 0, "empty when past end");
+  });
+
+  it("read_file full file not truncated", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "hello.txt", maxChars: 50000 }) as any;
+    assert.equal(result.data.truncated, undefined, "not truncated for small file");
+    assert.equal(result.data.content, "Hello World\n");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: requireWorkspace guard
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: requireWorkspace guard", () => {
+  let originalFetch2: typeof globalThis.fetch;
+
+  before(async () => {
+    originalFetch2 = globalThis.fetch;
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({});
+  });
+
+  after(() => {
+    globalThis.fetch = originalFetch2;
+    restoreConfig();
+  });
+
+  it("tools fail gracefully when no workspace set", async () => {
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    };
+    // Write empty config to clear any workspacePath
+    writeFileSync(REAL_CONFIG, JSON.stringify({}));
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider({ getWorkingDirectory: () => "" } as any);
+    const readFileTool = tools.find((t: any) => (t.spec?.name ?? t.name) === "read_file");
+    assert.ok(readFileTool, "read_file tool exists");
+    const result = await readFileTool.implementation({ filePath: "hello.txt", maxChars: 100 });
+    assert.ok(result.error, "returns error when no workspace");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cascade: edge cases
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("Cascade: edge cases", () => {
+  let allTools: any[];
+  let localFetch: typeof globalThis.fetch;
+
+  before(async () => {
+    setupWorkspace();
+    if (existsSync(REAL_CONFIG)) copyFileSync(REAL_CONFIG, BACKUP_CONFIG);
+    writeTestConfig({ workspacePath: TEST_DIR });
+    localFetch = globalThis.fetch;
+    globalThis.fetch = async (url: string) => {
+      if (typeof url === "string" && url.includes("/v1/models"))
+        return new Response(JSON.stringify({ data: [{ id: "test-model", max_context_length: 8192 }] }), { status: 200 });
+      return new Response("{}", { status: 200 });
+    };
+    const { toolsProvider } = await import("../src/toolsProvider");
+    allTools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+  });
+
+  after(() => { globalThis.fetch = localFetch; restoreConfig(); rmSync(TEST_DIR, { recursive: true, force: true }); });
+
+  function findTool(name: string) {
+    return allTools.find((t: any) => (t.spec?.name ?? t.name) === name);
+  }
+
+  it("read_file on non-existent file returns error", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "nonexistent.txt", maxChars: 100 }) as any;
+    assert.ok(result.error, "returns error");
+    assert.ok(result.error.includes("not found") || result.error.includes("ENOENT"), "error mentions not found");
+  });
+
+  it("read_file on directory returns error", async () => {
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "src", maxChars: 100 }) as any;
+    assert.ok(result.error, "returns error for directory");
+    assert.ok(result.error.includes("directory"), "error mentions directory");
+  });
+
+  it("read_file on binary file returns error", async () => {
+    writeFileSync(join(TEST_DIR, "test.png"), Buffer.from([0x00, 0x01, 0x02]));
+    const t = findTool("read_file");
+    const result = await t.implementation({ filePath: "test.png", maxChars: 100 }) as any;
+    assert.ok(result.error, "returns error for binary");
+    assert.ok(result.error.includes("binary"), "error mentions binary");
+  });
+
+  it("list_files on non-existent path returns error", async () => {
+    const t = findTool("list_files");
+    const result = await t.implementation({ path: "nonexistent_dir" }) as any;
+    assert.ok(result.error, "returns error");
+  });
+
+  it("bash_terminal with invalid command returns output", async () => {
+    const t = findTool("bash_terminal");
+    const result = await t.implementation({ command: "ls /nonexistent_path_xyz_123" }) as any;
+    const text = JSON.stringify(result);
+    assert.ok(text.length > 0, "returns something");
+  });
+
+  it("write_file and read_file roundtrip", async () => {
+    const content = "test content " + "x".repeat(500);
+    const wt = findTool("write_file");
+    await wt.implementation({ filePath: "edge_test.txt", content });
+    const rt = findTool("read_file");
+    const readBack = await rt.implementation({ filePath: "edge_test.txt", maxChars: 10000 }) as any;
+    assert.equal(readBack.data.content, content, "roundtrip preserves content exactly");
+    rmSync(join(TEST_DIR, "edge_test.txt"));
+  });
+
+  it("write_file creates parent dirs", async () => {
+    const wt = findTool("write_file");
+    await wt.implementation({ filePath: "deep/nested/dir/file.txt", content: "nested" });
+    const rt = findTool("read_file");
+    const result = await rt.implementation({ filePath: "deep/nested/dir/file.txt", maxChars: 100 }) as any;
+    assert.equal(result.data.content, "nested");
+    rmSync(join(TEST_DIR, "deep"), { recursive: true });
+  });
+
+  it("search_files with no matches returns empty", async () => {
+    const t = findTool("search_files");
+    const result = await t.implementation({ pattern: "ZZZZNOTFOUND99999", path: "" }) as any;
+    const text = JSON.stringify(result);
+    assert.ok(!text.includes("hello.txt"), "does not match unrelated files");
+  });
+
+  it("get_config returns config object", async () => {
+    const t = findTool("get_config");
+    const result = await t.implementation({}) as any;
+    assert.ok(result, "returns something");
+    const text = JSON.stringify(result);
+    assert.ok(text.includes("workspace"), "mentions workspace");
+  });
+
+  it("save_memory and search_memory roundtrip", async () => {
+    const sm = findTool("save_memory");
+    await sm.implementation({ content: "edge_case_test_777", tags: ["edge_test"] });
+    const after = readFileSync(JSONL_PATH, "utf-8");
+    assert.ok(after.includes("edge_case_test_777"), "saved");
+    const searchTool = findTool("search_memory");
+    const results = await searchTool.implementation({ tags: ["edge_test"] }) as any;
+    const text = JSON.stringify(results);
+    assert.ok(text.includes("edge_case_test_777"), "found by tag");
+  });
+
+  it("calculate with division by zero", async () => {
+    const t = findTool("calculate");
+    const result = await t.implementation({ expression: "1/0" }) as any;
+    const text = typeof result === "string" ? result : JSON.stringify(result);
+    assert.ok(text.includes("Infinity") || text.includes("inf") || text.includes("NaN") || result.data !== undefined, "handles division by zero");
+  });
+
+  it("calculate with invalid expression", async () => {
+    const t = findTool("calculate");
+    const result = await t.implementation({ expression: "+++" }) as any;
+    assert.ok(result, "returns something for invalid expression");
+  });
+});
