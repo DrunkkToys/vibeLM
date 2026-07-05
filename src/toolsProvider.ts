@@ -243,7 +243,7 @@ function buildContextMessages(
       for (const tr of turn.toolResults) {
         const truncated = { ...tr };
         if (typeof truncated.content === "string" && truncated.content.length > MAX_TOOL_RESULT_CHARS) {
-          truncated.content = truncated.content.slice(0, MAX_TOOL_RESULT_CHARS) + "\n[...truncated]";
+          truncated.content = truncated.content.slice(0, MAX_TOOL_RESULT_CHARS) + `\n\n[TRUNCATED: ${truncated.content.length - MAX_TOOL_RESULT_CHARS} chars omitted. Call read_file with offset to see more.]`;
         }
         msgs.push(truncated);
       }
@@ -268,7 +268,7 @@ const ORCHESTRATOR_TOOL_DEFS: Array<{
   type: "function";
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }> = [
-  { type: "function", function: { name: "read_file", description: "Read a file from the workspace", parameters: { type: "object", properties: { filePath: { type: "string", description: "File path relative to workspace" }, maxChars: { type: "number", description: "Max chars to read" } }, required: ["filePath"] } } },
+  { type: "function", function: { name: "read_file", description: "Read a file from the workspace", parameters: { type: "object", properties: { filePath: { type: "string", description: "File path relative to workspace" }, maxChars: { type: "number", description: "Max chars to read" }, offset: { type: "number", description: "Character offset to start from" } }, required: ["filePath"] } } },
   { type: "function", function: { name: "list_files", description: "List directory contents", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path relative to workspace" } }, required: [] } } },
   { type: "function", function: { name: "search_files", description: "Search file contents by pattern", parameters: { type: "object", properties: { pattern: { type: "string", description: "Search pattern" }, path: { type: "string" }, maxResults: { type: "number" } }, required: ["pattern"] } } },
   { type: "function", function: { name: "bash_terminal", description: "Run a shell command (git, grep, etc.)", parameters: { type: "object", properties: { command: { type: "string", description: "Command to run" }, timeout: { type: "number" } }, required: ["command"] } } },
@@ -942,8 +942,9 @@ export async function toolsProvider(ctl: ToolsProviderController) {
     parameters: {
       filePath: z.string().min(1).describe("File path relative to workspace"),
       maxChars: z.number().int().min(100).max(500000).optional().default(50000).describe("Max chars (default 50000)"),
+      offset: z.number().int().min(0).optional().default(0).describe("Character offset to start reading from (for truncated files)"),
     },
-    implementation: async ({ filePath, maxChars }) => {
+    implementation: async ({ filePath, maxChars, offset }) => {
       try {
         const ws = requireWorkspace(ctl);
         const resolved = sandboxPath(ws, filePath);
@@ -952,8 +953,9 @@ export async function toolsProvider(ctl: ToolsProviderController) {
         if (st.isDirectory()) return fail(`Is a directory: ${resolved}`);
         if (binaryExtCheck(resolved)) return fail(`Cannot read binary file: ${filePath}. Use bash_terminal for binary files.`);
         const content = readFileSync(resolved, "utf-8");
-        if (content.length > maxChars) return ok({ content: content.slice(0, maxChars), truncated: true, originalLength: content.length });
-        return ok({ content });
+        const sliced = content.slice(offset, offset + maxChars);
+        if (offset + maxChars < content.length) return ok({ content: sliced, truncated: true, originalLength: content.length, offset });
+        return ok({ content: sliced });
       } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
     },
   });
