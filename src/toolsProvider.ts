@@ -100,6 +100,13 @@ function binaryExtCheck(p: string): boolean {
 
 const VLM_PATTERNS = /vlm|vision|\d+v\b|video|multimodal|image/i;
 
+function isGarbageOutput(text: string): boolean {
+  if (!text || text.length < 20) return false;
+  const trimmed = text.trim();
+  const uniqueChars = new Set(trimmed).size;
+  return uniqueChars <= 3 && trimmed.length > 20;
+}
+
 function pickBestModel(models: Array<{ id: string }>, preferred?: string): string | null {
   if (!models.length) return null;
   if (preferred) {
@@ -575,7 +582,20 @@ export async function orchestratorLoop(
     }
 
     const text = resp.content;
-    const calls = resp.tool_calls;
+    let calls = resp.tool_calls;
+
+    if (isGarbageOutput(text) && (!calls || calls.length === 0)) {
+      console.warn(`[AgenticTools] orchestratorLoop: garbage output detected at turn ${turns}, retrying with simpler prompt`);
+      logEntries.push(`Turn ${turns}: garbage output, retrying`);
+      const retryMessages = [
+        { role: "system", content: "Use the provided tools. Call one tool at a time. Do not write long text." },
+        { role: "user", content: userPrompt },
+      ];
+      const retryResp = await callLLM(retryMessages, true, 0.1);
+      if (retryResp?.tool_calls && retryResp.tool_calls.length > 0) {
+        calls = retryResp.tool_calls;
+      }
+    }
 
     const completeMatch = text?.match(/^\s*COMPLETE\s*:\s*(.*)/is);
     const toolCallEntries: Array<{ name: string; args: string; result?: string }> = [];
