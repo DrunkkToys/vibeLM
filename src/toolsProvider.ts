@@ -159,7 +159,7 @@ function getWorkspace(sessionDir?: string): string {
 }
 
 function requireWorkspace(ctl: any): string {
-  const ws = requireWorkspace(ctl);
+  const ws = getWorkspace(ctl.getWorkingDirectory());
   if (!ws) throw new Error("No workspace set. Call set_workspace first.");
   return ws;
 }
