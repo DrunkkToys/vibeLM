@@ -306,7 +306,10 @@ async function callLLM(
     return null;
   }
   const body: Record<string, unknown> = { model, messages, max_tokens: tokenBudget, temperature };
-  if (tools) body.tools = ORCHESTRATOR_TOOL_DEFS;
+  if (tools) {
+    body.tools = ORCHESTRATOR_TOOL_DEFS;
+    body.tool_choice = "required";
+  }
   const resp = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
