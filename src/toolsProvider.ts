@@ -559,6 +559,7 @@ export async function orchestratorLoop(
   const session = getSessionLog();
   const logEntries: string[] = [];
   const storedTurns: StoredTurn[] = [];
+  const allToolResults: Array<{ name: string; content: string }> = [];
   if (contextWindow <= 0) contextWindow = await getContextWindow();
   const sessionId = crypto.randomUUID();
 
@@ -673,6 +674,7 @@ export async function orchestratorLoop(
         tool_call_id: fn.name,
         content: capped,
       });
+      allToolResults.push({ name: fn.name, content: capped });
     }
 
     storedTurns.push({ assistant: assistantMsg, toolResults });
@@ -706,18 +708,18 @@ export async function orchestratorLoop(
     }
   }
 
-  const noToolsUsed = storedTurns.every(t => t.toolResults.length === 0);
+  const noToolsUsed = allToolResults.length === 0;
   let finalText = storedTurns
     .map(t => {
       const parts: string[] = [];
       if (t.assistant.content) parts.push(t.assistant.content as string);
-      for (const tr of t.toolResults) {
-        if (tr.content) parts.push(`[${(tr as any).tool_call_id || "tool"}]: ${tr.content}`);
-      }
       return parts.join("\n");
     })
     .filter(Boolean)
     .join("\n\n");
+  // Add all tool results (even from pruned turns)
+  const toolSummary = allToolResults.map(r => `[${r.name}]: ${r.content.slice(0, 500)}`).join("\n\n");
+  if (toolSummary) finalText = (finalText ? finalText + "\n\n" : "") + toolSummary;
   if (noToolsUsed && finalText.length > 0) {
     finalText = `[WARNING: The model did not call any tools — result is raw model text without execution]\n\n${finalText}`;
   }
@@ -831,8 +833,17 @@ export async function orchestratorLoop(
     session.saveCheckpoint(`Research supplement completed (${rTurns} turns)`, ["orchestrator", "research"], turns + rTurns, sessionId);
     logEntries.push(`Checkpoint: Research supplement (${rTurns} turns)`);
 
+    const researchResult = finalText + "\n\n=== Research Supplement ===\n" + researchText;
+    if (researchResult && researchResult.length > 50) {
+      session.saveMemory(
+        ["orchestrator", "research", userPrompt.slice(0, 60)],
+        researchResult.slice(0, 2000),
+      );
+      logEntries.push(`Auto-saved research findings to memory`);
+    }
+
     return {
-      result: finalText + "\n\n=== Research Supplement ===\n" + researchText,
+      result: researchResult,
       turns,
       qualityScore,
       qualityReason,
