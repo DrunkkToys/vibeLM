@@ -672,7 +672,14 @@ export async function orchestratorLoop(
 
   const noToolsUsed = storedTurns.every(t => t.toolResults.length === 0);
   let finalText = storedTurns
-    .map(t => t.assistant.content as string)
+    .map(t => {
+      const parts: string[] = [];
+      if (t.assistant.content) parts.push(t.assistant.content as string);
+      for (const tr of t.toolResults) {
+        if (tr.content) parts.push(`[${(tr as any).tool_call_id || "tool"}]: ${tr.content}`);
+      }
+      return parts.join("\n");
+    })
     .filter(Boolean)
     .join("\n\n");
   if (noToolsUsed && finalText.length > 0) {
