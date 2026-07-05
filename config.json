@@ -1,7 +1,7 @@
 {
   "preferredModel": "qwen/qwen3-4b",
   "maxTokensPerCall": 2048,
-  "maxOrchestratorTurns": 10,
+  "maxOrchestratorTurns": 5,
   "skipQualityEval": true,
   "maxResearchTurns": 2,
   "enabledTools": [

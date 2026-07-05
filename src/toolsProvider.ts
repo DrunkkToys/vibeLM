@@ -18,7 +18,7 @@ const CONTEXT_WARNING_THRESHOLD = 0.85;
 const WORKING_WINDOW_SIZE = 12;
 const FILE_CACHE_MAX_BYTES = 1024 * 1024;
 const TOOL_RESULT_MAX_CHARS = 2000;
-const MAX_CONTEXT_TURNS = 2;
+const MAX_CONTEXT_TURNS = 1;
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 
@@ -559,7 +559,6 @@ export async function orchestratorLoop(
   const session = getSessionLog();
   const logEntries: string[] = [];
   const storedTurns: StoredTurn[] = [];
-  const allToolResults: Array<{ name: string; content: string }> = [];
   if (contextWindow <= 0) contextWindow = await getContextWindow();
   const sessionId = crypto.randomUUID();
 
@@ -674,7 +673,6 @@ export async function orchestratorLoop(
         tool_call_id: fn.name,
         content: capped,
       });
-      allToolResults.push({ name: fn.name, content: capped });
     }
 
     storedTurns.push({ assistant: assistantMsg, toolResults });
@@ -708,18 +706,18 @@ export async function orchestratorLoop(
     }
   }
 
-  const noToolsUsed = allToolResults.length === 0;
+  const noToolsUsed = storedTurns.every(t => t.toolResults.length === 0);
   let finalText = storedTurns
     .map(t => {
       const parts: string[] = [];
       if (t.assistant.content) parts.push(t.assistant.content as string);
+      for (const tr of t.toolResults) {
+        if (tr.content) parts.push(`[${(tr as any).tool_call_id || "tool"}]: ${(tr.content as string).slice(0, 500)}`);
+      }
       return parts.join("\n");
     })
     .filter(Boolean)
     .join("\n\n");
-  // Add all tool results (even from pruned turns)
-  const toolSummary = allToolResults.map(r => `[${r.name}]: ${r.content.slice(0, 500)}`).join("\n\n");
-  if (toolSummary) finalText = (finalText ? finalText + "\n\n" : "") + toolSummary;
   if (noToolsUsed && finalText.length > 0) {
     finalText = `[WARNING: The model did not call any tools — result is raw model text without execution]\n\n${finalText}`;
   }
@@ -1384,12 +1382,26 @@ export async function toolsProvider(ctl: ToolsProviderController) {
       }
 
       // Phase 2: Execute
-      const systemPrompt = `You are an AI assistant with tools.
+      const systemPrompt = `You are an AI agent that works step by step using tools.
 
-Rules:
-- Use tools to read/list/search files as needed.
-- After reading enough files, synthesize your findings.
-- When done, respond with COMPLETE: followed by your analysis.`;
+Plan:
+${planText}
+
+RULES:
+- One tool call at a time. After each result, decide the next tool.
+- You must complete ALL steps in the plan before saying COMPLETE.
+- "Exploring" means: list files THEN read the actual file contents.
+- You must read source files — not just list them — to provide real analysis.
+- If you don't know enough, search_files or read more files.
+- CRITICAL: You will lose context if you complete early.
+
+BEFORE saying COMPLETE, verify:
+  [ ] Did I list all relevant files?
+  [ ] Did I read the file contents?
+  [ ] Did I analyze what I read?
+
+After completing ALL steps, respond:
+COMPLETE: <your final analysis>`;
 
       const result = await orchestratorLoop(
         systemPrompt,
