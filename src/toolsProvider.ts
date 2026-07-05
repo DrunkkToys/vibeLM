@@ -18,7 +18,7 @@ const CONTEXT_WARNING_THRESHOLD = 0.85;
 const WORKING_WINDOW_SIZE = 12;
 const FILE_CACHE_MAX_BYTES = 1024 * 1024;
 const TOOL_RESULT_MAX_CHARS = 2000;
-const MAX_CONTEXT_TURNS = 4;
+const MAX_CONTEXT_TURNS = 2;
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 
@@ -208,14 +208,6 @@ function fail(msg: string) {
 
 // ─── Context Window Management ──────────────────────────────────────────────
 
-function buildContextSummary(task: string, tags: string[]): string {
-  const session = getSessionLog();
-  const relevant = session.searchMemoriesByTags(tags, 5);
-  if (relevant.length === 0) return "";
-  const lines = relevant.map((m) => `- ${(m.content || (m as any).summary || "").slice(0, 500)}`).join("\n");
-  return `\n[Relevant memories for "${task}"]\n${lines}\n`;
-}
-
 function buildContextMessages(
   systemPrompt: string,
   userPrompt: string,
@@ -224,6 +216,7 @@ function buildContextMessages(
   maxTokens: number,
   sessionId: string,
 ): Record<string, unknown>[] {
+  const MAX_TOOL_RESULT_CHARS = 2000;
   let recent = storedTurns.slice(-maxTurns);
   let contextNote = "";
   if (storedTurns.length > recent.length) {
@@ -242,8 +235,18 @@ function buildContextMessages(
     ];
     if (contextNote) msgs.push({ role: "system", content: contextNote });
     for (const turn of recent) {
-      msgs.push(turn.assistant);
-      msgs.push(...turn.toolResults);
+      const assistantMsg = { ...turn.assistant };
+      if (typeof assistantMsg.content === "string" && assistantMsg.content.length > 2000) {
+        assistantMsg.content = assistantMsg.content.slice(0, 2000) + "\n[...truncated]";
+      }
+      msgs.push(assistantMsg);
+      for (const tr of turn.toolResults) {
+        const truncated = { ...tr };
+        if (typeof truncated.content === "string" && truncated.content.length > MAX_TOOL_RESULT_CHARS) {
+          truncated.content = truncated.content.slice(0, MAX_TOOL_RESULT_CHARS) + "\n[...truncated]";
+        }
+        msgs.push(truncated);
+      }
     }
     const estimated = msgs.reduce(
       (s, m: any) => s + Math.ceil((typeof m.content === "string" ? m.content : JSON.stringify(m)).length / 4),
@@ -549,11 +552,6 @@ export async function orchestratorLoop(
   if (contextWindow <= 0) contextWindow = await getContextWindow();
   const sessionId = crypto.randomUUID();
 
-  const memContext = buildContextSummary(userPrompt, ["orchestrator", "analysis", "codebase"]);
-  const enrichedSystemPrompt = memContext
-    ? `${systemPrompt}\n\n## Prior Context from Saved Memories\n${memContext}`
-    : systemPrompt;
-
   let turns = 0;
   let completed = false;
   let researchDone = false;
@@ -561,7 +559,7 @@ export async function orchestratorLoop(
 
   while (turns < maxTurns) {
     turns++;
-    const contextMsgs = buildContextMessages(enrichedSystemPrompt, userPrompt, storedTurns, MAX_CONTEXT_TURNS, contextWindow, sessionId);
+    const contextMsgs = buildContextMessages(systemPrompt, userPrompt, storedTurns, MAX_CONTEXT_TURNS, contextWindow, sessionId);
     const estimatedTokens = contextMsgs.reduce(
       (s, m: any) => s + Math.ceil((typeof m.content === "string" ? m.content : JSON.stringify(m)).length / 4), 0
     );
@@ -1322,47 +1320,24 @@ export async function toolsProvider(ctl: ToolsProviderController) {
       console.log(`[AgenticTools] consult_expert: task="${task?.slice(0, 80)}..." maxTurns=${maxTurns}`);
 
       // Phase 1: Plan
+      let planText = "";
       const planMessages: Array<Record<string, unknown>> = [
-        { role: "system", content: `You are a code analyst. Given a task, create a step-by-step plan. Return JSON array: [{"step":1,"description":"..."}]. Max 5 steps. Each step must involve reading or analyzing a specific file or area.` },
+        { role: "system", content: "You are a code analyst. Given a task, list 2-3 steps to investigate it. One step per line. Just plain text, no JSON." },
         { role: "user", content: `Task: ${task}` },
       ];
-      let planText = "1. List files to map the project structure.\n2. Read key source files for the relevant area.\n3. Search for patterns or specific code.\n4. Synthesize findings into analysis.";
       const planResp = await callLLM(planMessages, false, 0.2);
-      if (planResp) {
-        try {
-          const plan = JSON.parse(planResp.content) as Array<{ step: number; description: string }>;
-          planText = plan.map((s) => `Step ${s.step}: ${s.description}`).join("\n");
-          console.log(`[AgenticTools] Plan:\n${planText}`);
-        } catch {
-          console.warn(`[AgenticTools] Plan parse failed, using default.`);
-        }
+      if (planResp?.content) {
+        planText = planResp.content.trim();
+        console.log(`[AgenticTools] Plan:\n${planText}`);
       }
 
       // Phase 2: Execute
-      const systemPrompt = `You are an AI agent that works step by step using tools.
+      const systemPrompt = `You are an AI assistant with tools.
 
-Plan:
-${planText}
-
-RULES:
-- One tool call at a time. After each result, decide the next tool.
-- Do NOT say COMPLETE until you have done ALL steps of the plan.
-- "Exploring" means: list files THEN read the actual file contents.
-- You must read source files — not just list them — to provide real analysis.
-- If you don't know enough, search_files or read more files.
-
-After completing ALL steps, respond:
-COMPLETE: <your final analysis>
-
-Available tools: read_file, list_files, search_files, bash_terminal, web_search, web_fetch, save_memory.
-
-MEMORY RULES (MANDATORY):
-- You MUST call save_memory after EVERY task with your findings. No exceptions.
-- Format: save_memory(content: "your findings", tags: ["task", "result"])
-- Before starting, call search_memory to check for prior context
-- If you find something important, save it IMMEDIATELY with save_memory
-- NEVER complete a task without calling save_memory first
-- Tags organize memories: use ["task", "result"], ["bug", "location"], ["feature", "implementation"]`;
+Rules:
+- Use tools to read/list/search files as needed.
+- After reading enough files, synthesize your findings.
+- When done, respond with COMPLETE: followed by your analysis.`;
 
       const result = await orchestratorLoop(
         systemPrompt,
