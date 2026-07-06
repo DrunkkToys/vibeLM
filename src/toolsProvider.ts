@@ -4,24 +4,38 @@ import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { resolve, dirname, relative, extname } from "path";
 import { homedir } from "os";
+import { randomUUID } from "crypto";
 import * as math from "mathjs";
 import { SessionLog, type MemoryEntry, type TurnEntry } from "./sessionLog";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
 
-const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "agentic-tools", "config.json");
-const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "agentic-tools", "session-log.jsonl");
+const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
+const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "session-log.jsonl");
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
+const PROMPT_BUDGET_RATIO = 0.75;
 const FILE_CACHE_MAX_BYTES = 1024 * 1024;
 const MAX_TOOL_RESULT_CHARS = 3000;
+const MAX_NON_CODE_RESULT_CHARS = 900;
+const COMPACT_CONTEXT_TRIGGER_TURNS = 12;
+const COMPACT_CONTEXT_TRIGGER_RATIO = 0.55;
+const COMPACT_CONTEXT_MIN_GAP_TURNS = 6;
+const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
+const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
+const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const MAX_TURNS = 25;
 const LOOP_WINDOW = 5;
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
+let cachedContextWindow: { value: number; ts: number } | null = null;
 
 async function getContextWindow(): Promise<number> {
+  const now = Date.now();
+  if (cachedContextWindow && now - cachedContextWindow.ts < 60_000) {
+    return cachedContextWindow.value;
+  }
   try {
     const resp = await fetch(`${LM_STUDIO_URL}/v1/models`);
     const data = await resp.json() as any;
@@ -31,8 +45,12 @@ async function getContextWindow(): Promise<number> {
     const target = pickBestModel(models, preferred);
     const model = models.find((m: any) => m.id === target) || models[0];
     const ctx = model?.max_context_length;
-    if (typeof ctx === "number" && ctx > 0) return ctx;
+    if (typeof ctx === "number" && ctx > 0) {
+      cachedContextWindow = { value: ctx, ts: now };
+      return ctx;
+    }
   } catch {}
+  cachedContextWindow = { value: 8192, ts: now };
   return 8192;
 }
 
@@ -124,7 +142,7 @@ function defaultConfig() {
   return { workspacePath: homedir() };
 }
 
-function readConfigSync(): { workspacePath: string } {
+function readConfigSync(): { workspacePath: string; preferredModel?: string; enabledTools?: string[]; searchEndpoint?: string } {
   try {
     const raw = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) : {};
     return { ...defaultConfig(), ...raw };
@@ -140,14 +158,39 @@ function writeConfigSync(config: Record<string, unknown>): void {
 function getWorkspace(sessionDir?: string): string {
   const config = readConfigSync();
   const ws = config.workspacePath?.trim();
-  if (ws) return ws;
-  if (sessionDir) return sessionDir.trim();
+  if (ws) {
+    return existsSync(ws) && statSync(ws).isDirectory() ? ws : "";
+  }
+  if (sessionDir) {
+    const trimmed = sessionDir.trim();
+    if (trimmed && existsSync(trimmed) && statSync(trimmed).isDirectory()) return trimmed;
+  }
   return "";
+}
+
+function formatWorkspaceSetupError(sessionDir?: string): string {
+  const config = readConfigSync();
+  const workspace = config.workspacePath?.trim();
+  if (workspace) {
+    if (!existsSync(workspace)) {
+      return `Workspace path not found: ${workspace}. Call set_workspace({ path: "/absolute/path" }) with an existing folder.`;
+    }
+    if (!statSync(workspace).isDirectory()) {
+      return `Workspace path is not a directory: ${workspace}. Call set_workspace({ path: "/absolute/path" }) with a folder.`;
+    }
+  }
+  if (sessionDir) {
+    const trimmed = sessionDir.trim();
+    if (trimmed && existsSync(trimmed) && !statSync(trimmed).isDirectory()) {
+      return `LM Studio working directory is not a directory: ${trimmed}. Call set_workspace({ path: "/absolute/path" }) with a folder.`;
+    }
+  }
+  return `No workspace set. Call set_workspace({ path: "/absolute/path" }) first.`;
 }
 
 function requireWorkspace(ctl: any): string {
   const ws = getWorkspace(ctl.getWorkingDirectory());
-  if (!ws) throw new Error("No workspace set. Call set_workspace first.");
+  if (!ws) throw new Error(formatWorkspaceSetupError(ctl.getWorkingDirectory()));
   return ws;
 }
 
@@ -169,34 +212,65 @@ function getSessionLog(): SessionLog {
   return globalSessionLog;
 }
 
-let turnCounter = 0;
-let toolCallHistory: Array<{ name: string; ts: number }> = [];
-let sessionStarted = false;
+type SessionState = {
+  sessionId: string;
+  turnCounter: number;
+  toolCallHistory: Array<{ name: string; ts: number }>;
+  lastCompactionTurn: number;
+};
 
-function beginSession(): void {
-  if (!sessionStarted) {
-    sessionStarted = true;
-    turnCounter = 0;
-    toolCallHistory = [];
-  }
+function createSessionState(): SessionState {
+  return {
+    sessionId: randomUUID(),
+    turnCounter: 0,
+    toolCallHistory: [],
+    lastCompactionTurn: 0,
+  };
 }
 
-function currentSessionId(): string {
-  return new Date().toISOString().split("T")[0];
+let activeSessionState = createSessionState();
+
+function resetSessionState(): SessionState {
+  activeSessionState = createSessionState();
+  return activeSessionState;
 }
 
-function detectLoop(name: string): string | null {
-  toolCallHistory.push({ name, ts: Date.now() });
-  if (toolCallHistory.length > LOOP_WINDOW) {
-    toolCallHistory = toolCallHistory.slice(-LOOP_WINDOW);
+function currentSessionId(state: SessionState = activeSessionState): string {
+  return state.sessionId;
+}
+
+function compactSessionTag(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function isOverPromptBudget(text: string, contextWindow: number): boolean {
+  return estimateTokens(text) > Math.floor(contextWindow * PROMPT_BUDGET_RATIO);
+}
+
+function compactTaskReminder(stepCount: number): string {
+  return `[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Do not call respond_to_user until every step is done.]`;
+}
+
+function compactWorkspaceHint(workspace: string, reminder: string): string {
+  return `[Workspace: ${workspace}]${reminder ? `\n\n${reminder}` : ""}`;
+}
+
+function detectLoop(state: SessionState, name: string): string | null {
+  state.toolCallHistory.push({ name, ts: Date.now() });
+  if (state.toolCallHistory.length > LOOP_WINDOW) {
+    state.toolCallHistory = state.toolCallHistory.slice(-LOOP_WINDOW);
   }
-  if (toolCallHistory.length >= 4) {
-    const last4 = toolCallHistory.slice(-4).map(t => t.name);
+  if (state.toolCallHistory.length >= 4) {
+    const last4 = state.toolCallHistory.slice(-4).map(t => t.name);
     if (last4.every(n => n === last4[0])) {
       return last4[0];
     }
   }
-  const window = toolCallHistory.slice(-6);
+  const window = state.toolCallHistory.slice(-6);
   const counts: Record<string, number> = {};
   for (const t of window) {
     counts[t.name] = (counts[t.name] || 0) + 1;
@@ -207,22 +281,552 @@ function detectLoop(name: string): string | null {
   return null;
 }
 
-function wrapTool(toolDef: any, name: string): any {
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function splitLines(text: string): string[] {
+  return text.split(/\r?\n/);
+}
+
+function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
+  const data = unwrapToolResult(result);
+
+  if (name === "read_file" && data && typeof data.content === "string") {
+    const filePath = typeof args.filePath === "string" ? args.filePath : "unknown";
+    return JSON.stringify({
+      ok: data.ok !== false,
+      filePath,
+      contentLength: data.content.length,
+      truncated: true,
+      sourcePolicy: "reference-only",
+    });
+  }
+
+  if (name === "list_files" && data && Array.isArray(data.entries)) {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      path: typeof data.path === "string" ? data.path : undefined,
+      count: typeof data.count === "number" ? data.count : data.entries.length,
+      entries: data.entries.slice(0, 10).map((entry: any) => ({
+        name: entry.name,
+        type: entry.type,
+        size: entry.size ?? null,
+      })),
+      truncated: data.entries.length > 10,
+    });
+  }
+
+  if (name === "search_files" && data && Array.isArray(data.results)) {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      pattern: typeof data.pattern === "string" ? data.pattern : undefined,
+      total: typeof data.total === "number" ? data.total : data.results.length,
+      results: data.results.slice(0, 10).map((entry: any) => ({
+        file: entry.file,
+        line: entry.line,
+        content: entry.content,
+      })),
+      truncated: data.results.length > 10,
+    });
+  }
+
+  if (name === "bash_terminal" && data && typeof data === "object") {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      exitCode: (data as any).exitCode ?? null,
+      stdout: truncateText(String((data as any).stdout ?? ""), MAX_NON_CODE_RESULT_CHARS),
+      stderr: truncateText(String((data as any).stderr ?? ""), MAX_NON_CODE_RESULT_CHARS),
+      killed: Boolean((data as any).killed),
+      signal: (data as any).signal ?? null,
+    });
+  }
+
+  if (name === "web_fetch" && data && typeof data.content === "string") {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      url: typeof args.url === "string" ? args.url : undefined,
+      contentLength: data.content.length,
+      truncated: Boolean(data.truncated),
+      preview: truncateText(data.content, MAX_NON_CODE_RESULT_CHARS),
+    });
+  }
+
+  return stringifyToolResult(result);
+}
+
+function safeJsonParse(text: string): any | null {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function unwrapToolResult(result: any): any {
+  if (!result || typeof result !== "object") return result;
+  if ("data" in result) return result.data;
+  return result;
+}
+
+function stringifyToolResult(result: unknown): string {
+  try {
+    const text = JSON.stringify(result);
+    return truncateText(text, MAX_TOOL_RESULT_CHARS);
+  } catch {
+    return truncateText(String(result), MAX_TOOL_RESULT_CHARS);
+  }
+}
+
+type CompactCodeSnippet = {
+  source: string;
+  path?: string;
+  language?: string;
+  content: string;
+  referenceOnly?: boolean;
+};
+
+type CompactContextResult = {
+  sessionId: string;
+  turnCount: number;
+  tokenEstimate: number;
+  budget: {
+    maxTokens: number;
+    safetyMargin: number;
+    triggerThreshold: number;
+  };
+  goal: string;
+  nextActions: string[];
+  openIssues: string[];
+  completedSteps: string[];
+  importantPaths: string[];
+  codeSnippets: CompactCodeSnippet[];
+  recentCommands: string[];
+  sourceTurns: number[];
+  savedToMemory: boolean;
+  needsMoreContext: boolean;
+  reason: string;
+};
+
+function extractPathLikeStrings(text: string): string[] {
+  const paths = new Set<string>();
+  const pathRe = /(?:^|[\s("'`])((?:\.{1,2}\/|\/)[^"'`\s]+|(?:[A-Za-z]:\\)[^"'`\s]+|(?:[\w.-]+\/)+[\w.-]+)(?=$|[\s)"'`.,:;!?])/g;
+  let match: RegExpExecArray | null;
+  while ((match = pathRe.exec(text)) !== null) {
+    const candidate = match[1].replace(/[),.;:!?]+$/, "");
+    if (candidate.length > 1) paths.add(candidate);
+  }
+  return [...paths];
+}
+
+function inferLanguageFromPath(filePath?: string): string | undefined {
+  if (!filePath) return undefined;
+  const ext = extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".ts":
+    case ".tsx":
+      return "typescript";
+    case ".js":
+    case ".jsx":
+      return "javascript";
+    case ".json":
+      return "json";
+    case ".md":
+      return "markdown";
+    case ".yml":
+    case ".yaml":
+      return "yaml";
+    case ".py":
+      return "python";
+    case ".sh":
+      return "bash";
+    case ".css":
+      return "css";
+    case ".html":
+      return "html";
+    default:
+      return undefined;
+  }
+}
+
+function extractGoalHint(
+  session: SessionLog,
+  sessionId: string,
+  goalHint?: string,
+): string {
+  if (goalHint?.trim()) return goalHint.trim();
+
+  const memories = session.readRecentMemories(100, sessionId);
+  for (const entry of memories) {
+    if (entry.tags.some((tag) => /goal|objective|task|plan/i.test(tag)) && entry.content.trim()) {
+      return truncateText(entry.content.trim(), 400);
+    }
+  }
+
+  const checkpoints = session.readRecentCheckpoints(50, sessionId);
+  const lastCheckpoint = checkpoints[checkpoints.length - 1];
+  if (lastCheckpoint?.summary?.trim()) return truncateText(lastCheckpoint.summary.trim(), 400);
+
+  return "Need more context to determine the active goal.";
+}
+
+function extractToolPayload(entry: TurnEntry): { name: string; args: any; result: any; rawResult: string } | null {
+  const call = entry.toolCalls?.[0];
+  if (!call) return null;
+  return {
+    name: call.name,
+    args: safeJsonParse(call.args),
+    result: safeJsonParse(call.result ?? ""),
+    rawResult: call.result ?? "",
+  };
+}
+
+function extractCodeSnippetsFromTurn(entry: TurnEntry): CompactCodeSnippet[] {
+  const payload = extractToolPayload(entry);
+  if (!payload) return [];
+  const snippets: CompactCodeSnippet[] = [];
+  const { name, args, result, rawResult } = payload;
+  const data = unwrapToolResult(result);
+
+  if (name === "read_file" && typeof args?.filePath === "string") {
+    snippets.push({
+      source: `turn:${entry.turn}:${name}`,
+      path: args.filePath,
+      language: inferLanguageFromPath(args.filePath),
+      content: "",
+      referenceOnly: true,
+    });
+  }
+
+  if ((name === "write_file" || name === "append_file") && typeof args?.content === "string") {
+    snippets.push({
+      source: `turn:${entry.turn}:${name}`,
+      path: typeof args?.filePath === "string" ? args.filePath : undefined,
+      language: inferLanguageFromPath(typeof args?.filePath === "string" ? args.filePath : undefined),
+      content: "",
+      referenceOnly: true,
+    });
+  }
+
+  return snippets;
+}
+
+function buildCompactContextState(
+  session: SessionLog,
+  state: SessionState,
+  options: {
+    maxTokens: number;
+    goalHint?: string;
+    includeCode: boolean;
+  },
+): CompactContextResult {
+  const sessionId = currentSessionId(state);
+  const recentTurns = session.readRecentTurns(COMPACT_CONTEXT_MAX_RECENT_TURNS, sessionId);
+  const recentMemories = session.readRecentMemories(100, sessionId);
+  const recentCheckpoints = session.readRecentCheckpoints(100, sessionId);
+  const sourceTurns = recentTurns.map((turn) => turn.turn);
+  const interestingTurns = recentTurns.slice(-24);
+
+  const completedSteps = new Set<string>();
+  const openIssues = new Set<string>();
+  const importantPaths = new Set<string>();
+  const recentCommands = new Set<string>();
+  const codeSnippets: CompactCodeSnippet[] = [];
+
+  for (const entry of interestingTurns) {
+    const payload = extractToolPayload(entry);
+    if (!payload) continue;
+
+    const { name, args, result, rawResult } = payload;
+    const data = unwrapToolResult(result);
+    const ok = result && typeof result === "object" ? result.ok !== false : !/error/i.test(rawResult);
+    const errorText = typeof result?.error === "string" ? result.error : typeof result?.message === "string" ? result.message : rawResult;
+
+    if (ok) {
+      if (name === "read_file" && typeof args?.filePath === "string") {
+        completedSteps.add(`Read ${args.filePath}`);
+        importantPaths.add(args.filePath);
+      } else if (name === "list_files" && typeof args?.path === "string") {
+        completedSteps.add(`Listed ${args.path}`);
+        importantPaths.add(args.path);
+      } else if (name === "search_files" && typeof args?.path === "string") {
+        completedSteps.add(`Searched ${args.path}`);
+        importantPaths.add(args.path);
+      } else if (name === "write_file" && typeof args?.filePath === "string") {
+        completedSteps.add(`Wrote ${args.filePath}`);
+        importantPaths.add(args.filePath);
+      } else if (name === "append_file" && typeof args?.filePath === "string") {
+        completedSteps.add(`Appended ${args.filePath}`);
+        importantPaths.add(args.filePath);
+      } else if (name === "rename_file" && typeof args?.sourcePath === "string" && typeof args?.destPath === "string") {
+        completedSteps.add(`Renamed ${args.sourcePath} → ${args.destPath}`);
+        importantPaths.add(args.sourcePath);
+        importantPaths.add(args.destPath);
+      } else if (name === "bash_terminal" && typeof args?.command === "string") {
+        completedSteps.add(`Ran shell command: ${truncateText(args.command, 120)}`);
+        recentCommands.add(args.command);
+      } else {
+        completedSteps.add(name);
+      }
+    } else {
+      const issue = `${name}: ${truncateText(String(errorText || "failed"), 200)}`;
+      openIssues.add(issue);
+    }
+
+    for (const path of extractPathLikeStrings(JSON.stringify(args ?? {}))) {
+      importantPaths.add(path);
+    }
+    for (const path of extractPathLikeStrings(rawResult)) {
+      importantPaths.add(path);
+    }
+
+    if (options.includeCode) {
+      for (const snippet of extractCodeSnippetsFromTurn(entry)) {
+        if (snippet.referenceOnly || snippet.content.trim()) codeSnippets.push(snippet);
+      }
+    }
+  }
+
+  const latestCompactMemory = [...recentMemories].reverse().find((entry) => entry.tags.some((tag) => /compact_context/i.test(tag)));
+
+  if (latestCompactMemory?.content) {
+    const existing = latestCompactMemory.content;
+    for (const path of extractPathLikeStrings(existing)) importantPaths.add(path);
+    for (const line of splitLines(existing)) {
+      if (/^-\s+/.test(line) || /^\*\s+/.test(line)) {
+        if (/open issue/i.test(line)) openIssues.add(line.replace(/^[-*]\s+/, ""));
+        if (/next action/i.test(line)) completedSteps.add(line.replace(/^[-*]\s+/, ""));
+      }
+    }
+  }
+
+  const goal = extractGoalHint(session, sessionId, options.goalHint);
+  const budgetText = [
+    `Goal: ${goal}`,
+    `Completed steps: ${[...completedSteps].join("; ")}`,
+    `Open issues: ${[...openIssues].join("; ")}`,
+    `Important paths: ${[...importantPaths].join("; ")}`,
+    `Recent commands: ${[...recentCommands].join("; ")}`,
+    `Code snippets: ${codeSnippets.map((snippet) => snippet.content).join("\n")}`,
+  ].join("\n");
+
+  const tokenEstimate = estimateTokens(budgetText);
+  const reason = recentTurns.length === 0
+    ? "No recent turns available."
+    : tokenEstimate > options.maxTokens
+      ? "Compacted state exceeds the configured budget."
+      : "Compacted recent turns into reusable state.";
+
+  const nextActions: string[] = [];
+  if (openIssues.size > 0) {
+    nextActions.push("Resolve the open issues before continuing.");
+  }
+  if (completedSteps.size === 0) {
+    nextActions.push("Collect more signal from the session before taking action.");
+  } else {
+    nextActions.push("Continue from the latest completed step.");
+  }
+  if (recentCommands.size > 0) {
+    nextActions.push("Reuse the most recent shell commands only if they still apply.");
+  }
+
+  const snippets = options.includeCode
+    ? codeSnippets
+        .slice(0, 5)
+        .map((snippet) => ({
+          ...snippet,
+          content: truncateText(snippet.content, 800),
+        }))
+    : [];
+
+  const compact: CompactContextResult = {
+    sessionId,
+    turnCount: state.turnCounter,
+    tokenEstimate,
+    budget: {
+      maxTokens: options.maxTokens,
+      safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+      triggerThreshold: Math.floor(options.maxTokens * COMPACT_CONTEXT_TRIGGER_RATIO),
+    },
+    goal,
+    nextActions,
+    openIssues: [...openIssues].slice(0, 10),
+    completedSteps: [...completedSteps].slice(0, 20),
+    importantPaths: [...importantPaths].slice(0, 20),
+    codeSnippets: snippets,
+    recentCommands: [...recentCommands].slice(0, 10),
+    sourceTurns,
+    savedToMemory: false,
+    needsMoreContext: recentTurns.length < 2 || (completedSteps.size === 0 && openIssues.size === 0 && snippets.length === 0),
+    reason,
+  };
+
+  return compact;
+}
+
+function compactContextText(state: CompactContextResult): string {
+  const lines = [
+    `sessionId: ${state.sessionId}`,
+    `turnCount: ${state.turnCount}`,
+    `goal: ${state.goal}`,
+  ];
+
+  if (state.codeSnippets.length > 0) {
+    lines.push(`verbatimCodeSnippets:`);
+    for (const snippet of state.codeSnippets) {
+      lines.push(`- source: ${snippet.source}`);
+      if (snippet.path) lines.push(`  path: ${snippet.path}`);
+      if (snippet.language) lines.push(`  language: ${snippet.language}`);
+      if (snippet.referenceOnly) {
+        lines.push(`  content: [omitted; local source should be re-read on demand]`);
+      } else {
+        lines.push(`  content: |`);
+        lines.push(...snippet.content.split(/\r?\n/).map((line) => `    ${line}`));
+      }
+    }
+  }
+
+  lines.push(`nextActions:`);
+  lines.push(...state.nextActions.map((item) => `- ${item}`));
+  lines.push(`completedSteps:`);
+  lines.push(...state.completedSteps.map((item) => `- ${item}`));
+  lines.push(`openIssues:`);
+  lines.push(...state.openIssues.map((item) => `- ${item}`));
+  lines.push(`importantPaths:`);
+  lines.push(...state.importantPaths.map((item) => `- ${item}`));
+  lines.push(`recentCommands:`);
+  lines.push(...state.recentCommands.map((item) => `- ${item}`));
+
+  lines.push(`sourceTurns: ${state.sourceTurns.join(", ")}`);
+  lines.push(`reason: ${state.reason}`);
+  lines.push(`needsMoreContext: ${state.needsMoreContext}`);
+  return lines.join("\n");
+}
+
+function shouldAutoCompactSession(
+  session: SessionLog,
+  state: SessionState,
+  contextWindow: number,
+): boolean {
+  if (state.turnCounter < COMPACT_CONTEXT_TRIGGER_TURNS) return false;
+  if (state.turnCounter - state.lastCompactionTurn < COMPACT_CONTEXT_MIN_GAP_TURNS) return false;
+  const recentTurns = session.readRecentTurns(COMPACT_CONTEXT_MAX_RECENT_TURNS, currentSessionId(state));
+  if (recentTurns.length === 0) return false;
+  const text = recentTurns.map((entry) => {
+    const payload = extractToolPayload(entry);
+    return [
+      entry.content || "",
+      payload?.rawResult || "",
+      payload?.name || "",
+    ].join("\n");
+  }).join("\n");
+  const tokenEstimate = estimateTokens(text);
+  return tokenEstimate >= Math.floor(contextWindow * COMPACT_CONTEXT_TRIGGER_RATIO);
+}
+
+function saveCompactContext(
+  session: SessionLog,
+  state: SessionState,
+  compact: CompactContextResult,
+): CompactContextResult {
+  const content = compactContextText(compact);
+  session.saveMemory(
+    [
+      "compact_context",
+      compactSessionTag(compact.sessionId),
+      `turn:${compact.turnCount}`,
+    ],
+    content,
+    compact.turnCount,
+    compact.sessionId,
+  );
+  session.saveCheckpoint(
+    `compact_context saved at turn ${compact.turnCount}`,
+    ["compact_context", compactSessionTag(compact.sessionId)],
+    compact.turnCount,
+    compact.sessionId,
+  );
+  state.lastCompactionTurn = compact.turnCount;
+  return { ...compact, savedToMemory: true };
+}
+
+async function compactSessionContext(
+  session: SessionLog,
+  state: SessionState,
+  options: {
+    maxTokens?: number;
+    goalHint?: string;
+    includeCode?: boolean;
+    saveToMemory?: boolean;
+    force?: boolean;
+  } = {},
+): Promise<{ ok: true; data: CompactContextResult } | { ok: false; error: string }> {
+  const maxTokens = Math.max(
+    200,
+    Math.min(
+      options.maxTokens ?? COMPACT_CONTEXT_DEFAULT_MAX_TOKENS,
+      Math.max(COMPACT_CONTEXT_DEFAULT_MAX_TOKENS, options.maxTokens ?? COMPACT_CONTEXT_DEFAULT_MAX_TOKENS),
+    ),
+  );
+  const compact = buildCompactContextState(session, state, {
+    maxTokens,
+    goalHint: options.goalHint,
+    includeCode: options.includeCode !== false,
+  });
+
+  if (!options.force && compact.needsMoreContext) {
+    return {
+      ok: true,
+      data: {
+        ...compact,
+        reason: `${compact.reason} Need more context before a stable compaction is possible.`,
+      },
+    };
+  }
+
+  if (compact.tokenEstimate > maxTokens) {
+    const trimmed = {
+      ...compact,
+      codeSnippets: compact.codeSnippets.slice(0, 2).map((snippet) => ({
+        ...snippet,
+        content: truncateText(snippet.content, 300),
+      })),
+      openIssues: compact.openIssues.slice(0, 5),
+      completedSteps: compact.completedSteps.slice(0, 8),
+      importantPaths: compact.importantPaths.slice(0, 8),
+      recentCommands: compact.recentCommands.slice(0, 5),
+      nextActions: compact.nextActions.slice(0, 4),
+      reason: "Compacted output was trimmed to fit the configured budget.",
+    };
+    if ((trimmed.codeSnippets.length > 0 || trimmed.completedSteps.length > 0 || trimmed.openIssues.length > 0) && options.saveToMemory !== false) {
+      return { ok: true, data: saveCompactContext(session, state, trimmed) };
+    }
+    return { ok: true, data: trimmed };
+  }
+
+  if (options.saveToMemory !== false) {
+    return { ok: true, data: saveCompactContext(session, state, compact) };
+  }
+  return { ok: true, data: compact };
+}
+
+function wrapTool(toolDef: any, name: string, sessionState: SessionState = activeSessionState): any {
   const origImpl = toolDef.implementation;
+  const state = sessionState;
   return {
     ...toolDef,
     implementation: async (args: Record<string, unknown>, ctx: any) => {
-      beginSession();
-      turnCounter++;
+      state.turnCounter++;
 
-      if (turnCounter > MAX_TURNS) {
+      if (state.turnCounter > MAX_TURNS) {
         return {
           ok: false,
           error: `Max turns (${MAX_TURNS}) exceeded. Use respond_to_user with what you have so far.`,
         };
       }
 
-      const looped = detectLoop(name);
+      const looped = detectLoop(state, name);
       if (looped) {
         return {
           ok: false,
@@ -230,7 +834,7 @@ function wrapTool(toolDef: any, name: string): any {
         };
       }
 
-      console.log(`[AgenticTools] [turn ${turnCounter}] Tool: ${name}`);
+      console.log(`[AgenticTools] [turn ${state.turnCounter}] Tool: ${name}`);
 
       let result: any;
       try {
@@ -240,23 +844,39 @@ function wrapTool(toolDef: any, name: string): any {
       }
 
       const log = getSessionLog();
+      const serializedResult = stringifyToolResult(result);
       const turnEntry: TurnEntry = {
         type: "turn",
-        sessionId: currentSessionId(),
+        sessionId: currentSessionId(state),
         ts: new Date().toISOString(),
-        turn: turnCounter,
+        turn: state.turnCounter,
         role: "tool",
         content: name,
-        toolCalls: [{ name, args: JSON.stringify(args), result: JSON.stringify(result).slice(0, 500) }],
+        toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
       };
       log.startTurn(turnEntry);
+      if (!["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
+        log.saveMemory([`turn:${state.turnCounter}`, `tool:${name}`], `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state));
+      }
 
-      if (turnCounter % 5 === 0) {
+      if (state.turnCounter % 5 === 0) {
         log.saveCheckpoint(
-          `Turn ${turnCounter}: called ${name} — result ok=${result?.ok}`,
-          ["checkpoint", `turn:${turnCounter}`],
-          turnCounter,
+          `Turn ${state.turnCounter}: called ${name} — result ok=${result?.ok}`,
+          ["checkpoint", `turn:${state.turnCounter}`],
+          state.turnCounter,
+          currentSessionId(state),
         );
+      }
+
+      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow())) {
+        const compact = await compactSessionContext(log, state, {
+          saveToMemory: true,
+          includeCode: true,
+          force: true,
+        });
+        if (compact.ok) {
+          console.log(`[AgenticTools] Auto-compacted session ${currentSessionId(state)} at turn ${state.turnCounter}`);
+        }
       }
 
       return result;
@@ -291,6 +911,9 @@ function fail(msg: string) {
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
 
 export async function toolsProvider(ctl: ToolsProviderController) {
+  const sessionState = resetSessionState();
+  activeSessionState = sessionState;
+
   const setWorkspaceTool = wrapTool(tool({
     name: "set_workspace",
     description: text`Changes the workspace root for all file and bash operations. The workspace is persisted across sessions.
@@ -301,7 +924,8 @@ EXAMPLE: set_workspace({ path: "/Users/name/project" })`,
     },
     implementation: async ({ path }) => {
       const resolved = resolve(path);
-      if (!existsSync(resolved)) return fail(`Path does not exist: ${resolved}`);
+      if (!existsSync(resolved)) return fail(`Workspace path not found: ${resolved}. Call set_workspace({ path: "/absolute/path" }) with an existing folder.`);
+      if (!statSync(resolved).isDirectory()) return fail(`Workspace path is not a directory: ${resolved}. Call set_workspace({ path: "/absolute/path" }) with a folder.`);
       const config = readConfigSync();
       const prev = config.workspacePath;
       config.workspacePath = resolved;
@@ -318,12 +942,16 @@ EXAMPLE: get_config()`,
     parameters: {},
     implementation: async () => {
       const config = readConfigSync();
+      const session = getSessionLog();
       return ok({
         workspace: requireWorkspace(ctl),
+        sessionId: currentSessionId(sessionState),
         configFile: CONFIG_PATH,
         configFileExists: existsSync(CONFIG_PATH),
         config,
-        totalMemories: getSessionLog().totalTurnsLogged(),
+        totalMemories: session.countEntriesByType("mem"),
+        totalCheckpoints: session.countEntriesByType("checkpoint"),
+        totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
       });
     },
@@ -393,19 +1021,23 @@ NOTE: This uses the system clock. Timezone reflects local machine settings.`,
 
   const respondToUserTool = tool({
     name: "respond_to_user",
-    description: text`Produces your final answer to the user. Call this when you have completed all necessary steps and are ready to respond.
-USE WHEN: you have gathered all information, analyzed it, and are ready to present your findings.
-EXAMPLE: respond_to_user({ text: "Here is a summary of what I found..." })
-NOTE: Call this ONLY when you're done. After calling it, your work is complete.
-IMPORTANT: This is the ONLY way to produce output. Do NOT try to write a response as text — use this tool.`,
+    description: text`Call this ONLY after completing EVERY step the user requested. If steps remain, call the next tool instead.
+USE WHEN: all requested files are read, all analysis done, all output files written.
+EXAMPLE: respond_to_user({ text: "Here is the complete analysis..." })`,
     parameters: {
       text: z.string().min(1).max(100000).describe("Your complete final response to the user"),
     },
     implementation: async ({ text }) => {
+      // Detect early/passive responses and reject them
+      if (/let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
+        return {
+          ok: false,
+          error: "You called respond_to_user too early. Continue with the next step in the user's request. Only call respond_to_user when EVERY step is complete.",
+        };
+      }
       return {
         ok: true,
         data: { text },
-        _final: true,
       };
     },
   });
@@ -659,10 +1291,36 @@ NOTE: Tags are searchable via search_memory. Use descriptive tags for easy retri
       tags: z.array(z.string().max(50)).min(1).max(20).describe("Tags like ['project:myapp', 'language:python']"),
     },
     implementation: async ({ content, tags }) => {
-      getSessionLog().saveMemory(tags, content);
+      getSessionLog().saveMemory(tags, content, undefined, currentSessionId(sessionState));
       return ok({ saved: true });
     },
   }), "save_memory");
+
+  const compactContextTool = wrapTool(tool({
+    name: "compact_context",
+    description: text`Compacts the recent session into a reusable summary while preserving code verbatim.
+USE WHEN: the session is getting long, repetitive, or you want a compact reusable state.
+RULES: prose may be summarized; code must be preserved verbatim or referenced by path; code must never be paraphrased.
+EXAMPLE: compact_context({ saveToMemory: true })
+NOTE: This stores a compact snapshot in memory so later turns can reload it without replaying full history.`,
+    parameters: {
+      maxTokens: z.number().int().min(200).max(20000).optional().default(COMPACT_CONTEXT_DEFAULT_MAX_TOKENS).describe("Maximum token budget for the compact state"),
+      includeCode: z.boolean().optional().default(true).describe("Whether to preserve verbatim code snippets when possible"),
+      saveToMemory: z.boolean().optional().default(true).describe("Store the compacted state in persistent memory"),
+      force: z.boolean().optional().default(false).describe("Return a compacted state even if the session signal is weak"),
+      goalHint: z.string().min(1).max(2000).optional().describe("Optional goal hint when the session log does not have one"),
+    },
+    implementation: async ({ maxTokens, includeCode, saveToMemory, force, goalHint }) => {
+      const session = getSessionLog();
+      return await compactSessionContext(session, sessionState, {
+        maxTokens,
+        includeCode,
+        saveToMemory,
+        force,
+        goalHint,
+      });
+    },
+  }), "compact_context");
 
   const searchMemoryTool = wrapTool(tool({
     name: "search_memory",
@@ -696,7 +1354,7 @@ EXAMPLE: list_memories()
 NOTE: Use search_memory to find specific entries. This only returns the total count.`,
     parameters: {},
     implementation: async () => {
-      const total = getSessionLog().totalTurnsLogged();
+      const total = getSessionLog().countEntriesByType("mem");
       return ok({ totalEntries: total, message: "Use search_memory to find specific entries." });
     },
   }), "list_memories");
@@ -868,6 +1526,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     set_workspace: setWorkspaceTool,
     get_config: getConfigTool,
     save_memory: saveMemoryTool,
+    compact_context: compactContextTool,
     search_memory: searchMemoryTool,
     list_memories: listMemoriesTool,
     update_memory: updateMemoryTool,
@@ -895,7 +1554,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
   };
 
   const DEFAULT_ENABLED = [
-    "set_workspace", "get_config", "save_memory", "search_memory",
+    "set_workspace", "get_config", "save_memory", "compact_context", "search_memory",
     "web_fetch", "web_search",
     "read_file", "list_files", "search_files", "bash_terminal",
     "calculate", "get_current_datetime", "write_file",
@@ -922,6 +1581,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 
 export async function preprocessMessage(text: string): Promise<string | null> {
   const t = text.trim();
+  const contextWindow = await getContextWindow();
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
   if (wsMatch) {
@@ -931,9 +1591,26 @@ export async function preprocessMessage(text: string): Promise<string | null> {
       const cfg = readConfigSync();
       cfg.workspacePath = resolved;
       writeConfigSync(cfg);
-      return `[Tool executed: set_workspace → workspace is now ${resolved}]`;
+      const rest = t.replace(wsMatch[0], "").trim();
+      const stepsMatch = rest.match(/^\d+\.\s/gm);
+      const reminder = stepsMatch ? compactTaskReminder(stepsMatch.length) : "";
+      const processed = `${compactWorkspaceHint(resolved, reminder)}${rest ? `\n\n${rest}` : ""}`;
+      if (isOverPromptBudget(processed, contextWindow)) {
+        return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+      }
+      return processed;
     }
     return `[Tool error: set_workspace → path not found: ${resolved}]`;
+  }
+
+  // Inject step-completion reminder for multi-step requests
+  const steps = t.match(/^\d+\.\s/gm);
+  if (steps && steps.length > 0) {
+    const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
+    if (isOverPromptBudget(processed, contextWindow)) {
+      return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+    }
+    return processed;
   }
 
   const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
@@ -954,7 +1631,11 @@ export async function preprocessMessage(text: string): Promise<string | null> {
       const results = await webSearch(searchMatch[1], 5);
       if (results.length > 0) {
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
-        return `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
+        const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
+        if (isOverPromptBudget(processed, contextWindow)) {
+          return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+        }
+        return processed;
       }
       return `[Tool executed: web_search → no results found]`;
     } catch (e: any) {

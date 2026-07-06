@@ -1,5 +1,5 @@
 {
-  "name": "lms-plugin-agentic-tools",
+  "name": "vibe-lm",
   "version": "1.0.0",
   "description": "A comprehensive set of agentic tools for LM Studio: web fetching, calculator, datetime, file operations, web search, and more.",
   "main": "dist/index.js",

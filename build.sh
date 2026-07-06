@@ -2,11 +2,13 @@
 set -euo pipefail
 
 SOURCE_DIR="/Users/drunkktoys/Desktop/vibeLM"
-INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/agentic-tools"
+INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibe-lm"
+LEGACY_INSTALL_DIR_1="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/agentic-tools"
+LEGACY_INSTALL_DIR_2="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibeLM"
 
 echo ""
 echo "═══════════════════════════════════════════════════════"
-echo "  Building agentic-tools plugin"
+echo "  Building vibeLM plugin"
 echo "═══════════════════════════════════════════════════════"
 echo ""
 
@@ -25,6 +27,7 @@ fi
 
 # 3. Install via LM Studio
 echo "▸ Installing plugin..."
+(rm -rf "$LEGACY_INSTALL_DIR_1" "$LEGACY_INSTALL_DIR_2")
 (cd "$SOURCE_DIR" && lms dev --install --yes)
 echo "  ✓ Plugin installed"
 
