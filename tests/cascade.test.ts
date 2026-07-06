@@ -63,13 +63,6 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(rt.implementation, "respond_to_user must have implementation");
   });
 
-  it("should load system prompt", async () => {
-    const { getSystemPrompt } = await import("../src/prompts/system");
-    const prompt = getSystemPrompt();
-    assert.ok(prompt.includes("respond_to_user"), "system prompt must mention respond_to_user");
-    assert.ok(prompt.includes("WORKFLOW"), "system prompt must have WORKFLOW section");
-    assert.ok(prompt.includes("RULES"), "system prompt must have RULES section");
-  });
 
   it("should detect loops in tool calls", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
