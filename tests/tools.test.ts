@@ -201,11 +201,25 @@ describe("SessionLog", () => {
   });
 
   it("saveMemory stores a memory entry", () => {
-    log.saveMemory(["test-tag", "demo"], "memory content");
+    log.saveMemory(["test-tag", "demo"], "memory content", undefined, "session-1", "/workspace-a", "research");
     const results = log.searchMemoriesByTags(["test-tag"]);
     assert.equal(results.length, 1);
     assert.equal(results[0].content, "memory content");
     assert.deepEqual(results[0].tags, ["test-tag", "demo"]);
+    assert.equal(results[0].sessionId, "session-1");
+    assert.equal(results[0].workspace, "/workspace-a");
+    assert.equal(results[0].scope, "research");
+  });
+
+  it("countMemories respects scope filters", () => {
+    log.saveMemory(["scope-a"], "workspace memory", undefined, "session-a", "/workspace-a", "workspace");
+    log.saveMemory(["scope-b"], "session memory", undefined, "session-b", "/workspace-a", "session");
+    log.saveMemory(["scope-c"], "research memory", undefined, "session-c", "/workspace-b", "research");
+
+    assert.equal(log.countMemories({ workspace: "/workspace-a", scope: "workspace" }), 1);
+    assert.equal(log.countMemories({ workspace: "/workspace-a", sessionId: "session-b", scope: "session" }), 1);
+    assert.equal(log.countMemories({ scope: "research" }), 1);
+    assert.equal(log.countMemories({ scope: "all" }), 3);
   });
 
   it("searchMemoriesByTags finds entries by tag", () => {
@@ -223,7 +237,7 @@ describe("SessionLog", () => {
   });
 
   it("searchMemoriesByContent finds entries by text", () => {
-    log.saveMemory(["tag1"], "unique searchable text");
+    log.saveMemory(["tag1"], "unique searchable text", undefined, "session-1", "/workspace-a", "workspace");
     const results = log.searchMemoriesByContent("unique");
     assert.equal(results.length, 1);
     assert.equal(results[0].content, "unique searchable text");
@@ -272,5 +286,19 @@ describe("SessionLog", () => {
     log.clear();
     assert.equal(log.getWorkingWindow().length, 0);
     assert.equal(log.searchMemoriesByTags(["x"]).length, 0);
+  });
+
+  it("searchMemoriesByTags respects workspace, session, and research scope filters", () => {
+    log.saveMemory(["scope-a"], "workspace memory", undefined, "session-a", "/workspace-a", "workspace");
+    log.saveMemory(["scope-b"], "session memory", undefined, "session-b", "/workspace-a", "session");
+    log.saveMemory(["scope-c"], "research memory", undefined, "session-c", "/workspace-b", "research");
+
+    const workspaceResults = log.searchMemoriesByTags(["scope-a"], 10, { workspace: "/workspace-a", scope: "workspace" });
+    const sessionResults = log.searchMemoriesByTags(["scope-b"], 10, { workspace: "/workspace-a", sessionId: "session-b", scope: "session" });
+    const researchResults = log.searchMemoriesByTags(["scope-c"], 10, { scope: "research" });
+
+    assert.equal(workspaceResults.length, 1);
+    assert.equal(sessionResults.length, 1);
+    assert.equal(researchResults.length, 1);
   });
 });
