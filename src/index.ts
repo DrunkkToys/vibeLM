@@ -2,9 +2,6 @@ console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage } from "@lmstudio/sdk";
 import { toolsProvider, preprocessMessage } from "./toolsProvider";
-import { getSystemPrompt } from "./prompts/system";
-
-let systemPromptInjected = false;
 
 export async function main(context: PluginContext) {
   console.log("[AgenticTools] main() called");
@@ -28,14 +25,6 @@ export async function main(context: PluginContext) {
   context.withPromptPreprocessor(async (_ctl: any, userMessage: ChatMessage) => {
     const text = userMessage.getText();
     if (!text) return userMessage;
-
-    if (!systemPromptInjected) {
-      systemPromptInjected = true;
-      const systemPrompt = getSystemPrompt();
-      userMessage.replaceText(`${systemPrompt}\n\n${text}`);
-      console.log("[AgenticTools] System prompt injected (prepended to first user message)");
-      return userMessage;
-    }
 
     const processed = await preprocessMessage(text);
     if (processed) return processed;
