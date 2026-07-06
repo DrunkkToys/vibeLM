@@ -82,7 +82,7 @@ The plugin keeps the LM Studio install path in kebab-case for compatibility, but
 
 ## Publishing
 
-- GitHub Releases: push a tag like `v1.0.0`. The release workflow should build, test, and attach a plugin artifact.
+- GitHub Releases: push a tag like `v0.1.0`. The release workflow should build, test, and attach a plugin artifact.
 - LM Studio community: run `lms push` from the plugin directory after logging in to LM Studio.
 - The manifest name stays `vibe-lm` because LM Studio expects kebab-case.
 - If you need an organization publish target, change the `owner` field in `manifest.json` before pushing.

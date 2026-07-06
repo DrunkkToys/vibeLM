@@ -317,6 +317,73 @@ describe("vibeLM Cascade Integration", () => {
       "long read-heavy sessions should auto-save a compact_context memory entry",
     );
   });
+
+  it("should complete a full user journey end to end", async () => {
+    const { preprocessMessage, toolsProvider } = await import("../src/toolsProvider");
+
+    const workspaceRequest = await preprocessMessage(`set workspace ${TEST_DIR}`);
+    assert.ok(workspaceRequest, "workspace setup should be rewritten by the preprocessor");
+    assert.match(workspaceRequest!, /\[vibeLM:managed-context\]/, "workspace setup should inject managed context");
+    assert.match(workspaceRequest!, new RegExp(TEST_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "workspace path should be preserved in the prompt");
+
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const toolMap = new Map(tools.map((tool: any) => [tool.name, tool]));
+
+    const configResult = await toolMap.get("get_config").implementation({});
+    assert.ok(configResult?.ok, `get_config should succeed: ${JSON.stringify(configResult)}`);
+    assert.equal(configResult.data.workspace, TEST_DIR);
+    assert.ok(configResult.data.promptBudget.limitTokens > 0, "prompt budget should be reported");
+
+    const listResult = await toolMap.get("list_files").implementation({ path: "." });
+    assert.ok(listResult?.ok, `list_files should succeed: ${JSON.stringify(listResult)}`);
+    assert.ok(
+      listResult.data.entries.some((entry: any) => entry.name === "README.md"),
+      "user journey should see the repository README",
+    );
+    assert.ok(
+      listResult.data.entries.some((entry: any) => entry.name === "src"),
+      "user journey should see the source tree",
+    );
+
+    const readResult = await toolMap.get("read_file").implementation({ filePath: "src/snippet.ts", maxChars: 2000, offset: 0 });
+    assert.ok(readResult?.ok, `read_file should succeed: ${JSON.stringify(readResult)}`);
+    assert.match(readResult.data.content, /export const meaning = 42;/, "user journey should read exact code");
+
+    const memoryResult = await toolMap.get("save_memory").implementation({
+      content: "User journey: workspace, file inspection, memory, compaction, final response.",
+      tags: ["journey", "user-flow"],
+      scope: "workspace",
+    });
+    assert.ok(memoryResult?.ok, `save_memory should succeed: ${JSON.stringify(memoryResult)}`);
+
+    const memorySearch = await toolMap.get("search_memory").implementation({
+      tags: ["journey"],
+      maxResults: 10,
+      scope: "workspace",
+    });
+    assert.ok(memorySearch?.ok, `search_memory should succeed: ${JSON.stringify(memorySearch)}`);
+    assert.ok(
+      memorySearch.data.results.some((entry: any) => String(entry.content).includes("workspace, file inspection, memory, compaction")),
+      "saved journey memory should be recoverable",
+    );
+
+    const compactResult = await toolMap.get("compact_context").implementation({
+      maxTokens: 600,
+      includeCode: true,
+      saveToMemory: true,
+      force: true,
+      goalHint: "Validate the full user journey from workspace setup to final response.",
+    });
+    assert.ok(compactResult?.ok, `compact_context should succeed: ${JSON.stringify(compactResult)}`);
+    assert.match(compactResult.data.handoff, /Start a new chat/i, "user journey should include a handoff block");
+    assert.ok(compactResult.data.savedToMemory, "compaction should be stored for reuse");
+    assert.ok(compactResult.data.importantPaths.includes("src/snippet.ts"), "user journey should keep important paths");
+
+    const respondResult = await toolMap.get("respond_to_user").implementation({
+      text: "Done. I checked the workspace, read the code, saved memory, compacted context, and validated the final handoff.",
+    });
+    assert.ok(respondResult?.ok, `respond_to_user should accept a completed final response: ${JSON.stringify(respondResult)}`);
+  });
 });
 
 describe("SessionLog", () => {
