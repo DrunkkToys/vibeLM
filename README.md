@@ -43,6 +43,7 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 - Code is preserved verbatim or referenced by path, never paraphrased.
 - Memory entries are tagged with workspace, session, and semantic scope so you can search by `session`, `workspace`, `research`, or `all`.
 - `get_config` shows the current prompt-budget estimate, safety margin, and overflow risk.
+- LM Studio’s plugin settings UI exposes `maxOrchestratorTurns`, which defaults to `50` and controls how many tool turns the orchestrator can use before it must stop.
 - `respond_to_user` is gated so the orchestrator does not stop too early.
 - The plugin tries to stay under the model’s prompt budget and auto-compacts when sessions get large.
 

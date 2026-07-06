@@ -28,6 +28,19 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
   writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify(merged, null, 2));
 }
 
+function makeCtl(maxOrchestratorTurns?: number) {
+  const base = { getWorkingDirectory: () => TEST_DIR };
+  if (typeof maxOrchestratorTurns !== "number") {
+    return base as any;
+  }
+  return {
+    ...base,
+    getPluginConfig: () => ({
+      get: (key: string) => (key === "maxOrchestratorTurns" ? maxOrchestratorTurns : undefined),
+    }),
+  } as any;
+}
+
 describe("vibeLM Cascade Integration", () => {
   before(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
@@ -99,13 +112,45 @@ describe("vibeLM Cascade Integration", () => {
 
   it("should return real workspace from get_config when workspace is set", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
-    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const tools = await toolsProvider(makeCtl());
     const gc = tools.find((t: any) => t.name === "get_config");
     assert.ok(gc, "get_config tool must be present");
     const result = await gc.implementation({});
     assert.ok(result?.ok, `get_config should succeed: ${JSON.stringify(result)}`);
     assert.equal(result.data.workspace, TEST_DIR);
     assert.ok(typeof result.data.sessionId === "string" && result.data.sessionId.length > 10, "sessionId must be present");
+    assert.equal(result.data.maxOrchestratorTurns, 50, "default max turns should be 50");
+  });
+
+  it("should honor the configured maxOrchestratorTurns limit", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl(1));
+    const gc = tools.find((t: any) => t.name === "get_config");
+    const respondToUser = tools.find((t: any) => t.name === "respond_to_user");
+    assert.ok(gc, "get_config tool must be present");
+    assert.ok(respondToUser, "respond_to_user tool must be present");
+
+    const first = await gc.implementation({});
+    assert.ok(first?.ok, `first call should succeed: ${JSON.stringify(first)}`);
+    assert.equal(first.data.maxOrchestratorTurns, 1, "configured max turns should be reported");
+
+    const second = await gc.implementation({});
+    assert.ok(!second?.ok, "second call should fail when the configured cap is 1");
+    assert.match(String(second.error), /Max turns \(1\) exceeded/i);
+
+    const finalResponse = await respondToUser.implementation({ text: "Let me know if you want more." });
+    assert.ok(finalResponse?.ok, `respond_to_user should remain available after the cap: ${JSON.stringify(finalResponse)}`);
+  });
+
+  it("should still reject passive handoffs before the cap is reached", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl(50));
+    const respondToUser = tools.find((t: any) => t.name === "respond_to_user");
+    assert.ok(respondToUser, "respond_to_user tool must be present");
+
+    const result = await respondToUser.implementation({ text: "Let me know if you want more." });
+    assert.ok(!result?.ok, "passive handoff should be rejected before the cap");
+    assert.match(String(result.error), /passive handoff/i);
   });
 
   it("should create a fresh session id for each toolsProvider instance", async () => {
