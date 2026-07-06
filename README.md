@@ -12,14 +12,13 @@ It gives a model practical tooling for real work:
 
 The goal is simple: keep the model useful in long, read-heavy sessions without forcing the user to switch tools or lose important context.
 
-## Product Goals
+## Product Story
 
-- Keep LM Studio sessions actionable for longer
-- Preserve code verbatim when compacting context
-- Make workspace access explicit and sandboxed
-- Keep state recoverable across restarts
-- Keep memory scoped by `workspace`, `session`, and `research`
-- Fail loudly when the workspace, model, or runtime is misconfigured
+vibeLM turns a local LM Studio model into a real agent instead of a chat-only assistant. It is built to do multi-step work, manage files, inspect a workspace, and keep track of what happened without relying on cloud infrastructure.
+
+That matters because the workflow is different from cloud LLMs. With a smaller model like Qwen3 4B, the agent can still execute useful tool flows, but the work is more fragmented and the context has to be managed carefully. With a stronger local model like GLM 4.6 Flash, Qwen3.5, or Gemma 4 E, vibeLM can sustain more reliable multi-step orchestration and keep the session moving.
+
+The point is not to pretend local models behave like hosted frontier systems. The point is to make local models genuinely useful for agentic work, with scoped memory, explicit workspace access, compact session handoff, and a prompt budget gate that fails early instead of blowing up mid-session.
 
 ## What It Does
 
