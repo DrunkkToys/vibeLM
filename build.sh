@@ -42,10 +42,14 @@ echo "▸ Copying dist/ to install dir..."
 cp -r "$SOURCE_DIR/dist" "$INSTALL_DIR/dist"
 echo "  ✓ dist/ copied"
 
-# 6. Copy config.json
-echo "▸ Copying config.json..."
-cp "$SOURCE_DIR/config.json" "$INSTALL_DIR/config.json"
-echo "  ✓ config.json copied"
+# 6. Preserve runtime config.json when it already exists.
+echo "▸ Preserving config.json..."
+if [ ! -f "$INSTALL_DIR/config.json" ]; then
+  cp "$SOURCE_DIR/config.json" "$INSTALL_DIR/config.json"
+  echo "  ✓ config.json initialized"
+else
+  echo "  ✓ config.json preserved"
+fi
 
 # 7. Verify
 echo "▸ Verifying..."

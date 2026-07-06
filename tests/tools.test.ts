@@ -93,6 +93,20 @@ describe("binaryExtCheck", () => {
   });
 });
 
+describe("pickBestModel and VLM_PATTERNS", () => {
+  it("treats glm vision variants as multimodal models", async () => {
+    const { VLM_PATTERNS, pickBestModel } = await import("../src/toolsProvider");
+    assert.equal(VLM_PATTERNS.test("zai-org/glm-4.6v-flash"), true);
+    assert.equal(VLM_PATTERNS.test("qwen/qwen3-4b"), false);
+
+    const chosen = pickBestModel(
+      [{ id: "zai-org/glm-4.6v-flash" }, { id: "qwen/qwen3-4b" }],
+      undefined,
+    );
+    assert.equal(chosen, "qwen/qwen3-4b");
+  });
+});
+
 describe("webSearch", () => {
   let originalFetch: typeof globalThis.fetch;
   const origEnv = process.env.AGENTIC_SEARCH_ENDPOINT;

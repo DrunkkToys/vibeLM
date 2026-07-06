@@ -104,7 +104,7 @@ function binaryExtCheck(p: string): boolean {
   return BINARY_EXTS.has(extname(p).toLowerCase());
 }
 
-const VLM_PATTERNS = /vlm|vision|\d+v\b|video|multimodal|image/i;
+const VLM_PATTERNS = /vlm|vision|video|multimodal|image|\d+(?:\.\d+)?v(?:\b|-)/i;
 
 function pickBestModel(models: Array<{ id: string }>, preferred?: string): string | null {
   if (!models.length) return null;
@@ -305,6 +305,71 @@ async function getHistoryText(ctl?: PromptPreprocessorController): Promise<strin
 
 function hasManagedContext(historyText: string): boolean {
   return historyText.includes(MANAGED_CONTEXT_MARKER);
+}
+
+function parseCompactCommand(text: string): { hard: boolean; keepTurns: number } | null {
+  const compactMatch = text.trim().match(/^compact(?:\s+hard)?(?:\s+(\d+))?$/i);
+  if (!compactMatch) return null;
+  const hard = /\bhard\b/i.test(text);
+  if (hard) {
+    return { hard: true, keepTurns: 0 };
+  }
+  const keepTurns = compactMatch[1] ? Math.max(0, Number.parseInt(compactMatch[1], 10)) : 10;
+  return { hard: false, keepTurns };
+}
+
+function formatCompactTranscript(history: Awaited<ReturnType<PromptPreprocessorController["pullHistory"]>>, keepTurns: number): string {
+  const messages = history.getMessagesArray();
+  const retained = keepTurns > 0 ? messages.filter((message) => message.getRole() !== "system").slice(-keepTurns) : [];
+  if (retained.length === 0) {
+    return "";
+  }
+  return retained
+    .map((message, index) => {
+      const role = message.getRole();
+      const content = message.getText();
+      return `${index + 1}. ${role}: ${content}`;
+    })
+    .join("\n");
+}
+
+async function buildCompactCommand(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
+  const parsed = parseCompactCommand(text);
+  if (!parsed) return null;
+  let history: Awaited<ReturnType<PromptPreprocessorController["pullHistory"]>> | null = null;
+  if (ctl) {
+    try {
+      history = await ctl.pullHistory();
+    } catch {
+      history = null;
+    }
+  }
+  const systemPrompt = history?.getSystemPrompt?.() ?? "";
+  const transcript = history ? formatCompactTranscript(history, parsed.keepTurns) : "";
+  const keepLabel = parsed.hard ? "hard" : `keep ${parsed.keepTurns}`;
+  const parts = [
+    MANAGED_CONTEXT_MARKER,
+    `[compact ${keepLabel}]`,
+    `[vibeLM system prompt: preserved]`,
+    parsed.keepTurns > 0
+      ? `[retained turns: ${parsed.keepTurns}]`
+      : `[retained turns: 0]`,
+  ];
+
+  if (parsed.keepTurns > 0) {
+    parts.push(`[retained transcript]`);
+    if (systemPrompt) {
+      parts.push(`[system prompt reference] ${truncateText(systemPrompt, 500)}`);
+    }
+    if (transcript) {
+      parts.push(transcript);
+    }
+  } else if (systemPrompt) {
+    parts.push(`[system prompt reference] ${truncateText(systemPrompt, 500)}`);
+  }
+
+  parts.push(`[instruction: ignore earlier conversation outside this retained context and continue from the retained state only.]`);
+  return parts.join("\n");
 }
 
 function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
@@ -1599,6 +1664,8 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   const contextWindow = await getContextWindow();
+  const compactCommand = await buildCompactCommand(t, ctl);
+  if (compactCommand) return compactCommand;
   const historyText = await getHistoryText(ctl);
   const managedContextPresent = hasManagedContext(historyText);
 
