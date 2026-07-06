@@ -4,8 +4,8 @@ import { tmpdir, homedir } from "os";
 import { join, resolve, relative, dirname } from "path";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from "fs";
 
-const TEST_DIR = join(tmpdir(), "agentic-tools-test-" + Date.now());
-const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "agentic-tools", "config.json");
+const TEST_DIR = join(tmpdir(), "vibe-lm-test-" + Date.now());
+const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
 
 function sandboxPath(workspace: string, requestedPath: string): string {
   const resolved = resolve(workspace, requestedPath);

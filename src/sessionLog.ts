@@ -70,6 +70,28 @@ export class SessionLog {
     return [...this.workingWindow];
   }
 
+  readRecentEntries(limit: number): JsonlEntry[] {
+    return this.jsonl.readTail(limit);
+  }
+
+  readRecentTurns(limit: number, sessionId?: string): TurnEntry[] {
+    return this.jsonl
+      .readTail(limit)
+      .filter((entry): entry is TurnEntry => entry.type === "turn" && (!sessionId || entry.sessionId === sessionId));
+  }
+
+  readRecentMemories(limit: number, sessionId?: string): MemoryEntry[] {
+    return this.jsonl
+      .readTail(limit)
+      .filter((entry): entry is MemoryEntry => entry.type === "mem" && (!sessionId || entry.sessionId === sessionId));
+  }
+
+  readRecentCheckpoints(limit: number, sessionId?: string): CheckpointEntry[] {
+    return this.jsonl
+      .readTail(limit)
+      .filter((entry): entry is CheckpointEntry => entry.type === "checkpoint" && (!sessionId || entry.sessionId === sessionId));
+  }
+
   saveMemory(tags: string[], content: string, step?: number, sessionId?: string): void {
     const entry: MemoryEntry = {
       type: "mem",
@@ -95,7 +117,9 @@ export class SessionLog {
   }
 
   searchMemoriesByTags(tags: string[], maxResults: number = 5): MemoryEntry[] {
-    return this.jsonl.searchByTags(tags, maxResults) as MemoryEntry[];
+    return this.jsonl
+      .searchByTags(tags, maxResults)
+      .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string");
   }
 
   searchCheckpoints(sessionId: string, maxResults: number = 5): CheckpointEntry[] {
@@ -129,6 +153,12 @@ export class SessionLog {
 
   totalTurnsLogged(): number {
     return this.jsonl.totalLines();
+  }
+
+  countEntriesByType(type: JsonlEntry["type"]): number {
+    const total = this.jsonl.totalLines();
+    if (total === 0) return 0;
+    return this.jsonl.readTail(total).filter((entry) => entry.type === type).length;
   }
 
   compact(): void {

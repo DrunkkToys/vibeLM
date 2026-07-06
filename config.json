@@ -5,7 +5,7 @@
   "skipQualityEval": true,
   "maxResearchTurns": 2,
   "enabledTools": [
-    "set_workspace", "get_config", "save_memory", "search_memory",
+    "set_workspace", "get_config", "save_memory", "compact_context", "search_memory",
     "consult_expert", "web_fetch", "web_search",
     "read_file", "list_files", "search_files", "bash_terminal",
     "calculate", "get_current_datetime", "write_file"

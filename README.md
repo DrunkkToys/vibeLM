@@ -19,10 +19,16 @@
 ## Install
 
 ```bash
-lms clone drunkktoys/agentic-tools
+lms clone drunkktoys/vibe-lm
 # or clone from source:
 git clone https://github.com/DrunkkToys/vibeLM.git
 ```
+
+## Publishing
+
+- GitHub Releases: push a tag like `v1.0.0`. The release workflow runs tests, builds the plugin, and uploads a zip artifact.
+- LM Studio community: run `lms push` from the plugin directory after logging in to LM Studio. The manifest name stays `vibe-lm` because LM Studio requires kebab-case.
+- If you need to publish to an organization, change the `owner` field in `manifest.json` before pushing.
 
 ## Development
 
@@ -43,7 +49,7 @@ npm test       # 30+ unit tests
 
 ## Config
 
-`~/.lmstudio/extensions/plugins/drunkktoys/agentic-tools/config.json`
+`~/.lmstudio/extensions/plugins/drunkktoys/vibe-lm/config.json`
 
 ```json
 { "workspacePath": "/Users/you/my-project" }

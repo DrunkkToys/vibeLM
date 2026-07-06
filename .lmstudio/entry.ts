@@ -90,5 +90,6 @@ import("./../src/index.ts").then(async module => {
   selfRegistrationHost.initCompleted();
 }).catch((error) => {
   console.error("Failed to execute the main function of the plugin.");
+  console.error(`Client: ${clientIdentifier || "unknown"} | Base URL: ${baseUrl || "unknown"}`);
   console.error(error);
 });
