@@ -1,6 +1,7 @@
 console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage } from "@lmstudio/sdk";
+import { configSchematics } from "./config";
 import { toolsProvider, preprocessMessage } from "./toolsProvider";
 
 export async function main(context: PluginContext) {
@@ -20,6 +21,7 @@ export async function main(context: PluginContext) {
 
   console.log("[AgenticTools] Registering tools provider...");
   try {
+    context.withConfigSchematics(configSchematics);
     context.withToolsProvider(toolsProvider);
   } catch (error) {
     console.error("[AgenticTools] Failed to register tools provider.");

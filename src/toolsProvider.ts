@@ -7,6 +7,7 @@ import { homedir } from "os";
 import { randomUUID } from "crypto";
 import * as math from "mathjs";
 import { SessionLog, type MemoryEntry, type TurnEntry } from "./sessionLog";
+import { configSchematics } from "./config";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
@@ -25,10 +26,11 @@ const COMPACT_CONTEXT_MIN_GAP_TURNS = 6;
 const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
 const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
-const MAX_TURNS = 25;
+const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
 const LOOP_WINDOW = 5;
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
+let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 let cachedContextWindow: { value: number; ts: number } | null = null;
@@ -149,6 +151,17 @@ function readConfigSync(): { workspacePath: string; preferredModel?: string; ena
     const raw = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) : {};
     return { ...defaultConfig(), ...raw };
   } catch { return defaultConfig(); }
+}
+
+function resolveMaxOrchestratorTurns(ctl?: { getPluginConfig?: (schematics: typeof configSchematics) => { get: (key: "maxOrchestratorTurns") => unknown } }): number {
+  try {
+    const pluginConfig = ctl?.getPluginConfig?.(configSchematics);
+    const rawValue = pluginConfig?.get("maxOrchestratorTurns");
+    if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+      return Math.max(1, Math.min(100, Math.floor(rawValue)));
+    }
+  } catch {}
+  return DEFAULT_MAX_ORCHESTRATOR_TURNS;
 }
 
 function writeConfigSync(config: Record<string, unknown>): void {
@@ -332,7 +345,7 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
 
 function compactTaskReminder(stepCount: number): string {
   return `${MANAGED_CONTEXT_MARKER}
-[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Do not call respond_to_user until every step is done.]`;
+[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call respond_to_user when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
 }
 
 function compactWorkspaceHint(workspace: string, reminder: string): string {
@@ -969,12 +982,13 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
   return {
     ...toolDef,
     implementation: async (args: Record<string, unknown>, ctx: any) => {
+      const maxTurns = activeMaxOrchestratorTurns;
       state.turnCounter++;
 
-      if (state.turnCounter > MAX_TURNS) {
+      if (name !== "respond_to_user" && state.turnCounter > maxTurns) {
         return {
           ok: false,
-          error: `Max turns (${MAX_TURNS}) exceeded. Use respond_to_user with what you have so far.`,
+          error: `Max turns (${maxTurns}) exceeded. Use respond_to_user with what you have so far.`,
         };
       }
 
@@ -1068,6 +1082,7 @@ export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
 export async function toolsProvider(ctl: ToolsProviderController) {
   const sessionState = resetSessionState();
   activeSessionState = sessionState;
+  activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
 
   const setWorkspaceTool = wrapTool(tool({
     name: "set_workspace",
@@ -1111,6 +1126,7 @@ EXAMPLE: get_config()`,
         totalCheckpoints: session.countEntriesByType("checkpoint"),
         totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
+        maxOrchestratorTurns: activeMaxOrchestratorTurns,
         promptBudget: {
           contextWindow,
           limitTokens: promptBudgetLimit(contextWindow),
@@ -1186,18 +1202,20 @@ NOTE: This uses the system clock. Timezone reflects local machine settings.`,
 
   const respondToUserTool = tool({
     name: "respond_to_user",
-    description: text`Call this ONLY after completing EVERY step the user requested. If steps remain, call the next tool instead.
-USE WHEN: all requested files are read, all analysis done, all output files written.
-EXAMPLE: respond_to_user({ text: "Here is the complete analysis..." })`,
+    description: text`Return the best available answer, progress update, or handoff summary to the user.
+USE WHEN: the task is complete, blocked, out of budget, or you need to hand off partial progress clearly.
+NOTE: If the session is already at the turn cap, this tool should still be allowed to return the current state even if the task is not fully complete.
+EXAMPLE: respond_to_user({ text: "Here is the current status and the next blocker..." })`,
     parameters: {
       text: z.string().min(1).max(100000).describe("Your complete final response to the user"),
     },
     implementation: async ({ text }) => {
+      const atTurnCap = activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
       // Detect early/passive responses and reject them
-      if (/let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
+      if (!atTurnCap && /let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
         return {
           ok: false,
-          error: "You called respond_to_user too early. Continue with the next step in the user's request. Only call respond_to_user when EVERY step is complete.",
+          error: "This response looks like a passive handoff. Return concrete progress, blockers, or the final answer instead.",
         };
       }
       return {
