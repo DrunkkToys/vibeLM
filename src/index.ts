@@ -32,7 +32,7 @@ export async function main(context: PluginContext) {
       const text = userMessage.getText();
       if (!text) return userMessage;
 
-      const processed = await preprocessMessage(text);
+      const processed = await preprocessMessage(text, _ctl);
       if (processed) return processed;
 
       return userMessage;

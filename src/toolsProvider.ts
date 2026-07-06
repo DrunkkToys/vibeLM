@@ -1,4 +1,4 @@
-import { text, tool, type ToolsProviderController } from "@lmstudio/sdk";
+import { text, tool, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
@@ -27,6 +27,7 @@ const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const MAX_TURNS = 25;
 const LOOP_WINDOW = 5;
+const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 let cachedContextWindow: { value: number; ts: number } | null = null;
@@ -252,11 +253,13 @@ function isOverPromptBudget(text: string, contextWindow: number): boolean {
 }
 
 function compactTaskReminder(stepCount: number): string {
-  return `[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Do not call respond_to_user until every step is done.]`;
+  return `${MANAGED_CONTEXT_MARKER}
+[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Do not call respond_to_user until every step is done.]`;
 }
 
 function compactWorkspaceHint(workspace: string, reminder: string): string {
-  return `[Workspace: ${workspace}]${reminder ? `\n\n${reminder}` : ""}`;
+  return `${MANAGED_CONTEXT_MARKER}
+[Workspace: ${workspace}]${reminder ? `\n\n${reminder}` : ""}`;
 }
 
 function detectLoop(state: SessionState, name: string): string | null {
@@ -288,6 +291,20 @@ function truncateText(text: string, maxChars: number): string {
 
 function splitLines(text: string): string[] {
   return text.split(/\r?\n/);
+}
+
+async function getHistoryText(ctl?: PromptPreprocessorController): Promise<string> {
+  if (!ctl) return "";
+  try {
+    const history = await ctl.pullHistory();
+    return `${history.getSystemPrompt()}\n${history.toString()}`;
+  } catch {
+    return "";
+  }
+}
+
+function hasManagedContext(historyText: string): boolean {
+  return historyText.includes(MANAGED_CONTEXT_MARKER);
 }
 
 function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
@@ -1579,12 +1596,15 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
   return allTools;
 }
 
-export async function preprocessMessage(text: string): Promise<string | null> {
+export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   const contextWindow = await getContextWindow();
+  const historyText = await getHistoryText(ctl);
+  const managedContextPresent = hasManagedContext(historyText);
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
   if (wsMatch) {
+    if (managedContextPresent) return null;
     const path = wsMatch[1].trim().replace(/^["'`]|["'`]$/g, "");
     const resolved = resolve(path);
     if (existsSync(resolved)) {
@@ -1606,6 +1626,7 @@ export async function preprocessMessage(text: string): Promise<string | null> {
   // Inject step-completion reminder for multi-step requests
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
+    if (managedContextPresent) return null;
     const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
     if (isOverPromptBudget(processed, contextWindow)) {
       return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;

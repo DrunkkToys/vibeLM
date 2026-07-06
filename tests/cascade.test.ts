@@ -137,6 +137,19 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(processed!, /too large for the current model context/i);
   });
 
+  it("should skip managed prompt injection when the history already has it", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => "[vibeLM:managed-context]\n[Workspace: /tmp/project]",
+        toString: () => "previous turns already contain the managed context marker",
+      }),
+    } as any;
+
+    const processed = await preprocessMessage("workspace /tmp/project", ctl);
+    assert.equal(processed, null, "preprocessMessage should not inject a duplicate managed prompt");
+  });
+
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
