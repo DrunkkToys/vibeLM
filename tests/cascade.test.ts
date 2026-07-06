@@ -73,6 +73,17 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(rt.implementation, "respond_to_user must have implementation");
   });
 
+  it("should force respond_to_user on even when config disables it", async () => {
+    makeConfig({
+      enabledTools: ["set_workspace", "get_config", "read_file"],
+    });
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const rt = tools.find((t: any) => t.name === "respond_to_user");
+    assert.ok(rt, "respond_to_user must stay enabled as a mandatory finalizer");
+    makeConfig();
+  });
+
 
   it("should detect loops in tool calls", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
@@ -137,6 +148,21 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(processed!, /too large for the current model context/i);
   });
 
+  it("should reject a normal prompt when the accumulated history is already over budget", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const hugeHistory = "tool output ".repeat(5000);
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => hugeHistory,
+        toString: () => hugeHistory,
+      }),
+    } as any;
+
+    const processed = await preprocessMessage("hello", ctl);
+    assert.ok(processed, "preprocessMessage should return an overflow response");
+    assert.match(processed!, /request is too large for the current model context/i);
+  });
+
   it("should inject managed context once and skip duplicate injection after history reload", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
     let historyText = "";
@@ -154,47 +180,6 @@ describe("vibeLM Cascade Integration", () => {
     historyText = first!;
     const second = await preprocessMessage("1. do the first thing\n2. do the second thing", ctl);
     assert.equal(second, null, "preprocessMessage should not inject a duplicate managed prompt after reload");
-  });
-
-  it("should support hard compact commands that keep only the system prompt", async () => {
-    const { preprocessMessage } = await import("../src/toolsProvider");
-    const ctl = {
-      pullHistory: async () => ({
-        getSystemPrompt: () => "vibeLM system prompt text",
-        getMessagesArray: () => [
-          { getRole: () => "user", getText: () => "first turn" },
-          { getRole: () => "assistant", getText: () => "second turn" },
-        ],
-      }),
-    } as any;
-
-    const result = await preprocessMessage("compact hard", ctl);
-    assert.ok(result, "compact hard should return a managed reset prompt");
-    assert.match(result!, /\[vibeLM:managed-context\]/, "hard compact should carry the managed context marker");
-    assert.match(result!, /\[compact hard\]/, "hard compact should identify the reset mode");
-    assert.match(result!, /\[retained turns: 0\]/, "hard compact should drop retained turns");
-    assert.match(result!, /\[vibeLM system prompt: preserved\]/, "hard compact must preserve the system prompt reference");
-  });
-
-  it("should support compact N commands with the last N turns retained", async () => {
-    const { preprocessMessage } = await import("../src/toolsProvider");
-    const ctl = {
-      pullHistory: async () => ({
-        getSystemPrompt: () => "vibeLM system prompt text",
-        getMessagesArray: () => [
-          { getRole: () => "user", getText: () => "turn 1" },
-          { getRole: () => "assistant", getText: () => "turn 2" },
-          { getRole: () => "user", getText: () => "turn 3" },
-        ],
-      }),
-    } as any;
-
-    const result = await preprocessMessage("compact 2", ctl);
-    assert.ok(result, "compact 2 should return a managed reset prompt");
-    assert.match(result!, /\[compact keep 2\]/, "compact 2 should identify the retained turn count");
-    assert.match(result!, /\[retained turns: 2\]/, "compact 2 should keep the requested number of turns");
-    assert.match(result!, /assistant: turn 2/, "compact 2 should preserve the latest retained turns");
-    assert.match(result!, /user: turn 3/, "compact 2 should preserve the latest retained turns");
   });
 
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
@@ -221,6 +206,7 @@ describe("vibeLM Cascade Integration", () => {
     const memoryResult = await saveMemory.implementation({
       content: "Current goal is to compact context without paraphrasing code.",
       tags: ["goal", `session:${sessionId}`],
+      scope: "research",
     });
     assert.ok(memoryResult?.ok, "save_memory should succeed");
 
@@ -233,6 +219,7 @@ describe("vibeLM Cascade Integration", () => {
     });
     assert.ok(compactResult?.ok, `compact_context should succeed: ${JSON.stringify(compactResult)}`);
     assert.match(compactResult.data.goal, /compact the session/i);
+    assert.match(compactResult.data.handoff, /Start a new chat/i, "compact_context should provide a handoff block");
     assert.ok(
       compactResult.data.codeSnippets.some((snippet: any) => snippet.path === "src/snippet.ts" && snippet.referenceOnly === true),
       "compact_context must keep a reference to local source instead of replaying it",
@@ -245,12 +232,25 @@ describe("vibeLM Cascade Integration", () => {
     const reloadResult = await searchMemory.implementation({
       tags: ["compact_context", sessionId],
       maxResults: 10,
+      scope: "session",
     });
     assert.ok(reloadResult?.ok, "search_memory should succeed");
     assert.ok(reloadResult.data.results.length >= 1, "compact memory must be reloadable");
+    assert.equal(reloadResult.data.scope, "session");
     assert.ok(
       reloadResult.data.results.some((entry: any) => String(entry.content).includes("[omitted; local source should be re-read on demand]")),
       "stored compact memory must point back to local source instead of storing raw code",
+    );
+
+    const researchResult = await searchMemory.implementation({
+      query: "compact context without paraphrasing code",
+      maxResults: 10,
+      scope: "research",
+    });
+    assert.ok(researchResult?.ok, "research-scoped search should succeed");
+    assert.ok(
+      researchResult.data.results.some((entry: any) => entry.scope === "research"),
+      "research-scoped search should return the explicitly scoped memory",
     );
 
     const secondResult = await compactContext.implementation({

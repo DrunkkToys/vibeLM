@@ -28,6 +28,7 @@ const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const MAX_TURNS = 25;
 const LOOP_WINDOW = 5;
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
+type MemoryScope = "session" | "workspace" | "research" | "all";
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 let cachedContextWindow: { value: number; ts: number } | null = null;
@@ -244,12 +245,89 @@ function compactSessionTag(sessionId: string): string {
   return `session:${sessionId}`;
 }
 
+function compactWorkspaceTag(workspace: string): string {
+  return `workspace:${workspace}`;
+}
+
+function compactScopeTag(scope: Exclude<MemoryScope, "all">): string {
+  return `scope:${scope}`;
+}
+
+function dedupeTags(tags: string[]): string[] {
+  return [...new Set(tags.filter((tag) => tag.trim().length > 0))];
+}
+
+function currentWorkspacePath(ctl?: { getWorkingDirectory?: () => string }): string | null {
+  const workspace = getWorkspace(ctl?.getWorkingDirectory?.());
+  return workspace || null;
+}
+
+function buildMemoryTags(baseTags: string[], sessionId: string, workspace: string, scope: Exclude<MemoryScope, "all">): string[] {
+  return dedupeTags([
+    ...baseTags,
+    compactSessionTag(sessionId),
+    ...(workspace ? [compactWorkspaceTag(workspace)] : []),
+    compactScopeTag(scope),
+  ]);
+}
+
+function memoryFilterForScope(scope: MemoryScope, workspace: string, sessionId: string): { workspace?: string; sessionId?: string; scope?: "session" | "workspace" | "research" | "all" } {
+  if (scope === "all") return { scope: "all" };
+  if (scope === "session") return { workspace, sessionId, scope: "session" };
+  if (scope === "research") return { workspace, scope: "research" };
+  return { workspace, scope: "workspace" };
+}
+
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
+function promptBudgetLimit(contextWindow: number): number {
+  return Math.max(512, contextWindow - COMPACT_CONTEXT_SAFETY_MARGIN);
+}
+
+function buildPromptBudgetReport(
+  historyText: string,
+  rewrittenText: string,
+  contextWindow: number,
+): {
+  estimatedTokens: number;
+  limitTokens: number;
+  safetyMargin: number;
+  overflow: boolean;
+} {
+  const combined = [historyText, rewrittenText].filter(Boolean).join("\n");
+  const estimatedTokens = estimateTokens(combined);
+  const limitTokens = promptBudgetLimit(contextWindow);
+  return {
+    estimatedTokens,
+    limitTokens,
+    safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+    overflow: estimatedTokens > limitTokens,
+  };
+}
+
 function isOverPromptBudget(text: string, contextWindow: number): boolean {
-  return estimateTokens(text) > Math.floor(contextWindow * PROMPT_BUDGET_RATIO);
+  return estimateTokens(text) > promptBudgetLimit(contextWindow);
+}
+
+function formatPromptBudgetError(contextWindow: number, estimatedTokens: number): string {
+  return `[Tool error: request is too large for the current model context (${estimatedTokens}/${contextWindow} tokens estimated, safety margin ${COMPACT_CONTEXT_SAFETY_MARGIN}). Split the request, shorten history, or compact before continuing.]`;
+}
+
+function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionState): number {
+  const recentTurns = session.readRecentTurns(COMPACT_CONTEXT_MAX_RECENT_TURNS, currentSessionId(state));
+  const text = recentTurns.map((entry) => {
+    const payload = extractToolPayload(entry);
+    return [
+      entry.role || "",
+      entry.content || "",
+      payload?.name || "",
+      typeof payload?.args === "string" ? payload.args : JSON.stringify(payload?.args ?? ""),
+      payload?.rawResult || "",
+    ].join("\n");
+  }).join("\n");
+  return estimateTokens(text);
 }
 
 function compactTaskReminder(stepCount: number): string {
@@ -305,71 +383,6 @@ async function getHistoryText(ctl?: PromptPreprocessorController): Promise<strin
 
 function hasManagedContext(historyText: string): boolean {
   return historyText.includes(MANAGED_CONTEXT_MARKER);
-}
-
-function parseCompactCommand(text: string): { hard: boolean; keepTurns: number } | null {
-  const compactMatch = text.trim().match(/^compact(?:\s+hard)?(?:\s+(\d+))?$/i);
-  if (!compactMatch) return null;
-  const hard = /\bhard\b/i.test(text);
-  if (hard) {
-    return { hard: true, keepTurns: 0 };
-  }
-  const keepTurns = compactMatch[1] ? Math.max(0, Number.parseInt(compactMatch[1], 10)) : 10;
-  return { hard: false, keepTurns };
-}
-
-function formatCompactTranscript(history: Awaited<ReturnType<PromptPreprocessorController["pullHistory"]>>, keepTurns: number): string {
-  const messages = history.getMessagesArray();
-  const retained = keepTurns > 0 ? messages.filter((message) => message.getRole() !== "system").slice(-keepTurns) : [];
-  if (retained.length === 0) {
-    return "";
-  }
-  return retained
-    .map((message, index) => {
-      const role = message.getRole();
-      const content = message.getText();
-      return `${index + 1}. ${role}: ${content}`;
-    })
-    .join("\n");
-}
-
-async function buildCompactCommand(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
-  const parsed = parseCompactCommand(text);
-  if (!parsed) return null;
-  let history: Awaited<ReturnType<PromptPreprocessorController["pullHistory"]>> | null = null;
-  if (ctl) {
-    try {
-      history = await ctl.pullHistory();
-    } catch {
-      history = null;
-    }
-  }
-  const systemPrompt = history?.getSystemPrompt?.() ?? "";
-  const transcript = history ? formatCompactTranscript(history, parsed.keepTurns) : "";
-  const keepLabel = parsed.hard ? "hard" : `keep ${parsed.keepTurns}`;
-  const parts = [
-    MANAGED_CONTEXT_MARKER,
-    `[compact ${keepLabel}]`,
-    `[vibeLM system prompt: preserved]`,
-    parsed.keepTurns > 0
-      ? `[retained turns: ${parsed.keepTurns}]`
-      : `[retained turns: 0]`,
-  ];
-
-  if (parsed.keepTurns > 0) {
-    parts.push(`[retained transcript]`);
-    if (systemPrompt) {
-      parts.push(`[system prompt reference] ${truncateText(systemPrompt, 500)}`);
-    }
-    if (transcript) {
-      parts.push(transcript);
-    }
-  } else if (systemPrompt) {
-    parts.push(`[system prompt reference] ${truncateText(systemPrompt, 500)}`);
-  }
-
-  parts.push(`[instruction: ignore earlier conversation outside this retained context and continue from the retained state only.]`);
-  return parts.join("\n");
 }
 
 function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
@@ -489,6 +502,8 @@ type CompactContextResult = {
   savedToMemory: boolean;
   needsMoreContext: boolean;
   reason: string;
+  reflection: string;
+  handoff: string;
 };
 
 function extractPathLikeStrings(text: string): string[] {
@@ -700,6 +715,13 @@ function buildCompactContextState(
       ? "Compacted state exceeds the configured budget."
       : "Compacted recent turns into reusable state.";
 
+  const reflectionParts = [
+    goal && goal !== "Need more context to determine the active goal." ? `Goal: ${goal}` : "Goal is still being established.",
+    completedSteps.size > 0 ? `Progress: ${[...completedSteps].slice(-3).join("; ")}` : "Progress: no durable steps yet.",
+    openIssues.size > 0 ? `Blockers: ${[...openIssues].slice(-3).join("; ")}` : "Blockers: none captured.",
+  ];
+  const reflection = reflectionParts.join(" ");
+
   const nextActions: string[] = [];
   if (openIssues.size > 0) {
     nextActions.push("Resolve the open issues before continuing.");
@@ -742,6 +764,30 @@ function buildCompactContextState(
     savedToMemory: false,
     needsMoreContext: recentTurns.length < 2 || (completedSteps.size === 0 && openIssues.size === 0 && snippets.length === 0),
     reason,
+    reflection,
+    handoff: formatCompactHandoff({
+      sessionId,
+      turnCount: state.turnCounter,
+      tokenEstimate,
+      budget: {
+        maxTokens: options.maxTokens,
+        safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+        triggerThreshold: Math.floor(options.maxTokens * COMPACT_CONTEXT_TRIGGER_RATIO),
+      },
+      goal,
+      nextActions,
+      openIssues: [...openIssues].slice(0, 10),
+      completedSteps: [...completedSteps].slice(0, 20),
+      importantPaths: [...importantPaths].slice(0, 20),
+      codeSnippets: snippets,
+      recentCommands: [...recentCommands].slice(0, 10),
+      sourceTurns,
+      savedToMemory: false,
+      needsMoreContext: recentTurns.length < 2 || (completedSteps.size === 0 && openIssues.size === 0 && snippets.length === 0),
+      reason,
+      reflection,
+      handoff: "",
+    }, options.goalHint?.trim() || currentWorkspacePath() || readConfigSync().workspacePath?.trim() || undefined),
   };
 
   return compact;
@@ -753,6 +799,10 @@ function compactContextText(state: CompactContextResult): string {
     `turnCount: ${state.turnCount}`,
     `goal: ${state.goal}`,
   ];
+
+  if (state.reflection) {
+    lines.push(`reflection: ${state.reflection}`);
+  }
 
   if (state.codeSnippets.length > 0) {
     lines.push(`verbatimCodeSnippets:`);
@@ -783,6 +833,25 @@ function compactContextText(state: CompactContextResult): string {
   lines.push(`sourceTurns: ${state.sourceTurns.join(", ")}`);
   lines.push(`reason: ${state.reason}`);
   lines.push(`needsMoreContext: ${state.needsMoreContext}`);
+  if (state.handoff) {
+    lines.push(`handoff: |`);
+    lines.push(...state.handoff.split(/\r?\n/).map((line) => `  ${line}`));
+  }
+  return lines.join("\n");
+}
+
+function formatCompactHandoff(state: CompactContextResult, workspace?: string): string {
+  const lines = [
+    "Start a new chat and paste this summary.",
+    `Scope: session ${state.sessionId}`,
+    `Workspace: ${workspace?.trim() || "(unset)"}`,
+    `Goal: ${state.goal}`,
+    `Reflection: ${state.reflection}`,
+    `Next actions:`,
+    ...state.nextActions.map((item) => `- ${item}`),
+    `Open issues:`,
+    ...state.openIssues.map((item) => `- ${item}`),
+  ];
   return lines.join("\n");
 }
 
@@ -811,17 +880,17 @@ function saveCompactContext(
   session: SessionLog,
   state: SessionState,
   compact: CompactContextResult,
+  workspace?: string,
 ): CompactContextResult {
   const content = compactContextText(compact);
+  const resolvedWorkspace = workspace?.trim() || currentWorkspacePath() || "";
   session.saveMemory(
-    [
-      "compact_context",
-      compactSessionTag(compact.sessionId),
-      `turn:${compact.turnCount}`,
-    ],
+    buildMemoryTags(["compact_context", `turn:${compact.turnCount}`], compact.sessionId, resolvedWorkspace, "session"),
     content,
     compact.turnCount,
     compact.sessionId,
+    resolvedWorkspace || undefined,
+    "session",
   );
   session.saveCheckpoint(
     `compact_context saved at turn ${compact.turnCount}`,
@@ -842,6 +911,7 @@ async function compactSessionContext(
     includeCode?: boolean;
     saveToMemory?: boolean;
     force?: boolean;
+    workspace?: string;
   } = {},
 ): Promise<{ ok: true; data: CompactContextResult } | { ok: false; error: string }> {
   const maxTokens = Math.max(
@@ -882,13 +952,13 @@ async function compactSessionContext(
       reason: "Compacted output was trimmed to fit the configured budget.",
     };
     if ((trimmed.codeSnippets.length > 0 || trimmed.completedSteps.length > 0 || trimmed.openIssues.length > 0) && options.saveToMemory !== false) {
-      return { ok: true, data: saveCompactContext(session, state, trimmed) };
+      return { ok: true, data: saveCompactContext(session, state, trimmed, options.workspace) };
     }
     return { ok: true, data: trimmed };
   }
 
   if (options.saveToMemory !== false) {
-    return { ok: true, data: saveCompactContext(session, state, compact) };
+    return { ok: true, data: saveCompactContext(session, state, compact, options.workspace) };
   }
   return { ok: true, data: compact };
 }
@@ -927,6 +997,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
 
       const log = getSessionLog();
       const serializedResult = stringifyToolResult(result);
+      const workspace = currentWorkspacePath(ctx) || undefined;
       const turnEntry: TurnEntry = {
         type: "turn",
         sessionId: currentSessionId(state),
@@ -938,7 +1009,8 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       };
       log.startTurn(turnEntry);
       if (!["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
-        log.saveMemory([`turn:${state.turnCounter}`, `tool:${name}`], `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state));
+        const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`], currentSessionId(state), workspace || "", "workspace");
+        log.saveMemory(tags, `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
       }
 
       if (state.turnCounter % 5 === 0) {
@@ -955,6 +1027,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
           saveToMemory: true,
           includeCode: true,
           force: true,
+          workspace,
         });
         if (compact.ok) {
           console.log(`[AgenticTools] Auto-compacted session ${currentSessionId(state)} at turn ${state.turnCounter}`);
@@ -1025,8 +1098,11 @@ EXAMPLE: get_config()`,
     implementation: async () => {
       const config = readConfigSync();
       const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      const promptEstimate = estimateRecentSessionPromptTokens(session, sessionState);
+      const contextWindow = await getContextWindow();
       return ok({
-        workspace: requireWorkspace(ctl),
+        workspace,
         sessionId: currentSessionId(sessionState),
         configFile: CONFIG_PATH,
         configFileExists: existsSync(CONFIG_PATH),
@@ -1035,6 +1111,13 @@ EXAMPLE: get_config()`,
         totalCheckpoints: session.countEntriesByType("checkpoint"),
         totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
+        promptBudget: {
+          contextWindow,
+          limitTokens: promptBudgetLimit(contextWindow),
+          estimatedTokens: promptEstimate,
+          safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+          risk: promptEstimate >= promptBudgetLimit(contextWindow) ? "high" : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow) * 0.85) ? "medium" : "low",
+        },
       });
     },
   }), "get_config");
@@ -1367,13 +1450,22 @@ NOTE: Call this first, then use web_fetch on the most relevant URLs to get full 
     description: text`Stores information in a persistent JSONL knowledge base that survives restarts.
 USE WHEN: you learn something important about the user's project that should be remembered across sessions.
 EXAMPLE: save_memory({ content: "Project uses React 18 with TypeScript", tags: ["project:myapp", "tech:react"] })
-NOTE: Tags are searchable via search_memory. Use descriptive tags for easy retrieval.`,
+NOTE: Every saved memory is automatically tagged with the current workspace and session. You can also choose a semantic scope.`,
     parameters: {
       content: z.string().min(1).max(50000).describe("Information to store"),
       tags: z.array(z.string().max(50)).min(1).max(20).describe("Tags like ['project:myapp', 'language:python']"),
+      scope: z.enum(["session", "workspace", "research"]).optional().default("workspace").describe("Semantic memory scope"),
     },
-    implementation: async ({ content, tags }) => {
-      getSessionLog().saveMemory(tags, content, undefined, currentSessionId(sessionState));
+    implementation: async ({ content, tags, scope }) => {
+      const workspace = requireWorkspace(ctl);
+      getSessionLog().saveMemory(
+        buildMemoryTags(tags, currentSessionId(sessionState), workspace, scope),
+        content,
+        undefined,
+        currentSessionId(sessionState),
+        workspace,
+        scope,
+      );
       return ok({ saved: true });
     },
   }), "save_memory");
@@ -1394,12 +1486,14 @@ NOTE: This stores a compact snapshot in memory so later turns can reload it with
     },
     implementation: async ({ maxTokens, includeCode, saveToMemory, force, goalHint }) => {
       const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
       return await compactSessionContext(session, sessionState, {
         maxTokens,
         includeCode,
         saveToMemory,
         force,
         goalHint,
+        workspace,
       });
     },
   }), "compact_context");
@@ -1410,34 +1504,54 @@ NOTE: This stores a compact snapshot in memory so later turns can reload it with
 USE WHEN: you need to recall information saved in previous sessions.
 EXAMPLE: search_memory({ tags: ["project:myapp"], maxResults: 10 })
 EXAMPLE: search_memory({ query: "deployment", maxResults: 5 })
-NOTE: Provide either tags or query, not both. Returns up to 50 results.`,
+NOTE: Provide either tags or query, not both. Scope defaults to workspace; set it to session or research when needed.`,
     parameters: {
       tags: z.array(z.string().max(50)).optional().describe("Filter by tags"),
       query: z.string().max(200).optional().describe("Keyword search"),
       maxResults: z.number().int().min(1).max(50).optional().default(10),
+      scope: z.enum(["session", "workspace", "research", "all"]).optional().default("workspace").describe("Limit results to the selected memory scope"),
     },
-    implementation: async ({ tags, query, maxResults }) => {
+    implementation: async ({ tags, query, maxResults, scope }) => {
       const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      const filter = memoryFilterForScope(scope ?? "workspace", workspace, currentSessionId(sessionState));
       let results: MemoryEntry[] = [];
       if (tags && tags.length > 0) {
-        results = session.searchMemoriesByTags(tags, maxResults);
+        results = session.searchMemoriesByTags(tags, maxResults, filter);
       } else if (query) {
-        results = session.searchMemoriesByContent(query, maxResults);
+        results = session.searchMemoriesByContent(query, maxResults, filter);
       }
-      return ok({ results: results.map((e) => ({ content: e.content.slice(0, 500), tags: e.tags })), totalMatches: results.length });
+      return ok({
+        results: results.map((e) => ({ content: e.content.slice(0, 500), tags: e.tags, scope: e.scope ?? null, workspace: e.workspace ?? null, sessionId: e.sessionId ?? null })),
+        totalMatches: results.length,
+        scope: scope ?? "workspace",
+      });
     },
   }), "search_memory");
 
   const listMemoriesTool = wrapTool(tool({
     name: "list_memories",
     description: text`Shows total count of memory entries stored in the knowledge base.
-USE WHEN: you want a quick count of how many memories exist.
+USE WHEN: you want a quick count of how many memories exist, optionally scoped.
 EXAMPLE: list_memories()
-NOTE: Use search_memory to find specific entries. This only returns the total count.`,
-    parameters: {},
-    implementation: async () => {
-      const total = getSessionLog().countEntriesByType("mem");
-      return ok({ totalEntries: total, message: "Use search_memory to find specific entries." });
+NOTE: Use search_memory to find specific entries. This can be limited by workspace/session/research scope.`,
+    parameters: {
+      scope: z.enum(["session", "workspace", "research", "all"]).optional().default("workspace").describe("Limit the count to a scope"),
+    },
+    implementation: async ({ scope }) => {
+      const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      const filter = memoryFilterForScope(scope ?? "workspace", workspace, currentSessionId(sessionState));
+      const total = session.countMemories(filter);
+      return ok({
+        totalEntries: total,
+        message: "Use search_memory to find specific entries.",
+        scope: scope ?? "workspace",
+        scopeSummary: {
+          workspace,
+          sessionId: currentSessionId(sessionState),
+        },
+      });
     },
   }), "list_memories");
 
@@ -1635,16 +1749,20 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     respond_to_user: respondToUserTool,
   };
 
-  const DEFAULT_ENABLED = [
+const DEFAULT_ENABLED = [
     "set_workspace", "get_config", "save_memory", "compact_context", "search_memory",
     "web_fetch", "web_search",
     "read_file", "list_files", "search_files", "bash_terminal",
     "calculate", "get_current_datetime", "write_file",
     "respond_to_user",
   ];
+  const MANDATORY_ENABLED = ["respond_to_user"];
 
   const configTools = readConfigSync();
-  const enabledNames = (configTools as any).enabledTools || DEFAULT_ENABLED;
+  const enabledNames = dedupeTags([
+    ...((configTools as any).enabledTools || DEFAULT_ENABLED),
+    ...MANDATORY_ENABLED,
+  ]);
   const allTools = enabledNames
     .filter((name: string) => ALL_TOOL_MAP[name])
     .map((name: string) => ALL_TOOL_MAP[name]);
@@ -1664,14 +1782,18 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   const contextWindow = await getContextWindow();
-  const compactCommand = await buildCompactCommand(t, ctl);
-  if (compactCommand) return compactCommand;
   const historyText = await getHistoryText(ctl);
   const managedContextPresent = hasManagedContext(historyText);
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
   if (wsMatch) {
-    if (managedContextPresent) return null;
+    if (managedContextPresent) {
+      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+      if (plainReport.overflow) {
+        return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+      }
+      return null;
+    }
     const path = wsMatch[1].trim().replace(/^["'`]|["'`]$/g, "");
     const resolved = resolve(path);
     if (existsSync(resolved)) {
@@ -1682,8 +1804,9 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const stepsMatch = rest.match(/^\d+\.\s/gm);
       const reminder = stepsMatch ? compactTaskReminder(stepsMatch.length) : "";
       const processed = `${compactWorkspaceHint(resolved, reminder)}${rest ? `\n\n${rest}` : ""}`;
-      if (isOverPromptBudget(processed, contextWindow)) {
-        return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+      const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+      if (report.overflow) {
+        return formatPromptBudgetError(contextWindow, report.estimatedTokens);
       }
       return processed;
     }
@@ -1693,10 +1816,17 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   // Inject step-completion reminder for multi-step requests
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
-    if (managedContextPresent) return null;
+    if (managedContextPresent) {
+      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+      if (plainReport.overflow) {
+        return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+      }
+      return null;
+    }
     const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
-    if (isOverPromptBudget(processed, contextWindow)) {
-      return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+    const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+    if (report.overflow) {
+      return formatPromptBudgetError(contextWindow, report.estimatedTokens);
     }
     return processed;
   }
@@ -1706,7 +1836,12 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
     try {
       const calcResp = await import("mathjs").then(m => m.evaluate(calcMatch[1]));
       if (typeof calcResp === "number" || typeof calcResp === "string") {
-        return `[Tool executed: calculate → ${calcResp}]`;
+        const processed = `[Tool executed: calculate → ${calcResp}]`;
+        const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+        if (report.overflow) {
+          return formatPromptBudgetError(contextWindow, report.estimatedTokens);
+        }
+        return processed;
       }
     } catch (e) {
       console.warn(`[AgenticTools] calculate preprocessor failed:`, e);
@@ -1720,8 +1855,9 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       if (results.length > 0) {
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
-        if (isOverPromptBudget(processed, contextWindow)) {
-          return `[Tool error: request is too large for the current model context (${contextWindow} tokens). Split the request into smaller steps before continuing.]`;
+        const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+        if (report.overflow) {
+          return formatPromptBudgetError(contextWindow, report.estimatedTokens);
         }
         return processed;
       }
@@ -1731,5 +1867,9 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
     }
   }
 
+  const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+  if (plainReport.overflow) {
+    return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+  }
   return null;
 }

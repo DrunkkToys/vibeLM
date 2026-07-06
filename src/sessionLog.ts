@@ -13,6 +13,8 @@ export interface TurnEntry extends JsonlEntry {
 export interface MemoryEntry extends JsonlEntry {
   type: "mem";
   sessionId?: string;
+  workspace?: string;
+  scope?: "session" | "workspace" | "research";
   ts: string;
   tags: string[];
   content: string;
@@ -29,6 +31,33 @@ export interface CheckpointEntry extends JsonlEntry {
 }
 
 const DEFAULT_WORKING_WINDOW = 12;
+
+type MemoryScope = "session" | "workspace" | "research";
+
+type MemoryFilter = {
+  workspace?: string;
+  sessionId?: string;
+  scope?: MemoryScope | "all";
+};
+
+export type { MemoryFilter, MemoryScope };
+
+function matchesMemoryFilter(entry: MemoryEntry, filter: MemoryFilter = {}): boolean {
+  if (filter.workspace) {
+    if (entry.workspace && entry.workspace !== filter.workspace) return false;
+    if (!entry.workspace && !entry.tags.some((tag) => tag === `workspace:${filter.workspace}`)) return false;
+  }
+  if (filter.sessionId) {
+    if (entry.sessionId && entry.sessionId !== filter.sessionId) return false;
+    if (!entry.sessionId && !entry.tags.some((tag) => tag === `session:${filter.sessionId}`)) return false;
+  }
+  if (filter.scope && filter.scope !== "all") {
+    const scopeTag = `scope:${filter.scope}`;
+    if (entry.scope && entry.scope !== filter.scope) return false;
+    if (!entry.scope && !entry.tags.includes(scopeTag)) return false;
+  }
+  return true;
+}
 
 export class SessionLog {
   private jsonl: JsonlCache;
@@ -92,10 +121,12 @@ export class SessionLog {
       .filter((entry): entry is CheckpointEntry => entry.type === "checkpoint" && (!sessionId || entry.sessionId === sessionId));
   }
 
-  saveMemory(tags: string[], content: string, step?: number, sessionId?: string): void {
+  saveMemory(tags: string[], content: string, step?: number, sessionId?: string, workspace?: string, scope: MemoryScope = "workspace"): void {
     const entry: MemoryEntry = {
       type: "mem",
       sessionId,
+      workspace,
+      scope,
       ts: new Date().toISOString(),
       tags,
       content,
@@ -116,10 +147,11 @@ export class SessionLog {
     this.jsonl.append(entry);
   }
 
-  searchMemoriesByTags(tags: string[], maxResults: number = 5): MemoryEntry[] {
+  searchMemoriesByTags(tags: string[], maxResults: number = 5, filter: MemoryFilter = {}): MemoryEntry[] {
     return this.jsonl
       .searchByTags(tags, maxResults)
-      .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string");
+      .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
+      .filter((entry) => matchesMemoryFilter(entry, filter));
   }
 
   searchCheckpoints(sessionId: string, maxResults: number = 5): CheckpointEntry[] {
@@ -132,7 +164,7 @@ export class SessionLog {
     return results;
   }
 
-  searchMemoriesByContent(query: string, maxResults: number = 5): MemoryEntry[] {
+  searchMemoriesByContent(query: string, maxResults: number = 5, filter: MemoryFilter = {}): MemoryEntry[] {
     const results: MemoryEntry[] = [];
     const total = this.jsonl.totalLines();
     if (total === 0) return results;
@@ -140,11 +172,21 @@ export class SessionLog {
     const q = query.toLowerCase();
     for (let i = entries.length - 1; i >= 0 && results.length < maxResults; i--) {
       const e = entries[i] as MemoryEntry;
-      if (e.type === "mem" && e.content && e.content.toLowerCase().includes(q)) {
+      if (e.type === "mem" && e.content && e.content.toLowerCase().includes(q) && matchesMemoryFilter(e, filter)) {
         results.push(e);
       }
     }
     return results;
+  }
+
+  countMemories(filter: MemoryFilter = {}): number {
+    const total = this.jsonl.totalLines();
+    if (total === 0) return 0;
+    return this.jsonl
+      .readTail(total)
+      .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
+      .filter((entry) => matchesMemoryFilter(entry, filter))
+      .length;
   }
 
   getTurnCount(): number {
