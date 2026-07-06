@@ -156,6 +156,47 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(second, null, "preprocessMessage should not inject a duplicate managed prompt after reload");
   });
 
+  it("should support hard compact commands that keep only the system prompt", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => "vibeLM system prompt text",
+        getMessagesArray: () => [
+          { getRole: () => "user", getText: () => "first turn" },
+          { getRole: () => "assistant", getText: () => "second turn" },
+        ],
+      }),
+    } as any;
+
+    const result = await preprocessMessage("compact hard", ctl);
+    assert.ok(result, "compact hard should return a managed reset prompt");
+    assert.match(result!, /\[vibeLM:managed-context\]/, "hard compact should carry the managed context marker");
+    assert.match(result!, /\[compact hard\]/, "hard compact should identify the reset mode");
+    assert.match(result!, /\[retained turns: 0\]/, "hard compact should drop retained turns");
+    assert.match(result!, /\[vibeLM system prompt: preserved\]/, "hard compact must preserve the system prompt reference");
+  });
+
+  it("should support compact N commands with the last N turns retained", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => "vibeLM system prompt text",
+        getMessagesArray: () => [
+          { getRole: () => "user", getText: () => "turn 1" },
+          { getRole: () => "assistant", getText: () => "turn 2" },
+          { getRole: () => "user", getText: () => "turn 3" },
+        ],
+      }),
+    } as any;
+
+    const result = await preprocessMessage("compact 2", ctl);
+    assert.ok(result, "compact 2 should return a managed reset prompt");
+    assert.match(result!, /\[compact keep 2\]/, "compact 2 should identify the retained turn count");
+    assert.match(result!, /\[retained turns: 2\]/, "compact 2 should keep the requested number of turns");
+    assert.match(result!, /assistant: turn 2/, "compact 2 should preserve the latest retained turns");
+    assert.match(result!, /user: turn 3/, "compact 2 should preserve the latest retained turns");
+  });
+
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
