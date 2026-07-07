@@ -5,6 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSy
 import { resolve, dirname, relative, extname } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
+import * as math from "mathjs";
 import { SessionLog, type MemoryEntry, type SearchMemoryResult, type TurnEntry } from "./sessionLog";
 import { configSchematics } from "./config";
 import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
@@ -296,19 +297,19 @@ function formatWorkspaceSetupError(sessionDir?: string): string {
   const workspace = config.workspacePath?.trim();
   if (workspace) {
     if (!existsSync(workspace)) {
-      return `Workspace path not found: ${workspace}. Provide an existing folder.`;
+      return `Workspace path not found: ${workspace}. Call set_workspace({ path: "/absolute/path" }) with an existing folder.`;
     }
     if (!statSync(workspace).isDirectory()) {
-      return `Workspace path is not a directory: ${workspace}. Provide a folder.`;
+      return `Workspace path is not a directory: ${workspace}. Call set_workspace({ path: "/absolute/path" }) with a folder.`;
     }
   }
   if (sessionDir) {
     const trimmed = sessionDir.trim();
     if (trimmed && existsSync(trimmed) && !statSync(trimmed).isDirectory()) {
-      return `LM Studio working directory is not a directory: ${trimmed}. Provide a folder.`;
+      return `LM Studio working directory is not a directory: ${trimmed}. Call set_workspace({ path: "/absolute/path" }) with a folder.`;
     }
   }
-  return `No workspace set. Configure a workspace first.`;
+  return `No workspace set. Call set_workspace({ path: "/absolute/path" }) first.`;
 }
 
 function requireWorkspace(ctl: any): string {
@@ -749,6 +750,68 @@ export async function resolveSessionStateFromHistory(
 }
 
 function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
+  const data = unwrapToolResult(result);
+
+  if (name === "read_file" && data && typeof data.content === "string") {
+    const filePath = typeof args.filePath === "string" ? args.filePath : "unknown";
+    return JSON.stringify({
+      ok: data.ok !== false,
+      filePath,
+      contentLength: data.content.length,
+      truncated: true,
+      sourcePolicy: "reference-only",
+    });
+  }
+
+  if (name === "list_files" && data && Array.isArray(data.entries)) {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      path: typeof data.path === "string" ? data.path : undefined,
+      count: typeof data.count === "number" ? data.count : data.entries.length,
+      entries: data.entries.slice(0, 10).map((entry: any) => ({
+        name: entry.name,
+        type: entry.type,
+        size: entry.size ?? null,
+      })),
+      truncated: data.entries.length > 10,
+    });
+  }
+
+  if (name === "search_files" && data && Array.isArray(data.results)) {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      pattern: typeof data.pattern === "string" ? data.pattern : undefined,
+      total: typeof data.total === "number" ? data.total : data.results.length,
+      results: data.results.slice(0, 10).map((entry: any) => ({
+        file: entry.file,
+        line: entry.line,
+        content: entry.content,
+      })),
+      truncated: data.results.length > 10,
+    });
+  }
+
+  if (name === "bash_terminal" && data && typeof data === "object") {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      exitCode: (data as any).exitCode ?? null,
+      stdout: truncateText(String((data as any).stdout ?? ""), MAX_NON_CODE_RESULT_CHARS),
+      stderr: truncateText(String((data as any).stderr ?? ""), MAX_NON_CODE_RESULT_CHARS),
+      killed: Boolean((data as any).killed),
+      signal: (data as any).signal ?? null,
+    });
+  }
+
+  if (name === "web_fetch" && data && typeof data.content === "string") {
+    return JSON.stringify({
+      ok: data.ok !== false,
+      url: typeof args.url === "string" ? args.url : undefined,
+      contentLength: data.content.length,
+      truncated: Boolean(data.truncated),
+      preview: truncateText(data.content, MAX_NON_CODE_RESULT_CHARS),
+    });
+  }
+
   return stringifyToolResult(result);
 }
 
@@ -887,7 +950,17 @@ function extractCodeSnippetsFromTurn(entry: TurnEntry): CompactCodeSnippet[] {
   const { name, args, result, rawResult } = payload;
   const data = unwrapToolResult(result);
 
-  if (name === "append_file" && typeof args?.content === "string") {
+  if (name === "read_file" && typeof args?.filePath === "string") {
+    snippets.push({
+      source: `turn:${entry.turn}:${name}`,
+      path: args.filePath,
+      language: inferLanguageFromPath(args.filePath),
+      content: "",
+      referenceOnly: true,
+    });
+  }
+
+  if ((name === "write_file" || name === "append_file") && typeof args?.content === "string") {
     snippets.push({
       source: `turn:${entry.turn}:${name}`,
       path: typeof args?.filePath === "string" ? args.filePath : undefined,
@@ -932,13 +1005,28 @@ function buildCompactContextState(
     const errorText = typeof result?.error === "string" ? result.error : typeof result?.message === "string" ? result.message : rawResult;
 
     if (ok) {
-      if (name === "append_file" && typeof args?.filePath === "string") {
+      if (name === "read_file" && typeof args?.filePath === "string") {
+        completedSteps.add(`Read ${args.filePath}`);
+        importantPaths.add(args.filePath);
+      } else if (name === "list_files" && typeof args?.path === "string") {
+        completedSteps.add(`Listed ${args.path}`);
+        importantPaths.add(args.path);
+      } else if (name === "search_files" && typeof args?.path === "string") {
+        completedSteps.add(`Searched ${args.path}`);
+        importantPaths.add(args.path);
+      } else if (name === "write_file" && typeof args?.filePath === "string") {
+        completedSteps.add(`Wrote ${args.filePath}`);
+        importantPaths.add(args.filePath);
+      } else if (name === "append_file" && typeof args?.filePath === "string") {
         completedSteps.add(`Appended ${args.filePath}`);
         importantPaths.add(args.filePath);
       } else if (name === "rename_file" && typeof args?.sourcePath === "string" && typeof args?.destPath === "string") {
         completedSteps.add(`Renamed ${args.sourcePath} → ${args.destPath}`);
         importantPaths.add(args.sourcePath);
         importantPaths.add(args.destPath);
+      } else if (name === "bash_terminal" && typeof args?.command === "string") {
+        completedSteps.add(`Ran shell command: ${truncateText(args.command, 120)}`);
+        recentCommands.add(args.command);
       } else {
         completedSteps.add(name);
       }
@@ -1285,7 +1373,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
       };
       log.startTurn(turnEntry);
-      if (!["list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
+      if (!["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
         const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`], currentSessionId(state), workspace || "", "workspace");
         log.saveMemory(tags, `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
       }
@@ -1299,7 +1387,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         );
       }
 
-      if (shouldAutoCompactSession(log, state, await getContextWindow(ctx))) {
+      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx))) {
         const compact = await compactSessionContext(log, state, {
           saveToMemory: true,
           includeCode: true,
@@ -1349,6 +1437,175 @@ export async function toolsProvider(ctl: ToolsProviderController) {
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
   activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
 
+  const setWorkspaceTool = wrapTool(tool({
+    name: "set_workspace",
+    description: text`Changes the workspace root for all file and bash operations. The workspace is persisted across sessions.
+USE WHEN: you need to change where file operations run. Always call this first if the user hasn't set a workspace.
+EXAMPLE: set_workspace({ path: "/Users/name/project" })`,
+    parameters: {
+      path: z.string().min(1).describe("Absolute path to the workspace folder"),
+    },
+    implementation: async ({ path }) => {
+      const resolved = resolve(path);
+      if (!existsSync(resolved)) return fail(`Workspace path not found: ${resolved}. Call set_workspace({ path: "/absolute/path" }) with an existing folder.`);
+      if (!statSync(resolved).isDirectory()) return fail(`Workspace path is not a directory: ${resolved}. Call set_workspace({ path: "/absolute/path" }) with a folder.`);
+      const config = readConfigSync();
+      const prev = config.workspacePath;
+      config.workspacePath = resolved;
+      writeConfigSync(config);
+      return ok({ previous: prev, workspace: resolved });
+    },
+  }), "set_workspace");
+
+  const exploreWorkspaceTool = wrapTool(tool({
+    name: "explore_workspace",
+    description: text`Produces a shallow inventory of the workspace or a subdirectory.
+USE WHEN: you want to inspect the current workspace structure without recursive content search.
+EXAMPLE: explore_workspace({ path: "." }) returns the top-level entries in the workspace.
+NOTE: This does not search file contents; it only lists the requested directory and summarizes what is there.`,
+    parameters: {
+      path: z.string().optional().default(".").describe("Directory relative to workspace"),
+      maxEntries: z.number().int().min(1).max(200).optional().default(50).describe("Maximum entries to return"),
+    },
+    implementation: async ({ path, maxEntries }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const dir = sandboxPath(ws, path);
+        if (!existsSync(dir)) return fail(`Path not found: ${dir}`);
+        const st = statSync(dir);
+        if (!st.isDirectory()) return fail(`Is not a directory: ${dir}`);
+        const entries = readdirSync(dir, { withFileTypes: true });
+        const limited = entries.slice(0, maxEntries);
+        return ok({
+          workspace: ws,
+          path: dir,
+          summary: {
+            totalEntries: entries.length,
+            directories: entries.filter((entry) => entry.isDirectory()).length,
+            files: entries.filter((entry) => entry.isFile()).length,
+            truncated: entries.length > limited.length,
+          },
+          entries: limited.map((entry) => {
+            const full = resolve(dir, entry.name);
+            let size: number | null = null;
+            try { if (entry.isFile()) size = statSync(full).size; } catch {}
+            return { name: entry.name, type: entry.isDirectory() ? "directory" : "file", size };
+          }),
+        });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "explore_workspace");
+
+  const getConfigTool = wrapTool(tool({
+    name: "get_config",
+    description: text`Returns current configuration: workspace path, memory stats, config file info.
+USE WHEN: you need to check where the workspace is or how many memories are stored.
+EXAMPLE: get_config()`,
+    parameters: {},
+    implementation: async () => {
+      const config = readConfigSync();
+      const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      const promptEstimate = estimateRecentSessionPromptTokens(session, sessionState);
+      const contextWindow = await getContextWindow(ctl);
+      const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl);
+      const effectiveRollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
+      activeRollingWindowTriggerTokens = effectiveRollingWindowTriggerTokens;
+      return ok({
+        workspace,
+        sessionId: currentSessionId(sessionState),
+        configFile: CONFIG_PATH,
+        configFileExists: existsSync(CONFIG_PATH),
+        config,
+        totalMemories: session.countEntriesByType("mem"),
+        totalCheckpoints: session.countEntriesByType("checkpoint"),
+        totalTurnsLogged: session.totalTurnsLogged(),
+        sessionWorkingDirectory: ctl.getWorkingDirectory(),
+        maxOrchestratorTurns: activeMaxOrchestratorTurns,
+        rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
+        rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
+        rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
+        promptBudget: {
+          contextWindow,
+          hardLimitTokens: hardPromptBudgetLimit(contextWindow),
+          estimatedTokens: promptEstimate,
+          safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+          rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
+          rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
+          rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
+          risk: promptEstimate >= hardPromptBudgetLimit(contextWindow) ? "high" : promptEstimate >= Math.floor(hardPromptBudgetLimit(contextWindow) * 0.85) ? "medium" : "low",
+          recommendedOverflowPolicy: promptEstimate >= hardPromptBudgetLimit(contextWindow)
+            ? "compact_context"
+            : promptEstimate >= effectiveRollingWindowTriggerTokens
+              ? "rollingWindow"
+              : "stopAtLimit",
+        },
+      });
+    },
+  }), "get_config");
+
+  const webFetchTool = wrapTool(tool({
+    name: "web_fetch",
+    description: text`Fetches a URL and returns text content (max 500KB).
+USE WHEN: you need to read the actual content of a webpage. Call web_search first to find the URL.
+EXAMPLE: web_fetch({ url: "https://example.com", maxChars: 50000 })
+NOTE: Only returns text content. JavaScript-rendered content may not be captured.`,
+    parameters: {
+      url: z.string().url().describe("The URL to fetch"),
+      maxChars: z.number().int().min(100).max(500000).optional().default(50000).describe("Max chars (default 50000)"),
+    },
+    implementation: async ({ url, maxChars }) => {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 15000);
+        const resp = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "LMStudio-AgenticTools/1.0" } });
+        clearTimeout(t);
+        if (!resp.ok) return fail(`HTTP ${resp.status}`);
+        const text = await resp.text();
+        if (text.length > maxChars) return ok({ content: text.slice(0, maxChars), truncated: true, originalLength: text.length });
+        return ok({ content: text });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "web_fetch");
+
+  const calculateTool = wrapTool(tool({
+    name: "calculate",
+    description: text`Evaluates a math expression: arithmetic, trig, log, stats, units.
+USE WHEN: you need to compute something numerical. Supports +, -, *, /, sin, cos, log, sqrt, etc.
+EXAMPLE: calculate({ expression: "sin(45 deg) + sqrt(144)" })
+NOTE: For complex expressions, keep them under 500 chars.`,
+    parameters: {
+      expression: z.string().min(1).max(500).describe("Math expression to evaluate"),
+    },
+    implementation: async ({ expression }) => {
+      try {
+        const result = math.evaluate(expression);
+        if (typeof result === "object" && result?.toString) return ok({ result: result.toString() });
+        return ok({ result });
+      } catch (e) { return fail(`Evaluation error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  }), "calculate");
+
+  const currentDateTimeTool = wrapTool(tool({
+    name: "get_current_datetime",
+    description: text`Returns current date, time, timezone, and unix timestamp.
+USE WHEN: you need to know the current time, date, or timezone for context.
+EXAMPLE: get_current_datetime()
+NOTE: This uses the system clock. Timezone reflects local machine settings.`,
+    parameters: {},
+    implementation: async () => {
+      const now = new Date();
+      return ok({
+        iso: now.toISOString(),
+        date: now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" }),
+        time: now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZoneName: "short" }),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        unixTimestamp: Math.floor(now.getTime() / 1000),
+        components: { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate(), dayOfWeek: now.getDay(), hours: now.getHours(), minutes: now.getMinutes(), seconds: now.getSeconds() },
+      });
+    },
+  }), "get_current_datetime");
+
   const amendTool = tool({
     name: "amend",
     description: text`Return the best available answer, progress update, or handoff summary to the user.
@@ -1361,7 +1618,6 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
     implementation: async ({ text }) => {
       activeSessionState.turnCounter++;
       const atTurnCap = activeMaxOrchestratorTurns > 0 && activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
-      // Detect early/passive responses and reject them
       if (!atTurnCap && /let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
         return {
           ok: false,
@@ -1374,6 +1630,84 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
       };
     },
   });
+
+  const listFilesTool = wrapTool(tool({
+    name: "list_files",
+    description: text`Lists files and directories relative to the workspace root.
+USE WHEN: you need to see what files exist in a directory before reading or searching.
+EXAMPLE: list_files({ path: "src" }) lists files in the 'src' subdirectory.
+NOTE: If path is omitted, lists the workspace root directory. Returns entry names, types, and file sizes.`,
+    parameters: {
+      path: z.string().optional().default(".").describe("Directory relative to workspace"),
+    },
+    implementation: async ({ path }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const dir = sandboxPath(ws, path);
+        const entries = readdirSync(dir, { withFileTypes: true });
+        return ok({
+          workspace: ws,
+          path: dir,
+          entries: entries.map((e) => {
+            const full = resolve(dir, e.name);
+            let size: number | null = null;
+            try { if (e.isFile()) size = statSync(full).size; } catch {}
+            return { name: e.name, type: e.isDirectory() ? "directory" : "file", size };
+          }),
+          count: entries.length,
+        });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "list_files");
+
+  const readFileTool = wrapTool(tool({
+    name: "read_file",
+    description: text`Reads a text file from the workspace. Binary files (images, PDFs, etc.) are rejected.
+USE WHEN: you need to examine source code, configuration files, logs, or any text file.
+EXAMPLE: read_file({ filePath: "src/index.ts", maxChars: 50000, offset: 0 })
+NOTE: For large files, use offset to paginate. Binary files must be handled via bash_terminal.`,
+    parameters: {
+      filePath: z.string().min(1).describe("File path relative to workspace"),
+      maxChars: z.number().int().min(100).max(500000).optional().default(50000).describe("Max chars (default 50000)"),
+      offset: z.number().int().min(0).optional().default(0).describe("Character offset to start reading from (for truncated files)"),
+    },
+    implementation: async ({ filePath, maxChars, offset }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const resolved = sandboxPath(ws, filePath);
+        if (!existsSync(resolved)) return fail(`File not found: ${resolved}`);
+        const st = statSync(resolved);
+        if (st.isDirectory()) return fail(`Is a directory: ${resolved}`);
+        if (binaryExtCheck(resolved)) return fail(`Cannot read binary file: ${filePath}. Use bash_terminal for binary files.`);
+        const content = readFileSync(resolved, "utf-8");
+        const sliced = content.slice(offset, offset + maxChars);
+        if (offset + maxChars < content.length) return ok({ content: sliced, truncated: true, originalLength: content.length, offset });
+        return ok({ content: sliced });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "read_file");
+
+  const writeFileTool = wrapTool(tool({
+    name: "write_file",
+    description: text`Writes text content to a file. Creates parent directories if needed. Overwrites existing files.
+USE WHEN: you need to create or replace a file with new content.
+EXAMPLE: write_file({ filePath: "src/hello.ts", content: "console.log('hello')" })
+NOTE: Path is relative to workspace. Use append_file to add to an existing file.`,
+    parameters: {
+      filePath: z.string().min(1).describe("File path relative to workspace"),
+      content: z.string().describe("Text content to write"),
+    },
+    implementation: async ({ filePath, content }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const resolved = sandboxPath(ws, filePath);
+        const parent = dirname(resolved);
+        if (!existsSync(parent)) await mkdir(parent, { recursive: true });
+        await writeFile(resolved, content, "utf-8");
+        return ok({ path: resolved, workspace: ws, size: Buffer.byteLength(content, "utf-8"), action: "written" });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "write_file");
 
   const appendFileTool = wrapTool(tool({
     name: "append_file",
@@ -1423,6 +1757,55 @@ NOTE: Parent directories for the destination are created automatically.`,
     },
   }), "rename_file");
 
+  const searchFilesTool = wrapTool(tool({
+    name: "search_files",
+    description: text`Searches file contents recursively for a case-insensitive text pattern. Skips binary files, hidden dirs, and node_modules.
+USE WHEN: you need to find files containing specific text or code patterns.
+EXAMPLE: search_files({ pattern: "TODO", include: "*.ts", maxResults: 20 })
+NOTE: This is a text-based search, not a regex search. The pattern is matched case-insensitively.`,
+    parameters: {
+      pattern: z.string().min(1).max(200).describe("Text pattern to search for (case-insensitive)"),
+      path: z.string().optional().default(".").describe("Starting directory relative to workspace"),
+      include: z.string().optional().describe("File glob pattern (e.g. '*.ts', '*.{js,ts,md}')"),
+      maxResults: z.number().int().min(1).max(200).optional().default(50).describe("Max matches (default 50)"),
+    },
+    implementation: async ({ pattern, path, include, maxResults }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const dir = sandboxPath(ws, path);
+        const q = pattern.toLowerCase();
+        const results: Array<{ file: string; line: number; content: string }> = [];
+        function walkFn(current: string): void {
+          if (results.length >= maxResults) return;
+          try {
+            const ents = readdirSync(current, { withFileTypes: true });
+            for (const e of ents) {
+              if (results.length >= maxResults) return;
+              const full = resolve(current, e.name);
+              if (e.isDirectory()) { if (!e.name.startsWith(".") && e.name !== "node_modules") walkFn(full); }
+              else if (e.isFile()) {
+                if (include) {
+                  const re = new RegExp("^" + include.replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+                  if (!re.test(e.name)) continue;
+                }
+                if (binaryExtCheck(full)) continue;
+                try {
+                  const lines = readFileSync(full, "utf-8").split("\n");
+                  for (let i = 0; i < lines.length; i++) {
+                    if (results.length >= maxResults) break;
+                    if (lines[i].toLowerCase().includes(q)) { results.push({ file: full, line: i + 1, content: lines[i].trim().slice(0, 200) }); }
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+        }
+        walkFn(dir);
+        return ok({ pattern, workspace: ws, path: dir, results, total: results.length });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "search_files");
+
   const deleteFileTool = wrapTool(tool({
     name: "delete_file",
     description: text`Deletes a file or empty directory. Path is relative to workspace.
@@ -1448,12 +1831,145 @@ NOTE: Will NOT delete non-empty directories. Use bash_terminal 'rm -rf' for that
     },
   }), "delete_file");
 
+  const bashTerminalTool = wrapTool(tool({
+    name: "bash_terminal",
+    description: text`Runs a bash command in the workspace directory. Each call creates a fresh process.
+USE WHEN: you need to run shell commands, scripts, or access binary files.
+EXAMPLE: bash_terminal({ command: "ls -la", timeout: 10000 })
+NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 120s. Output is capped at 10MB.`,
+    parameters: {
+      command: z.string().min(1).max(5000).describe("Bash command to execute"),
+      timeout: z.number().int().min(1000).max(120000).optional().default(30000).describe("Timeout ms (default 30000, max 120000)"),
+    },
+    implementation: async ({ command, timeout }) => {
+      try {
+        const { exec } = await import("child_process");
+        return await new Promise((res) => {
+          exec(command, { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+            res(ok({ exitCode: err?.code ?? 0, stdout: stdout || "", stderr: stderr || "", killed: !!err?.killed, signal: err?.signal ?? null }));
+          });
+        });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "bash_terminal");
+
+  const webSearchTool = wrapTool(tool({
+    name: "web_search",
+    description: text`Searches the web and returns results with titles, snippets, and URLs.
+USE WHEN: you need to find information on the internet, look up documentation, or research a topic.
+EXAMPLE: web_search({ query: "typescript decorators example", maxResults: 5 })
+NOTE: Call this first, then use web_fetch on the most relevant URLs to get full content.`,
+    parameters: {
+      query: z.string().min(1).max(500).describe("Search query"),
+      maxResults: z.number().int().min(1).max(10).optional().default(5).describe("Max results (default 5)"),
+    },
+    implementation: async ({ query, maxResults }) => {
+      try { return ok(await webSearch(query, maxResults)); }
+      catch (e: any) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "web_search");
+
+  const saveMemoryTool = wrapTool(tool({
+    name: "save_memory",
+    description: text`Stores information in a persistent JSONL knowledge base that survives restarts.
+USE WHEN: you learn something important about the user's project that should be remembered across sessions.
+EXAMPLE: save_memory({ content: "Project uses React 18 with TypeScript", tags: ["project:myapp", "tech:react"] })
+NOTE: Every saved memory is automatically tagged with the current workspace and session. You can also choose a semantic scope.`,
+    parameters: {
+      content: z.string().min(1).max(50000).describe("Information to store"),
+      tags: z.array(z.string().max(50)).min(1).max(20).describe("Tags like ['project:myapp', 'language:python']"),
+      scope: z.enum(["session", "workspace", "research"]).optional().default("workspace").describe("Semantic memory scope"),
+    },
+    implementation: async ({ content, tags, scope }) => {
+      const workspace = requireWorkspace(ctl);
+      getSessionLog().saveMemory(
+        buildMemoryTags(tags, currentSessionId(sessionState), workspace, scope),
+        content,
+        undefined,
+        currentSessionId(sessionState),
+        workspace,
+        scope,
+      );
+      return ok({ saved: true });
+    },
+  }), "save_memory");
+
+  const compactContextTool = wrapTool(tool({
+    name: "compact_context",
+    description: text`Compacts the recent session into a reusable summary while preserving code verbatim.
+USE WHEN: the session is getting long, repetitive, or you want a compact reusable state.
+RULES: prose may be summarized; code must be preserved verbatim or referenced by path; code must never be paraphrased.
+EXAMPLE: compact_context({ saveToMemory: true })
+NOTE: This stores a compact snapshot in memory so later turns can reload it without replaying full history.`,
+    parameters: {
+      maxTokens: z.number().int().min(200).max(20000).optional().default(COMPACT_CONTEXT_DEFAULT_MAX_TOKENS).describe("Maximum token budget for the compact state"),
+      includeCode: z.boolean().optional().default(true).describe("Whether to preserve verbatim code snippets when possible"),
+      saveToMemory: z.boolean().optional().default(true).describe("Store the compacted state in persistent memory"),
+      force: z.boolean().optional().default(false).describe("Return a compacted state even if the session signal is weak"),
+      goalHint: z.string().min(1).max(2000).optional().describe("Optional goal hint when the session log does not have one"),
+    },
+    implementation: async ({ maxTokens, includeCode, saveToMemory, force, goalHint }) => {
+      const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      return await compactSessionContext(session, sessionState, {
+        maxTokens,
+        includeCode,
+        saveToMemory,
+        force,
+        goalHint,
+        workspace,
+      });
+    },
+  }), "compact_context");
+
+  const searchMemoryTool = wrapTool(tool({
+    name: "search_memory",
+    description: text`Searches stored memories by tags and/or keyword. Results are newest-first.
+USE WHEN: you need to recall information saved in previous sessions.
+EXAMPLE: search_memory({ tags: ["project:myapp"], maxResults: 10 })
+EXAMPLE: search_memory({ query: "deployment", maxResults: 5 })
+NOTE: Provide either tags or query, not both. Scope defaults to workspace; set it to session or research when needed.`,
+    parameters: {
+      tags: z.array(z.string().max(50)).optional().describe("Filter by tags"),
+      query: z.string().max(200).optional().describe("Keyword search"),
+      maxResults: z.number().int().min(1).max(50).optional().default(10),
+      scope: z.enum(["session", "workspace", "research", "all"]).optional().default("workspace").describe("Limit results to the selected memory scope"),
+    },
+    implementation: async ({ tags, query, maxResults, scope }) => {
+      const session = getSessionLog();
+      const workspace = requireWorkspace(ctl);
+      const filter = memoryFilterForScope(scope ?? "workspace", workspace, currentSessionId(sessionState));
+      let results: SearchMemoryResult[] = [];
+      if (tags && tags.length > 0) {
+        results = session.searchMemoriesByTags(tags, maxResults, filter);
+      } else if (query) {
+        results = session.searchMemoriesByContent(query, maxResults, filter);
+      }
+      return ok({
+        results: results.map((e) => ({
+          content: e.content.slice(0, 500),
+          tags: e.tags,
+          scope: e.scope ?? null,
+          workspace: e.workspace ?? null,
+          sessionId: e.sessionId ?? null,
+          matchScore: e.matchScore,
+          matchedTags: e.matchedTags,
+          matchedContent: e.matchedContent,
+          matchMode: e.matchMode,
+          query: query ?? null,
+        })),
+        totalMatches: results.length,
+        scope: scope ?? "workspace",
+      });
+    },
+  }), "search_memory");
+
   const listMemoriesTool = wrapTool(tool({
     name: "list_memories",
     description: text`Shows total count of memory entries stored in the knowledge base.
 USE WHEN: you want a quick count of how many memories exist, optionally scoped.
 EXAMPLE: list_memories()
-NOTE: Returns count only. This can be limited by workspace/session/research scope.`,
+NOTE: Use search_memory to find specific entries. This can be limited by workspace/session/research scope.`,
     parameters: {
       scope: z.enum(["session", "workspace", "research", "all"]).optional().default("workspace").describe("Limit the count to a scope"),
     },
@@ -1464,7 +1980,7 @@ NOTE: Returns count only. This can be limited by workspace/session/research scop
       const total = session.countMemories(filter);
       return ok({
         totalEntries: total,
-        message: `${total} memory entries found.`,
+        message: "Use search_memory to find specific entries.",
         scope: scope ?? "workspace",
         scopeSummary: {
           workspace,
@@ -1479,7 +1995,7 @@ NOTE: Returns count only. This can be limited by workspace/session/research scop
     description: text`Deletes ALL memory entries. This is irreversible.
 USE WHEN: you need to reset the memory knowledge base completely.
 EXAMPLE: clear_memories()
-NOTE: This deletes everything. There is no undo.`,
+NOTE: This deletes everything. There is no undo. Use save_memory to re-add important entries after.`,
     parameters: {
       tags: z.array(z.string().max(50)).optional().describe("If provided, only delete entries matching ANY of these tags"),
     },
@@ -1615,38 +2131,53 @@ NOTE: If httpPath is provided, also performs an HTTP GET and returns status code
 
   const deleteMemoryTool = wrapTool(tool({
     name: "delete_memory",
-    description: text`Delete is not supported with append-only JSONL storage. Use clear_memories to reset instead.
+    description: text`Delete is not supported with append-only JSONL storage. Use clear_memories to reset, or save_memory with fresh content to overwrite.
 USE WHEN: the user asks to delete a specific memory YOU CANNOT. Tell them to use clear_memories instead.`,
     parameters: { id: z.string().min(1).describe("Memory entry ID") },
     implementation: async () => {
-      return fail("Delete not supported with append-only JSONL. Use clear_memories to reset.");
+      return fail("Delete not supported with append-only JSONL. Use clear_memories to reset, or save_memory with fresh content.");
     },
   }), "delete_memory");
 
   const updateMemoryTool = wrapTool(tool({
     name: "update_memory",
-    description: text`Update is not supported with append-only JSONL storage.
-USE WHEN: the user asks to update a memory YOU CANNOT.`,
+    description: text`Update is not supported with append-only JSONL storage. Use save_memory with new content and tags instead.
+USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_memory instead.`,
     parameters: {
       id: z.string().min(1).describe("Memory entry ID to update"),
       content: z.string().max(50000).optional().describe("New content"),
       tags: z.array(z.string().max(50)).min(1).max(20).optional().describe("New tags"),
     },
     implementation: async () => {
-      return fail("Update not supported with append-only JSONL.");
+      return fail("Update not supported with append-only JSONL. Use save_memory with new content and tags.");
     },
   }), "update_memory");
 
   const ALL_TOOL_MAP: Record<string, any> = {
+    set_workspace: setWorkspaceTool,
+    explore_workspace: exploreWorkspaceTool,
+    get_config: getConfigTool,
+    save_memory: saveMemoryTool,
+    compact_context: compactContextTool,
+    search_memory: searchMemoryTool,
     list_memories: listMemoriesTool,
     update_memory: updateMemoryTool,
     delete_memory: deleteMemoryTool,
     clear_memories: clearMemoriesTool,
     ssh_exec: sshExecTool,
     check_service: checkServiceTool,
+    web_fetch: webFetchTool,
+    calculate: calculateTool,
+    get_current_datetime: currentDateTimeTool,
+    list_files: listFilesTool,
+    read_file: readFileTool,
+    write_file: writeFileTool,
     append_file: appendFileTool,
     rename_file: renameFileTool,
+    search_files: searchFilesTool,
     delete_file: deleteFileTool,
+    bash_terminal: bashTerminalTool,
+    web_search: webSearchTool,
     generate_uuid: generateUuidTool,
     generate_password: generatePasswordTool,
     encode_base64: encodeBase64Tool,
@@ -1687,6 +2218,28 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const normalizedHistoryText = normalizeManagedContextHistory(historyText);
   const managedContextPresent = hasManagedContext(historyText) || activeSessionState.resumedFromPersistedState;
 
+  const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
+  if (wsMatch) {
+    const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
+    if (!requestedPath) {
+      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → explicit path required. Call set_workspace({ path: "/absolute/path" }) with an existing folder.]`);
+    }
+
+    const resolved = resolve(requestedPath);
+    if (existsSync(resolved)) {
+      const cfg = readConfigSync();
+      cfg.workspacePath = resolved;
+      writeConfigSync(cfg);
+      return recordProcessedPrompt(historyText, `[Tool executed: set_workspace]`);
+    }
+    return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
+  }
+
+  const exploreMatch = t.match(/^(?:explore|inspect|scan|survey)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+explore|inspect|scan|survey)(?:\s+(.+))?$/i);
+  if (exploreMatch) {
+    return recordProcessedPrompt(historyText, `[Tool executed: explore_workspace]`);
+  }
+
   // Inject step-completion reminder for multi-step requests
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
@@ -1702,6 +2255,42 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step"));
     }
     return recordProcessedPrompt(historyText, compactTaskReminder(steps.length));
+  }
+
+  const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
+  if (calcMatch) {
+    try {
+      const calcResp = await import("mathjs").then(m => m.evaluate(calcMatch[1]));
+      if (typeof calcResp === "number" || typeof calcResp === "string") {
+        const processed = `[Tool executed: calculate → ${calcResp}]`;
+        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
+        if (report.overflow) {
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
+        }
+        return recordProcessedPrompt(historyText, processed);
+      }
+    } catch (e) {
+      console.warn(`[AgenticTools] calculate preprocessor failed:`, e);
+    }
+  }
+
+  const searchMatch = t.match(/^(?:search|find|google|look\s+up|lookup|bing)\s+(?:the\s+web\s+)?(?:for\s+)?(.+)/i);
+  if (searchMatch) {
+    try {
+      const results = await webSearch(searchMatch[1], 5);
+      if (results.length > 0) {
+        const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
+        const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
+        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
+        if (report.overflow) {
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
+        }
+        return recordProcessedPrompt(historyText, processed);
+      }
+      return recordProcessedPrompt(historyText, `[Tool executed: web_search → no results found]`);
+    } catch (e: any) {
+      return recordProcessedPrompt(historyText, `[Tool error: web_search → ${e.message}]`);
+    }
   }
 
   const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);

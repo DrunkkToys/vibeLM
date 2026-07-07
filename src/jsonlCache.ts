@@ -3,7 +3,8 @@ import { resolve, dirname } from "path";
 
 export type JsonlEntry = Record<string, unknown>;
 
-const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+const SCAN_BUFFER_SIZE = 64 * 1024;
 
 export class JsonlCache {
   private path: string;
@@ -27,18 +28,21 @@ export class JsonlCache {
       const size = statSync(this.path).size;
       if (size === 0) return;
       const fd = openSync(this.path, "r");
-      const buf = Buffer.alloc(size);
-      readSync(fd, buf, 0, size, 0);
-      closeSync(fd);
-      const content = buf.toString("utf-8");
-      let pos = 0;
-      while (pos < content.length) {
-        const nl = content.indexOf("\n", pos);
-        if (nl === -1) break;
-        this.byteOffsets.push(pos);
-        this.count++;
-        pos = nl + 1;
+      const buf = Buffer.alloc(Math.min(SCAN_BUFFER_SIZE, size));
+      let fileOffset = 0;
+      while (fileOffset < size) {
+        const toRead = Math.min(buf.length, size - fileOffset);
+        const bytesRead = readSync(fd, buf, 0, toRead, fileOffset);
+        if (bytesRead === 0) break;
+        for (let i = 0; i < bytesRead; i++) {
+          if (buf[i] === 0x0a) {
+            this.byteOffsets.push(fileOffset + i);
+            this.count++;
+          }
+        }
+        fileOffset += bytesRead;
       }
+      closeSync(fd);
     } catch {}
   }
 
@@ -66,6 +70,7 @@ export class JsonlCache {
       const fileStart = this.byteOffsets[Math.max(0, startIdx)];
       const fileEnd = endIdx < this.count ? this.byteOffsets[endIdx] : statSync(this.path).size;
       const len = fileEnd - fileStart;
+      if (len <= 0) { closeSync(fd); return lines; }
       const buf = Buffer.alloc(len);
       readSync(fd, buf, 0, len, fileStart);
       closeSync(fd);
@@ -83,8 +88,9 @@ export class JsonlCache {
     if (size + Buffer.byteLength(line, "utf-8") > this.maxBytes) {
       this.compact();
     }
+    const newSize = statSync(this.path).size;
     appendFileSync(this.path, line, "utf-8");
-    this.byteOffsets.push(size);
+    this.byteOffsets.push(newSize);
     this.count++;
   }
 
@@ -94,8 +100,11 @@ export class JsonlCache {
     if (size + Buffer.byteLength(lines, "utf-8") > this.maxBytes) {
       this.compact();
     }
+    const newSize = statSync(this.path).size;
     appendFileSync(this.path, lines, "utf-8");
-    this.byteOffsets.push(size);
+    for (let i = 0; i < objs.length; i++) {
+      this.byteOffsets.push(newSize);
+    }
     this.count += objs.length;
   }
 

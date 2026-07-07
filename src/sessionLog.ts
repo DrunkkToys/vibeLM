@@ -224,7 +224,8 @@ export class SessionLog {
   searchMemoriesByTags(tags: string[], maxResults: number = 5, filter: MemoryFilter = {}): SearchMemoryResult[] {
     const total = this.jsonl.totalLines();
     if (total === 0) return [];
-    const entries = this.jsonl.readTail(total);
+    const limit = Math.min(total, 200);
+    const entries = this.jsonl.readTail(limit);
     return entries
       .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
       .filter((entry) => matchesMemoryFilter(entry, filter))
@@ -248,7 +249,8 @@ export class SessionLog {
   searchMemoriesByContent(query: string, maxResults: number = 5, filter: MemoryFilter = {}): SearchMemoryResult[] {
     const total = this.jsonl.totalLines();
     if (total === 0) return [];
-    const entries = this.jsonl.readTail(total);
+    const limit = Math.min(total, 200);
+    const entries = this.jsonl.readTail(limit);
     const normalizedQuery = normalizeSearchText(query);
     return entries
       .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
@@ -263,8 +265,9 @@ export class SessionLog {
   countMemories(filter: MemoryFilter = {}): number {
     const total = this.jsonl.totalLines();
     if (total === 0) return 0;
+    const limit = Math.min(total, 200);
     return this.jsonl
-      .readTail(total)
+      .readTail(limit)
       .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
       .filter((entry) => matchesMemoryFilter(entry, filter))
       .length;
@@ -281,7 +284,8 @@ export class SessionLog {
   countEntriesByType(type: JsonlEntry["type"]): number {
     const total = this.jsonl.totalLines();
     if (total === 0) return 0;
-    return this.jsonl.readTail(total).filter((entry) => entry.type === type).length;
+    const limit = Math.min(total, 200);
+    return this.jsonl.readTail(limit).filter((entry) => entry.type === type).length;
   }
 
   compact(): void {
