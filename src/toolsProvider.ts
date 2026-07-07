@@ -18,19 +18,23 @@ const RUNTIME_STATE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugin
 const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "session-log.jsonl");
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
-const PROMPT_BUDGET_RATIO = 0.75;
+const PROMPT_BUDGET_RATIO = 0.50;
 const FILE_CACHE_MAX_BYTES = 1024 * 1024;
-const MAX_TOOL_RESULT_CHARS = 3000;
-const MAX_NON_CODE_RESULT_CHARS = 900;
-const COMPACT_CONTEXT_TRIGGER_TURNS = 12;
-const COMPACT_CONTEXT_TRIGGER_RATIO = 0.55;
-const COMPACT_CONTEXT_MIN_GAP_TURNS = 6;
+const MAX_TOOL_RESULT_CHARS = 500;
+const MAX_NON_CODE_RESULT_CHARS = 300;
+const COMPACT_CONTEXT_TRIGGER_TURNS = 5;
+const COMPACT_CONTEXT_TRIGGER_RATIO = 0.30;
+const COMPACT_CONTEXT_MIN_GAP_TURNS = 3;
 const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
-const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
+const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 500;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
-const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 0;
+const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
 const LOOP_WINDOW = 5;
+const CHECKPOINT_INTERVAL_MAX = 10;
+const CHECKPOINT_INTERVAL_EARLY = 4;
+const CHECKPOINT_CONTEXT_RATIO = 0.40;
+const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
 let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
@@ -669,6 +673,19 @@ function detectRepeatedToolSignature(state: SessionState, name: string, signatur
     }
   }
   return null;
+}
+
+function isReadOnlyTool(name: string): boolean {
+  return readOnlyTools.includes(name);
+}
+
+function shouldSaveCheckpoint(state: SessionState): boolean {
+  if (state.turnCounter >= CHECKPOINT_INTERVAL_MAX) return true;
+  if (state.turnCounter >= CHECKPOINT_INTERVAL_EARLY) {
+    const lastCalls = state.toolCallHistory.slice(-3);
+    if (lastCalls.length >= 3 && new Set(lastCalls.map((t: any) => t.name)).size === 1) return true;
+  }
+  return false;
 }
 
 function truncateText(text: string, maxChars: number): string {
@@ -1373,12 +1390,12 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
       };
       log.startTurn(turnEntry);
-      if (!["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
+      if (!readOnlyTools.includes(name) && !["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
         const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`], currentSessionId(state), workspace || "", "workspace");
         log.saveMemory(tags, `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
       }
 
-      if (state.turnCounter % 5 === 0) {
+      if (shouldSaveCheckpoint(state)) {
         log.saveCheckpoint(
           `Turn ${state.turnCounter}: called ${name} — result ok=${result?.ok}`,
           ["checkpoint", `turn:${state.turnCounter}`],
