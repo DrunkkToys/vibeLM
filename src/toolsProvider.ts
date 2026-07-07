@@ -566,7 +566,7 @@ function estimateCharsFromTokens(tokens: number): number {
 }
 
 function hardPromptBudgetLimit(contextWindow: number): number {
-  return Math.max(512, contextWindow - COMPACT_CONTEXT_SAFETY_MARGIN);
+  return Math.max(512, Math.floor(contextWindow * PROMPT_BUDGET_RATIO));
 }
 
 function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general"): string {
@@ -673,10 +673,6 @@ function detectRepeatedToolSignature(state: SessionState, name: string, signatur
     }
   }
   return null;
-}
-
-function isReadOnlyTool(name: string): boolean {
-  return readOnlyTools.includes(name);
 }
 
 function shouldSaveCheckpoint(state: SessionState): boolean {

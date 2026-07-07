@@ -95,15 +95,18 @@ export class JsonlCache {
   }
 
   appendBatch(objs: JsonlEntry[]): void {
-    const lines = objs.map(o => JSON.stringify(o)).join("\n") + "\n";
+    const lines = objs.map(o => JSON.stringify(o));
+    const text = lines.join("\n") + "\n";
     const size = statSync(this.path).size;
-    if (size + Buffer.byteLength(lines, "utf-8") > this.maxBytes) {
+    if (size + Buffer.byteLength(text, "utf-8") > this.maxBytes) {
       this.compact();
     }
-    const newSize = statSync(this.path).size;
-    appendFileSync(this.path, lines, "utf-8");
-    for (let i = 0; i < objs.length; i++) {
-      this.byteOffsets.push(newSize);
+    const baseSize = statSync(this.path).size;
+    appendFileSync(this.path, text, "utf-8");
+    let offsetDelta = 0;
+    for (const line of lines) {
+      this.byteOffsets.push(baseSize + offsetDelta);
+      offsetDelta += Buffer.byteLength(line + "\n", "utf-8");
     }
     this.count += objs.length;
   }
