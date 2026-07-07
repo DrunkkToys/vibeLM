@@ -1457,6 +1457,45 @@ EXAMPLE: set_workspace({ path: "/Users/name/project" })`,
     },
   }), "set_workspace");
 
+  const exploreWorkspaceTool = wrapTool(tool({
+    name: "explore_workspace",
+    description: text`Produces a shallow inventory of the workspace or a subdirectory.
+USE WHEN: you want to inspect the current workspace structure without recursive content search.
+EXAMPLE: explore_workspace({ path: "." }) returns the top-level entries in the workspace.
+NOTE: This does not search file contents; it only lists the requested directory and summarizes what is there.`,
+    parameters: {
+      path: z.string().optional().default(".").describe("Directory relative to workspace"),
+      maxEntries: z.number().int().min(1).max(200).optional().default(50).describe("Maximum entries to return"),
+    },
+    implementation: async ({ path, maxEntries }) => {
+      try {
+        const ws = requireWorkspace(ctl);
+        const dir = sandboxPath(ws, path);
+        if (!existsSync(dir)) return fail(`Path not found: ${dir}`);
+        const st = statSync(dir);
+        if (!st.isDirectory()) return fail(`Is not a directory: ${dir}`);
+        const entries = readdirSync(dir, { withFileTypes: true });
+        const limited = entries.slice(0, maxEntries);
+        return ok({
+          workspace: ws,
+          path: dir,
+          summary: {
+            totalEntries: entries.length,
+            directories: entries.filter((entry) => entry.isDirectory()).length,
+            files: entries.filter((entry) => entry.isFile()).length,
+            truncated: entries.length > limited.length,
+          },
+          entries: limited.map((entry) => {
+            const full = resolve(dir, entry.name);
+            let size: number | null = null;
+            try { if (entry.isFile()) size = statSync(full).size; } catch {}
+            return { name: entry.name, type: entry.isDirectory() ? "directory" : "file", size };
+          }),
+        });
+      } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
+    },
+  }), "explore_workspace");
+
   const getConfigTool = wrapTool(tool({
     name: "get_config",
     description: text`Returns current configuration: workspace path, memory stats, config file info.
@@ -2116,6 +2155,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 
   const ALL_TOOL_MAP: Record<string, any> = {
     set_workspace: setWorkspaceTool,
+    explore_workspace: exploreWorkspaceTool,
     get_config: getConfigTool,
     save_memory: saveMemoryTool,
     compact_context: compactContextTool,
@@ -2193,6 +2233,11 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       return recordProcessedPrompt(historyText, `[Tool executed: set_workspace]`);
     }
     return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
+  }
+
+  const exploreMatch = t.match(/^(?:explore|inspect|scan|survey)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+explore|inspect|scan|survey)(?:\s+(.+))?$/i);
+  if (exploreMatch) {
+    return recordProcessedPrompt(historyText, `[Tool executed: explore_workspace]`);
   }
 
   // Inject step-completion reminder for multi-step requests
