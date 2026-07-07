@@ -2,11 +2,13 @@
 set -euo pipefail
 
 SOURCE_DIR="/Users/drunkktoys/Desktop/vibeLM"
-INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/agentic-tools"
+INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibe-lm"
+LEGACY_INSTALL_DIR_1="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/agentic-tools"
+LEGACY_INSTALL_DIR_2="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibeLM"
 
 echo ""
 echo "═══════════════════════════════════════════════════════"
-echo "  Building agentic-tools plugin"
+echo "  Building vibeLM plugin"
 echo "═══════════════════════════════════════════════════════"
 echo ""
 
@@ -25,6 +27,7 @@ fi
 
 # 3. Install via LM Studio
 echo "▸ Installing plugin..."
+(rm -rf "$LEGACY_INSTALL_DIR_1" "$LEGACY_INSTALL_DIR_2")
 (cd "$SOURCE_DIR" && lms dev --install --yes)
 echo "  ✓ Plugin installed"
 
@@ -39,10 +42,14 @@ echo "▸ Copying dist/ to install dir..."
 cp -r "$SOURCE_DIR/dist" "$INSTALL_DIR/dist"
 echo "  ✓ dist/ copied"
 
-# 6. Copy config.json
-echo "▸ Copying config.json..."
-cp "$SOURCE_DIR/config.json" "$INSTALL_DIR/config.json"
-echo "  ✓ config.json copied"
+# 6. Preserve runtime config.json when it already exists.
+echo "▸ Preserving config.json..."
+if [ ! -f "$INSTALL_DIR/config.json" ]; then
+  cp "$SOURCE_DIR/config.json" "$INSTALL_DIR/config.json"
+  echo "  ✓ config.json initialized"
+else
+  echo "  ✓ config.json preserved"
+fi
 
 # 7. Verify
 echo "▸ Verifying..."

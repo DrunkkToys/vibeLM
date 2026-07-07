@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local search proxy — Bing RSS, returns JSON for agentic-tools plugin.
+"""Local search proxy — Bing RSS, returns JSON for vibeLM plugin.
 Run: python3 scripts/search_server.py
 Endpoint: http://localhost:8394/search?q=...&format=json
 No API keys. No DuckDuckGo. No SearXNG. Just Bing RSS + XML."""

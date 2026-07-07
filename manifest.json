@@ -2,6 +2,6 @@
   "type": "plugin",
   "runner": "node",
   "owner": "drunkktoys",
-  "name": "agentic-tools",
+  "name": "vibe-lm",
   "revision": 2
 }
