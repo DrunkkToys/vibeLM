@@ -495,6 +495,27 @@ describe("vibeLM Cascade Integration", () => {
     }
   });
 
+  it("should expose explore_workspace as a shallow inventory command", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const exploreWorkspace = tools.find((tool: any) => tool.name === "explore_workspace");
+    assert.ok(exploreWorkspace, "explore_workspace tool must be present");
+
+    const result = await exploreWorkspace.implementation({ path: ".", maxEntries: 10 });
+    assert.ok(result?.ok, `explore_workspace should succeed: ${JSON.stringify(result)}`);
+    assert.equal(result.data.workspace, TEST_DIR);
+    assert.equal(result.data.path, TEST_DIR);
+    assert.ok(Array.isArray(result.data.entries), "explore_workspace should return a shallow entry list");
+    assert.ok(result.data.entries.some((entry: any) => entry.name === "README.md"), "explore_workspace should expose top-level files");
+  });
+
+  it("should rewrite bare explore workspace requests without searching content", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const result = await preprocessMessage("explore workspace");
+    assert.ok(result, "bare explore workspace should be rewritten");
+    assert.match(result!, /\[Tool executed: explore_workspace\]/, "bare explore workspace should stay on the narrow command path");
+  });
+
   it("should ignore older workspace memories when the latest memory is unrelated", async () => {
     const { SessionLog } = await import("../src/sessionLog");
     const { getLatestWorkspaceMemory } = await import("../src/toolsProvider");

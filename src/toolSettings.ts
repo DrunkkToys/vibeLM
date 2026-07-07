@@ -13,6 +13,12 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
     defaultEnabled: true,
   },
   {
+    name: "explore_workspace",
+    displayName: "Explore Workspace",
+    subtitle: "Enable a shallow workspace inventory command without recursive search.",
+    defaultEnabled: true,
+  },
+  {
     name: "get_config",
     displayName: "Get Config",
     subtitle: "Enable runtime config, prompt budget, and memory visibility.",
