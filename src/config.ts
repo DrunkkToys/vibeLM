@@ -1,30 +1,48 @@
 import { createConfigSchematics } from "@lmstudio/sdk";
+import { TOOL_TOGGLES } from "./toolSettings";
 
 export const configSchematics = createConfigSchematics()
-  .field(
-    "maxOrchestratorTurns",
-    "numeric",
-    {
-      displayName: "Max Orchestrator Turns",
-      subtitle: "Hard cap on how many tool turns the agent can use before it must stop and respond.",
-      int: true,
-      min: 1,
-      max: 100,
-      slider: { min: 1, max: 50, step: 1 },
-    },
-    50,
-  )
-  .field(
-    "contextOverflowHeadroomTokens",
-    "numeric",
-    {
-      displayName: "Rolling Window Trigger Tokens",
-      subtitle: "When the remaining context drops below this many tokens, vibeLM treats the session as near limit and can compact or recommend rolling-window behavior.",
-      int: true,
-      min: 256,
-      max: 8192,
-      slider: { min: 256, max: 4096, step: 128 },
-    },
-    1024,
-  )
+  .scope("tools", (builder) => {
+    let scoped = builder
+      .field(
+        "maxOrchestratorTurns",
+        "numeric",
+        {
+          displayName: "Max Orchestrator Turns",
+          subtitle: "Hard cap on how many tool turns the agent can use before it must stop and respond. Set to 0 to disable the hard cap.",
+          int: true,
+          min: 0,
+          max: 100,
+          slider: { min: 0, max: 100, step: 1 },
+        },
+        50,
+      )
+      .field(
+        "rollingWindowTriggerTokens",
+        "numeric",
+        {
+          displayName: "Rolling Window Trigger Limit (prompt tokens)",
+          subtitle: "Enter a token count, not characters. Set 0 to auto-derive from the selected model context window minus a safety margin. When the prompt estimate reaches this many tokens, vibeLM treats the session as near limit and can compact or recommend rolling-window behavior.",
+          int: true,
+          min: 0,
+          max: 16384,
+          slider: { min: 0, max: 16384, step: 256 },
+        },
+        0,
+      );
+
+    for (const tool of TOOL_TOGGLES) {
+      scoped = scoped.field(
+        tool.name,
+        "boolean",
+        {
+          displayName: tool.displayName,
+          subtitle: tool.subtitle,
+        },
+        tool.defaultEnabled,
+      );
+    }
+
+    return scoped;
+  })
   .build();

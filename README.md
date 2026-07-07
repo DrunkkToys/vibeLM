@@ -43,8 +43,10 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 - Code is preserved verbatim or referenced by path, never paraphrased.
 - Memory entries are tagged with workspace, session, and semantic scope so you can search by `session`, `workspace`, `research`, or `all`.
 - `get_config` shows the current prompt-budget estimate, safety margin, and overflow risk.
-- LM Studio’s plugin settings UI exposes `maxOrchestratorTurns`, which defaults to `50` and controls how many tool turns the orchestrator can use before it must stop.
-- LM Studio’s plugin settings UI also exposes `Rolling Window Trigger Tokens`, which controls how early vibeLM treats the session as near the context limit.
+- LM Studio’s plugin settings UI groups the agent controls under a `tools` section.
+- `maxOrchestratorTurns` defaults to `50`, accepts values from `0` to `100`, and `0` disables the hard turn cap.
+- `Rolling Window Trigger Limit (prompt tokens)` controls the maximum prompt size before vibeLM switches to rolling-window behavior. Set it to `0` to auto-derive the trigger from the selected model’s context window minus a safety margin.
+- The `tools` section also exposes on/off toggles for the individual tools, so you can disable capabilities you do not want the orchestrator to use.
 - `respond_to_user` is gated so the orchestrator does not stop too early.
 - The plugin tries to stay under the model’s prompt budget and auto-compacts when sessions get large.
 
@@ -80,7 +82,6 @@ Example:
 ```
 
 Set it from the plugin with `set_workspace`, or use `pick_workspace` on macOS.
-The plugin keeps the LM Studio install path in kebab-case for compatibility, but the product name shown in prompts and docs is `vibeLM`.
 
 ## Publishing
 

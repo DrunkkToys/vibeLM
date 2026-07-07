@@ -1,18 +1,20 @@
 import { text, tool, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
-import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
 import { resolve, dirname, relative, extname } from "path";
 import { homedir } from "os";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import * as math from "mathjs";
-import { SessionLog, type MemoryEntry, type TurnEntry } from "./sessionLog";
+import { SessionLog, type MemoryEntry, type SearchMemoryResult, type TurnEntry } from "./sessionLog";
 import { configSchematics } from "./config";
+import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
 
 const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
+const RUNTIME_STATE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "runtime-state.json");
 const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "session-log.jsonl");
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
@@ -27,37 +29,90 @@ const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
 const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
-const DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS = 1024;
+const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 0;
 const LOOP_WINDOW = 5;
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
 let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
-let activeContextOverflowHeadroomTokens = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS;
+let activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
 
-const LM_STUDIO_URL = "http://127.0.0.1:1234";
-let cachedContextWindow: { value: number; ts: number } | null = null;
+type ContextWindowCacheEntry = {
+  modelKey: string;
+  contextWindow: number;
+  ts: number;
+};
 
-async function getContextWindow(): Promise<number> {
-  const now = Date.now();
-  if (cachedContextWindow && now - cachedContextWindow.ts < 60_000) {
-    return cachedContextWindow.value;
-  }
+let cachedContextWindow: ContextWindowCacheEntry | null = null;
+
+function makeModelCacheKey(model: { identifier?: string; modelKey?: string; path?: string } | null | undefined): string {
+  return [model?.identifier, model?.modelKey, model?.path].filter((part) => typeof part === "string" && part.trim().length > 0).join("::");
+}
+
+async function resolveLoadedContextWindow(ctl?: any): Promise<ContextWindowCacheEntry | null> {
   try {
-    const resp = await fetch(`${LM_STUDIO_URL}/v1/models`);
-    const data = await resp.json() as any;
-    const models = data?.data || [];
+    const loadedModels = await ctl?.client?.llm?.listLoaded?.();
+    if (!Array.isArray(loadedModels) || loadedModels.length === 0) {
+      return null;
+    }
     const config = readConfigSync();
     const preferred = (config as any).preferredModel;
-    const target = pickBestModel(models, preferred);
-    const model = models.find((m: any) => m.id === target) || models[0];
-    const ctx = model?.max_context_length;
+    const selected = pickBestLoadedModel(loadedModels, preferred) || loadedModels[0];
+    if (!selected) {
+      return null;
+    }
+    const contextWindow = await readLoadedModelContextWindow(selected);
+    if (typeof contextWindow === "number" && contextWindow > 0) {
+      return {
+        modelKey: makeModelCacheKey(selected),
+        contextWindow,
+        ts: Date.now(),
+      };
+    }
+  } catch {}
+  return null;
+}
+
+function pickBestLoadedModel(models: Array<{ identifier?: string; modelKey?: string; path?: string }>, preferred?: string) {
+  if (!models.length) return null;
+  if (preferred) {
+    const match = models.find((m) => [m.identifier, m.modelKey, m.path].some((value) => typeof value === "string" && value.includes(preferred)));
+    if (match) return match;
+  }
+  return models[0];
+}
+
+async function readLoadedModelContextWindow(model: any): Promise<number | null> {
+  const direct = model?.contextLength ?? model?.max_context_length;
+  if (typeof direct === "number" && direct > 0) {
+    return direct;
+  }
+  try {
+    const info = await model?.getModelInfo?.();
+    const ctx = info?.contextLength ?? info?.max_context_length;
     if (typeof ctx === "number" && ctx > 0) {
-      cachedContextWindow = { value: ctx, ts: now };
       return ctx;
     }
   } catch {}
-  cachedContextWindow = { value: 8192, ts: now };
-  return 8192;
+  return null;
+}
+
+async function getContextWindow(ctl?: any): Promise<number> {
+  const now = Date.now();
+  const resolved = await resolveLoadedContextWindow(ctl);
+  if (resolved) {
+    if (!cachedContextWindow || cachedContextWindow.modelKey !== resolved.modelKey || cachedContextWindow.contextWindow !== resolved.contextWindow) {
+      cachedContextWindow = resolved;
+    } else {
+      cachedContextWindow.ts = now;
+    }
+    return resolved.contextWindow;
+  }
+
+  if (cachedContextWindow) {
+    return cachedContextWindow.contextWindow;
+  }
+
+  return DEFAULT_CONTEXT_WINDOW;
 }
 
 const BINARY_EXTS = new Set([
@@ -148,33 +203,74 @@ function defaultConfig() {
   return { workspacePath: homedir() };
 }
 
-function readConfigSync(): { workspacePath: string; preferredModel?: string; enabledTools?: string[]; searchEndpoint?: string } {
+function readConfigSync(): { workspacePath: string; preferredModel?: string; searchEndpoint?: string } {
   try {
     const raw = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) : {};
+    if (raw && typeof raw === "object" && !Array.isArray(raw) && "enabledTools" in raw) {
+      const { enabledTools, ...cleaned } = raw as Record<string, unknown>;
+      writeConfigSync(cleaned);
+      return { ...defaultConfig(), ...cleaned };
+    }
     return { ...defaultConfig(), ...raw };
   } catch { return defaultConfig(); }
 }
 
-function resolveMaxOrchestratorTurns(ctl?: { getPluginConfig?: (schematics: typeof configSchematics) => { get: (key: "maxOrchestratorTurns") => unknown } }): number {
+function readPluginConfigValue(ctl: any, keys: string[]): unknown {
   try {
     const pluginConfig = ctl?.getPluginConfig?.(configSchematics);
-    const rawValue = pluginConfig?.get("maxOrchestratorTurns");
-    if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
-      return Math.max(1, Math.min(100, Math.floor(rawValue)));
+    for (const key of keys) {
+      const rawValue = pluginConfig?.get(key);
+      if (rawValue !== undefined) {
+        return rawValue;
+      }
     }
   } catch {}
+  return undefined;
+}
+
+function resolveMaxOrchestratorTurns(ctl?: any): number {
+  const rawValue = readPluginConfigValue(ctl, ["tools.maxOrchestratorTurns", "maxOrchestratorTurns"]);
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(0, Math.min(100, Math.floor(rawValue)));
+  }
   return DEFAULT_MAX_ORCHESTRATOR_TURNS;
 }
 
-function resolveContextOverflowHeadroomTokens(ctl?: { getPluginConfig?: (schematics: typeof configSchematics) => { get: (key: "contextOverflowHeadroomTokens") => unknown } }): number {
-  try {
-    const pluginConfig = ctl?.getPluginConfig?.(configSchematics);
-    const rawValue = pluginConfig?.get("contextOverflowHeadroomTokens");
-    if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
-      return Math.max(256, Math.min(8192, Math.floor(rawValue)));
+function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
+  const rawValue = readPluginConfigValue(ctl, ["tools.rollingWindowTriggerTokens", "rollingWindowTriggerTokens", "contextOverflowHeadroomTokens"]);
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(0, Math.min(16384, Math.floor(rawValue)));
+  }
+  return DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
+}
+
+function resolveRollingWindowTriggerTokens(contextWindow: number, configuredTokens: number): number {
+  const hardLimitTokens = hardPromptBudgetLimit(contextWindow);
+  if (configuredTokens <= 0) {
+    return hardLimitTokens;
+  }
+  return Math.max(1, Math.min(configuredTokens, hardLimitTokens));
+}
+
+function resolveEnabledToolNames(ctl?: any): string[] {
+  const pluginEnabledTools: string[] = [];
+  let sawPluginToggle = false;
+
+  for (const tool of TOOL_TOGGLES) {
+    const rawValue = readPluginConfigValue(ctl, [`tools.${tool.name}`, tool.name]);
+    if (typeof rawValue === "boolean") {
+      sawPluginToggle = true;
+      if (rawValue) {
+        pluginEnabledTools.push(tool.name);
+      }
     }
-  } catch {}
-  return DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS;
+  }
+
+  if (sawPluginToggle) {
+    return dedupeTags([...pluginEnabledTools, "respond_to_user"]);
+  }
+
+  return dedupeTags([...DEFAULT_ENABLED_TOOL_NAMES, "respond_to_user"]);
 }
 
 function writeConfigSync(config: Record<string, unknown>): void {
@@ -243,8 +339,10 @@ function getSessionLog(): SessionLog {
 type SessionState = {
   sessionId: string;
   turnCounter: number;
-  toolCallHistory: Array<{ name: string; ts: number }>;
+  toolCallHistory: Array<{ name: string; signature: string; ts: number }>;
   lastCompactionTurn: number;
+  historyFingerprint: string;
+  resumedFromPersistedState: boolean;
 };
 
 function createSessionState(): SessionState {
@@ -253,10 +351,14 @@ function createSessionState(): SessionState {
     turnCounter: 0,
     toolCallHistory: [],
     lastCompactionTurn: 0,
+    historyFingerprint: "",
+    resumedFromPersistedState: false,
   };
 }
 
 let activeSessionState = createSessionState();
+let activeSessionInitialized = false;
+let activeSessionBootstrapPromise: Promise<SessionState> | null = null;
 
 function resetSessionState(): SessionState {
   activeSessionState = createSessionState();
@@ -277,6 +379,142 @@ function compactWorkspaceTag(workspace: string): string {
 
 function compactScopeTag(scope: Exclude<MemoryScope, "all">): string {
   return `scope:${scope}`;
+}
+
+type PersistedSessionState = {
+  version: 1;
+  sessionId: string;
+  turnCounter: number;
+  lastCompactionTurn: number;
+  historyFingerprint: string;
+  resumedFromPersistedState: boolean;
+  updatedAt: string;
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeHistoryText(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
+function stripManagedContextBlocks(historyText: string): string {
+  const normalized = normalizeHistoryText(historyText);
+  if (!normalized.includes(MANAGED_CONTEXT_MARKER)) {
+    return normalized;
+  }
+  const managedBlock = new RegExp(`${escapeRegExp(MANAGED_CONTEXT_MARKER)}[\\s\\S]*?(?=\\n{2,}|$)`, "g");
+  return normalized.replace(managedBlock, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function fingerprintHistoryText(historyText: string): string {
+  return createHash("sha256").update(stripManagedContextBlocks(historyText), "utf-8").digest("hex");
+}
+
+function readRuntimeStateSync(): PersistedSessionState | null {
+  try {
+    if (!existsSync(RUNTIME_STATE_PATH)) return null;
+    const parsed = JSON.parse(readFileSync(RUNTIME_STATE_PATH, "utf-8")) as Partial<PersistedSessionState> | null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (parsed.version !== 1) return null;
+    if (typeof parsed.sessionId !== "string" || typeof parsed.historyFingerprint !== "string") return null;
+    return {
+      version: 1,
+      sessionId: parsed.sessionId,
+      turnCounter: Number.isFinite(parsed.turnCounter) ? Math.max(0, Math.floor(parsed.turnCounter ?? 0)) : 0,
+      lastCompactionTurn: Number.isFinite(parsed.lastCompactionTurn) ? Math.max(0, Math.floor(parsed.lastCompactionTurn ?? 0)) : 0,
+      historyFingerprint: parsed.historyFingerprint,
+      resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeRuntimeStateSync(state: SessionState): void {
+  try {
+    const dir = dirname(RUNTIME_STATE_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const payload: PersistedSessionState = {
+      version: 1,
+      sessionId: state.sessionId,
+      turnCounter: state.turnCounter,
+      lastCompactionTurn: state.lastCompactionTurn,
+      historyFingerprint: state.historyFingerprint,
+      resumedFromPersistedState: state.resumedFromPersistedState,
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
+  } catch {}
+}
+
+async function readHistoryText(ctl?: PromptPreprocessorController | ToolsProviderController): Promise<string | null> {
+  try {
+    const history = await (ctl as any)?.pullHistory?.();
+    if (!history) return null;
+    return `${history.getSystemPrompt()}\n${history.toString()}`;
+  } catch {
+    return null;
+  }
+}
+
+async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsProviderController, force = false): Promise<SessionState> {
+  if (activeSessionInitialized && !force) {
+    return activeSessionState;
+  }
+
+  if (force) {
+    activeSessionInitialized = false;
+    activeSessionBootstrapPromise = null;
+    activeSessionState = createSessionState();
+  }
+
+  if (!activeSessionBootstrapPromise) {
+    activeSessionBootstrapPromise = (async () => {
+      const historyText = await readHistoryText(ctl);
+      if (!historyText) {
+        activeSessionState = createSessionState();
+      } else {
+        const historyFingerprint = fingerprintHistoryText(historyText);
+        const persisted = readRuntimeStateSync();
+        if (persisted && persisted.historyFingerprint === historyFingerprint) {
+          activeSessionState = {
+            sessionId: persisted.sessionId,
+            turnCounter: persisted.turnCounter,
+            toolCallHistory: [],
+            lastCompactionTurn: persisted.lastCompactionTurn,
+            historyFingerprint,
+            resumedFromPersistedState: true,
+          };
+        } else {
+          activeSessionState = createSessionState();
+          activeSessionState.historyFingerprint = historyFingerprint;
+        }
+      }
+
+      activeSessionInitialized = true;
+      writeRuntimeStateSync(activeSessionState);
+      return activeSessionState;
+    })().finally(() => {
+      activeSessionBootstrapPromise = null;
+    });
+  }
+
+  return activeSessionBootstrapPromise;
+}
+
+function syncRuntimeState(historyText?: string | null, state: SessionState = activeSessionState): void {
+  if (typeof historyText === "string" && historyText.trim().length > 0) {
+    state.historyFingerprint = fingerprintHistoryText(historyText);
+  }
+  writeRuntimeStateSync(state);
+}
+
+function recordProcessedPrompt(historyText: string, processed: string, state: SessionState = activeSessionState): string {
+  syncRuntimeState([historyText, processed].filter(Boolean).join("\n"), state);
+  return processed;
 }
 
 function dedupeTags(tags: string[]): string[] {
@@ -308,42 +546,51 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function promptBudgetLimit(contextWindow: number, headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS): number {
-  return Math.max(512, contextWindow - Math.max(COMPACT_CONTEXT_SAFETY_MARGIN, headroomTokens));
+function estimateCharsFromTokens(tokens: number): number {
+  return Math.max(1, tokens * 4);
+}
+
+function hardPromptBudgetLimit(contextWindow: number): number {
+  return Math.max(512, contextWindow - COMPACT_CONTEXT_SAFETY_MARGIN);
+}
+
+function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general"): string {
+  return `${MANAGED_CONTEXT_MARKER}
+[Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
+[Action: preserve code verbatim, summarize only the actionable state, and call respond_to_user with the best available handoff.]
+[If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
 }
 
 function buildPromptBudgetReport(
   historyText: string,
   rewrittenText: string,
   contextWindow: number,
-  headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS,
+  rollingWindowTriggerTokens: number = hardPromptBudgetLimit(contextWindow),
 ): {
   estimatedTokens: number;
-  limitTokens: number;
+  hardLimitTokens: number;
   safetyMargin: number;
-  headroomTokens: number;
+  rollingWindowTriggerTokens: number;
+  rollingWindowTriggerCharsApprox: number;
   overflow: boolean;
   nearLimit: boolean;
 } {
-  const combined = [historyText, rewrittenText].filter(Boolean).join("\n");
+  const combined = [stripManagedContextBlocks(historyText), rewrittenText].filter(Boolean).join("\n");
   const estimatedTokens = estimateTokens(combined);
-  const limitTokens = promptBudgetLimit(contextWindow, headroomTokens);
+  const hardLimitTokens = hardPromptBudgetLimit(contextWindow);
   return {
     estimatedTokens,
-    limitTokens,
+    hardLimitTokens,
     safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
-    headroomTokens,
-    overflow: estimatedTokens > limitTokens,
-    nearLimit: estimatedTokens >= Math.max(512, limitTokens - Math.floor(headroomTokens / 2)),
+    rollingWindowTriggerTokens,
+    rollingWindowTriggerCharsApprox: estimateCharsFromTokens(rollingWindowTriggerTokens),
+    overflow: estimatedTokens > hardLimitTokens,
+    nearLimit: estimatedTokens >= rollingWindowTriggerTokens,
   };
 }
 
-function isOverPromptBudget(text: string, contextWindow: number, headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS): boolean {
-  return estimateTokens(text) > promptBudgetLimit(contextWindow, headroomTokens);
-}
-
-function formatPromptBudgetError(contextWindow: number, estimatedTokens: number): string {
-  return `[Tool error: request is too large for the current model context (${estimatedTokens}/${contextWindow} tokens estimated, safety margin ${COMPACT_CONTEXT_SAFETY_MARGIN}). Split the request, shorten history, or compact before continuing.]`;
+function isOverPromptBudget(text: string, contextWindow: number): boolean {
+  return estimateTokens(text) > hardPromptBudgetLimit(contextWindow);
 }
 
 function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionState): number {
@@ -371,24 +618,44 @@ function compactWorkspaceHint(workspace: string, reminder: string): string {
 [Workspace: ${workspace}]${reminder ? `\n\n${reminder}` : ""}`;
 }
 
-function detectLoop(state: SessionState, name: string): string | null {
-  state.toolCallHistory.push({ name, ts: Date.now() });
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`);
+  return `{${entries.join(",")}}`;
+}
+
+function toolSignature(name: string, args: Record<string, unknown>): string {
+  return `${name}:${stableStringify(args)}`;
+}
+
+function detectRepeatedToolSignature(state: SessionState, name: string, signature: string): string | null {
+  state.toolCallHistory.push({ name, signature, ts: Date.now() });
   if (state.toolCallHistory.length > LOOP_WINDOW) {
     state.toolCallHistory = state.toolCallHistory.slice(-LOOP_WINDOW);
   }
   if (state.toolCallHistory.length >= 4) {
-    const last4 = state.toolCallHistory.slice(-4).map(t => t.name);
-    if (last4.every(n => n === last4[0])) {
-      return last4[0];
+    const last4 = state.toolCallHistory.slice(-4).map((t) => t.signature);
+    if (last4.every((sig) => sig === last4[0])) {
+      return state.toolCallHistory[state.toolCallHistory.length - 1].name;
     }
   }
   const window = state.toolCallHistory.slice(-6);
   const counts: Record<string, number> = {};
   for (const t of window) {
-    counts[t.name] = (counts[t.name] || 0) + 1;
+    counts[t.signature] = (counts[t.signature] || 0) + 1;
   }
   for (const [n, c] of Object.entries(counts)) {
-    if (c >= 4) return n;
+    if (c >= 4) {
+      const match = window.find((entry) => entry.signature === n);
+      return match?.name || null;
+    }
   }
   return null;
 }
@@ -414,6 +681,30 @@ async function getHistoryText(ctl?: PromptPreprocessorController): Promise<strin
 
 function hasManagedContext(historyText: string): boolean {
   return historyText.includes(MANAGED_CONTEXT_MARKER);
+}
+
+export function normalizeManagedContextHistory(historyText: string): string {
+  return stripManagedContextBlocks(historyText);
+}
+
+export function fingerprintManagedContextHistory(historyText: string): string {
+  return fingerprintHistoryText(historyText);
+}
+
+export function estimatePromptBudgetSnapshot(
+  historyText: string,
+  rewrittenText: string,
+  contextWindow: number,
+  rollingWindowTriggerTokens: number = hardPromptBudgetLimit(contextWindow),
+): ReturnType<typeof buildPromptBudgetReport> {
+  return buildPromptBudgetReport(historyText, rewrittenText, contextWindow, rollingWindowTriggerTokens);
+}
+
+export async function resolveSessionStateFromHistory(
+  ctl?: PromptPreprocessorController | ToolsProviderController,
+  force = false,
+): Promise<SessionState> {
+  return await bootstrapSessionState(ctl, force);
 }
 
 function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
@@ -1003,14 +1294,14 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       const maxTurns = activeMaxOrchestratorTurns;
       state.turnCounter++;
 
-      if (name !== "respond_to_user" && state.turnCounter > maxTurns) {
+      if (maxTurns > 0 && name !== "respond_to_user" && state.turnCounter > maxTurns) {
         return {
           ok: false,
           error: `Max turns (${maxTurns}) exceeded. Use respond_to_user with what you have so far.`,
         };
       }
 
-      const looped = detectLoop(state, name);
+      const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args));
       if (looped) {
         return {
           ok: false,
@@ -1054,7 +1345,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         );
       }
 
-      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow())) {
+      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx))) {
         const compact = await compactSessionContext(log, state, {
           saveToMemory: true,
           includeCode: true,
@@ -1066,6 +1357,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         }
       }
 
+      syncRuntimeState(undefined, state);
       return result;
     },
   };
@@ -1098,10 +1390,10 @@ function fail(msg: string) {
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
 
 export async function toolsProvider(ctl: ToolsProviderController) {
-  const sessionState = resetSessionState();
+  const sessionState = await bootstrapSessionState(ctl, true);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
-  activeContextOverflowHeadroomTokens = resolveContextOverflowHeadroomTokens(ctl);
+  activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
 
   const setWorkspaceTool = wrapTool(tool({
     name: "set_workspace",
@@ -1134,7 +1426,10 @@ EXAMPLE: get_config()`,
       const session = getSessionLog();
       const workspace = requireWorkspace(ctl);
       const promptEstimate = estimateRecentSessionPromptTokens(session, sessionState);
-      const contextWindow = await getContextWindow();
+      const contextWindow = await getContextWindow(ctl);
+      const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl);
+      const effectiveRollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
+      activeRollingWindowTriggerTokens = effectiveRollingWindowTriggerTokens;
       return ok({
         workspace,
         sessionId: currentSessionId(sessionState),
@@ -1146,17 +1441,21 @@ EXAMPLE: get_config()`,
         totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
         maxOrchestratorTurns: activeMaxOrchestratorTurns,
-        contextOverflowHeadroomTokens: activeContextOverflowHeadroomTokens,
+        rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
+        rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
+        rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
         promptBudget: {
           contextWindow,
-          limitTokens: promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens),
+          hardLimitTokens: hardPromptBudgetLimit(contextWindow),
           estimatedTokens: promptEstimate,
           safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
-          headroomTokens: activeContextOverflowHeadroomTokens,
-          risk: promptEstimate >= promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) ? "high" : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) * 0.85) ? "medium" : "low",
-          recommendedOverflowPolicy: promptEstimate >= promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens)
+          rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
+          rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
+          rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
+          risk: promptEstimate >= hardPromptBudgetLimit(contextWindow) ? "high" : promptEstimate >= Math.floor(hardPromptBudgetLimit(contextWindow) * 0.85) ? "medium" : "low",
+          recommendedOverflowPolicy: promptEstimate >= hardPromptBudgetLimit(contextWindow)
             ? "compact_context"
-            : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) * 0.85)
+            : promptEstimate >= effectiveRollingWindowTriggerTokens
               ? "rollingWindow"
               : "stopAtLimit",
         },
@@ -1236,7 +1535,7 @@ EXAMPLE: respond_to_user({ text: "Here is the current status and the next blocke
       text: z.string().min(1).max(100000).describe("Your complete final response to the user"),
     },
     implementation: async ({ text }) => {
-      const atTurnCap = activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
+      const atTurnCap = activeMaxOrchestratorTurns > 0 && activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
       // Detect early/passive responses and reject them
       if (!atTurnCap && /let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
         return {
@@ -1559,14 +1858,25 @@ NOTE: Provide either tags or query, not both. Scope defaults to workspace; set i
       const session = getSessionLog();
       const workspace = requireWorkspace(ctl);
       const filter = memoryFilterForScope(scope ?? "workspace", workspace, currentSessionId(sessionState));
-      let results: MemoryEntry[] = [];
+      let results: SearchMemoryResult[] = [];
       if (tags && tags.length > 0) {
         results = session.searchMemoriesByTags(tags, maxResults, filter);
       } else if (query) {
         results = session.searchMemoriesByContent(query, maxResults, filter);
       }
       return ok({
-        results: results.map((e) => ({ content: e.content.slice(0, 500), tags: e.tags, scope: e.scope ?? null, workspace: e.workspace ?? null, sessionId: e.sessionId ?? null })),
+        results: results.map((e) => ({
+          content: e.content.slice(0, 500),
+          tags: e.tags,
+          scope: e.scope ?? null,
+          workspace: e.workspace ?? null,
+          sessionId: e.sessionId ?? null,
+          matchScore: e.matchScore,
+          matchedTags: e.matchedTags,
+          matchedContent: e.matchedContent,
+          matchMode: e.matchMode,
+          query: query ?? null,
+        })),
         totalMatches: results.length,
         scope: scope ?? "workspace",
       });
@@ -1793,18 +2103,10 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     respond_to_user: respondToUserTool,
   };
 
-const DEFAULT_ENABLED = [
-    "set_workspace", "get_config", "save_memory", "compact_context", "search_memory",
-    "web_fetch", "web_search",
-    "read_file", "list_files", "search_files", "bash_terminal",
-    "calculate", "get_current_datetime", "write_file",
-    "respond_to_user",
-  ];
   const MANDATORY_ENABLED = ["respond_to_user"];
 
-  const configTools = readConfigSync();
   const enabledNames = dedupeTags([
-    ...((configTools as any).enabledTools || DEFAULT_ENABLED),
+    ...resolveEnabledToolNames(ctl),
     ...MANDATORY_ENABLED,
   ]);
   const allTools = enabledNames
@@ -1825,17 +2127,21 @@ const DEFAULT_ENABLED = [
 
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
-  const contextWindow = await getContextWindow();
-  const contextOverflowHeadroomTokens = resolveContextOverflowHeadroomTokens(ctl as any);
+  await bootstrapSessionState(ctl as any);
+  const contextWindow = await getContextWindow(ctl as any);
+  const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl as any);
+  const rollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
   const historyText = await getHistoryText(ctl);
-  const managedContextPresent = hasManagedContext(historyText);
+  syncRuntimeState(historyText, activeSessionState);
+  const normalizedHistoryText = normalizeManagedContextHistory(historyText);
+  const managedContextPresent = hasManagedContext(historyText) || activeSessionState.resumedFromPersistedState;
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
   if (wsMatch) {
     if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
+      const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
       if (plainReport.overflow) {
-        return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
       }
       return null;
     }
@@ -1849,31 +2155,31 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const stepsMatch = rest.match(/^\d+\.\s/gm);
       const reminder = stepsMatch ? compactTaskReminder(stepsMatch.length) : "";
       const processed = `${compactWorkspaceHint(resolved, reminder)}${rest ? `\n\n${rest}` : ""}`;
-      const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
+      const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
       if (report.overflow) {
-        return formatPromptBudgetError(contextWindow, report.estimatedTokens);
+        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "workspace"));
       }
-      return processed;
+      return recordProcessedPrompt(historyText, processed);
     }
-    return `[Tool error: set_workspace → path not found: ${resolved}]`;
+    return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
   }
 
   // Inject step-completion reminder for multi-step requests
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
     if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
+      const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
       if (plainReport.overflow) {
-        return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step"));
       }
       return null;
     }
     const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
-    const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
+    const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
     if (report.overflow) {
-      return formatPromptBudgetError(contextWindow, report.estimatedTokens);
+      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step"));
     }
-    return processed;
+    return recordProcessedPrompt(historyText, processed);
   }
 
   const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
@@ -1882,11 +2188,11 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const calcResp = await import("mathjs").then(m => m.evaluate(calcMatch[1]));
       if (typeof calcResp === "number" || typeof calcResp === "string") {
         const processed = `[Tool executed: calculate → ${calcResp}]`;
-        const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
+        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return formatPromptBudgetError(contextWindow, report.estimatedTokens);
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
         }
-        return processed;
+        return recordProcessedPrompt(historyText, processed);
       }
     } catch (e) {
       console.warn(`[AgenticTools] calculate preprocessor failed:`, e);
@@ -1900,21 +2206,21 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       if (results.length > 0) {
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
-        const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
+        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return formatPromptBudgetError(contextWindow, report.estimatedTokens);
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
         }
-        return processed;
+        return recordProcessedPrompt(historyText, processed);
       }
-      return `[Tool executed: web_search → no results found]`;
+      return recordProcessedPrompt(historyText, `[Tool executed: web_search → no results found]`);
     } catch (e: any) {
-      return `[Tool error: web_search → ${e.message}]`;
+      return recordProcessedPrompt(historyText, `[Tool error: web_search → ${e.message}]`);
     }
   }
 
-  const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
+  const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
   if (plainReport.overflow) {
-    return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
+    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
   }
   return null;
 }

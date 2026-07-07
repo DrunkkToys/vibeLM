@@ -21,6 +21,13 @@ export interface MemoryEntry extends JsonlEntry {
   step?: number;
 }
 
+export interface SearchMemoryResult extends MemoryEntry {
+  matchScore: number;
+  matchedTags: string[];
+  matchedContent: boolean;
+  matchMode: "tags" | "query";
+}
+
 export interface CheckpointEntry extends JsonlEntry {
   type: "checkpoint";
   sessionId?: string;
@@ -57,6 +64,73 @@ function matchesMemoryFilter(entry: MemoryEntry, filter: MemoryFilter = {}): boo
     if (!entry.scope && !entry.tags.includes(scopeTag)) return false;
   }
   return true;
+}
+
+function normalizeSearchText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9:_./-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreMemoryEntry(entry: MemoryEntry, tags: string[] = [], query?: string): number {
+  let score = 0;
+  const normalizedContent = normalizeSearchText(entry.content);
+  const normalizedQuery = normalizeSearchText(query || "");
+  if (normalizedQuery) {
+    if (normalizedContent === normalizedQuery) score += 100;
+    if (normalizedContent.includes(normalizedQuery)) score += 60;
+    for (const part of normalizedQuery.split(" ")) {
+      if (!part) continue;
+      if (normalizedContent.includes(part)) score += 8;
+    }
+    for (const tag of entry.tags) {
+      const normalizedTag = normalizeSearchText(tag);
+      if (normalizedTag === normalizedQuery) score += 90;
+      if (normalizedTag.includes(normalizedQuery) || normalizedQuery.includes(normalizedTag)) score += 45;
+    }
+  }
+  for (const tag of tags) {
+    const normalizedTag = normalizeSearchText(tag);
+    for (const entryTag of entry.tags) {
+      const normalizedEntryTag = normalizeSearchText(entryTag);
+      if (normalizedEntryTag === normalizedTag) score += 30;
+      else if (normalizedEntryTag.includes(normalizedTag) || normalizedTag.includes(normalizedEntryTag)) score += 15;
+    }
+  }
+  if (entry.scope === "research") score += 2;
+  return score;
+}
+
+function explainMemoryMatch(entry: MemoryEntry, tags: string[] = [], query?: string): { matchedTags: string[]; matchedContent: boolean; score: number } {
+  const matchedTags: string[] = [];
+  const normalizedQuery = normalizeSearchText(query || "");
+  const normalizedContent = normalizeSearchText(entry.content);
+  let matchedContent = false;
+
+  if (normalizedQuery) {
+    matchedContent = normalizedContent.includes(normalizedQuery);
+    if (matchedContent) {
+      matchedTags.push(`content:${query}`);
+    }
+    for (const tag of entry.tags) {
+      const normalizedTag = normalizeSearchText(tag);
+      if (normalizedTag === normalizedQuery || normalizedTag.includes(normalizedQuery) || normalizedQuery.includes(normalizedTag)) {
+        matchedTags.push(`tag:${tag}`);
+      }
+    }
+  }
+
+  for (const tag of tags) {
+    for (const entryTag of entry.tags) {
+      if (entryTag === tag || entryTag.includes(tag) || tag.includes(entryTag)) {
+        matchedTags.push(`tag:${entryTag}`);
+      }
+    }
+  }
+
+  return { matchedTags: Array.from(new Set(matchedTags)), matchedContent, score: scoreMemoryEntry(entry, tags, query) };
 }
 
 export class SessionLog {
@@ -147,11 +221,18 @@ export class SessionLog {
     this.jsonl.append(entry);
   }
 
-  searchMemoriesByTags(tags: string[], maxResults: number = 5, filter: MemoryFilter = {}): MemoryEntry[] {
-    return this.jsonl
-      .searchByTags(tags, maxResults)
+  searchMemoriesByTags(tags: string[], maxResults: number = 5, filter: MemoryFilter = {}): SearchMemoryResult[] {
+    const total = this.jsonl.totalLines();
+    if (total === 0) return [];
+    const entries = this.jsonl.readTail(total);
+    return entries
       .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
-      .filter((entry) => matchesMemoryFilter(entry, filter));
+      .filter((entry) => matchesMemoryFilter(entry, filter))
+      .filter((entry) => tags.some((tag) => entry.tags.some((entryTag) => entryTag === tag || entryTag.includes(tag) || tag.includes(entryTag))))
+      .map((entry) => ({ entry, ...explainMemoryMatch(entry, tags), matchMode: "tags" as const }))
+      .sort((a, b) => b.score - a.score || (b.entry.ts || "").localeCompare(a.entry.ts || ""))
+      .slice(0, maxResults)
+      .map(({ entry, score, matchedTags, matchedContent, matchMode }) => ({ ...entry, matchScore: score, matchedTags, matchedContent, matchMode }));
   }
 
   searchCheckpoints(sessionId: string, maxResults: number = 5): CheckpointEntry[] {
@@ -164,19 +245,19 @@ export class SessionLog {
     return results;
   }
 
-  searchMemoriesByContent(query: string, maxResults: number = 5, filter: MemoryFilter = {}): MemoryEntry[] {
-    const results: MemoryEntry[] = [];
+  searchMemoriesByContent(query: string, maxResults: number = 5, filter: MemoryFilter = {}): SearchMemoryResult[] {
     const total = this.jsonl.totalLines();
-    if (total === 0) return results;
-    const entries = this.jsonl.readTail(Math.min(total, 500));
-    const q = query.toLowerCase();
-    for (let i = entries.length - 1; i >= 0 && results.length < maxResults; i--) {
-      const e = entries[i] as MemoryEntry;
-      if (e.type === "mem" && e.content && e.content.toLowerCase().includes(q) && matchesMemoryFilter(e, filter)) {
-        results.push(e);
-      }
-    }
-    return results;
+    if (total === 0) return [];
+    const entries = this.jsonl.readTail(total);
+    const normalizedQuery = normalizeSearchText(query);
+    return entries
+      .filter((entry): entry is MemoryEntry => entry.type === "mem" && typeof entry.content === "string")
+      .filter((entry) => matchesMemoryFilter(entry, filter))
+      .map((entry) => ({ entry, ...explainMemoryMatch(entry, [], normalizedQuery), matchMode: "query" as const }))
+      .filter(({ matchedContent, matchedTags }) => matchedContent || matchedTags.length > 0)
+      .sort((a, b) => b.score - a.score || (b.entry.ts || "").localeCompare(a.entry.ts || ""))
+      .slice(0, maxResults)
+      .map(({ entry, score, matchedTags, matchedContent, matchMode }) => ({ ...entry, matchScore: score, matchedTags, matchedContent, matchMode }));
   }
 
   countMemories(filter: MemoryFilter = {}): number {
