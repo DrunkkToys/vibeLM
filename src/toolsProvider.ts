@@ -19,7 +19,6 @@ const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins"
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
 const PROMPT_BUDGET_RATIO = 0.50;
-const FILE_CACHE_MAX_BYTES = 1024 * 1024;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
 const COMPACT_CONTEXT_TRIGGER_TURNS = 5;
@@ -33,7 +32,6 @@ const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
 const LOOP_WINDOW = 5;
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
-const CHECKPOINT_CONTEXT_RATIO = 0.40;
 const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
@@ -128,41 +126,6 @@ const BINARY_EXTS = new Set([
   ".o", ".obj", ".pyc", ".class",
   ".ttf", ".otf", ".woff", ".woff2",
 ]);
-
-const fileCache = new Map<string, { content: string; mtime: number; size: number }>();
-let fileCacheBytes = 0;
-
-function cacheRead(filePath: string): string {
-  const cached = fileCache.get(filePath);
-  try {
-    const mtime = statSync(filePath).mtimeMs;
-    if (cached && cached.mtime === mtime) return cached.content;
-  } catch {
-    fileCache.delete(filePath);
-    throw new Error(`File not found: ${filePath}`);
-  }
-  const content = readFileSync(filePath, "utf-8");
-  const size = Buffer.byteLength(content, "utf-8");
-  const mtime = statSync(filePath).mtimeMs;
-  while (fileCacheBytes + size > FILE_CACHE_MAX_BYTES && fileCache.size > 0) {
-    const firstKey = fileCache.keys().next().value;
-    if (firstKey === undefined) break;
-    const evicted = fileCache.get(firstKey);
-    if (evicted) fileCacheBytes -= evicted.size;
-    fileCache.delete(firstKey);
-  }
-  fileCache.set(filePath, { content, mtime, size });
-  fileCacheBytes += size;
-  return content;
-}
-
-function cacheInvalidate(filePath: string): void {
-  const cached = fileCache.get(filePath);
-  if (cached) {
-    fileCacheBytes -= cached.size;
-    fileCache.delete(filePath);
-  }
-}
 
 function binaryExtCheck(p: string): boolean {
   return BINARY_EXTS.has(extname(p).toLowerCase());
@@ -363,12 +326,6 @@ function createSessionState(): SessionState {
 let activeSessionState = createSessionState();
 let activeSessionInitialized = false;
 let activeSessionBootstrapPromise: Promise<SessionState> | null = null;
-
-function resetSessionState(): SessionState {
-  activeSessionState = createSessionState();
-  return activeSessionState;
-}
-
 function currentSessionId(state: SessionState = activeSessionState): string {
   return state.sessionId;
 }
@@ -604,10 +561,6 @@ function buildPromptBudgetReport(
   };
 }
 
-function isOverPromptBudget(text: string, contextWindow: number): boolean {
-  return estimateTokens(text) > hardPromptBudgetLimit(contextWindow);
-}
-
 function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionState): number {
   const recentTurns = session.readRecentTurns(COMPACT_CONTEXT_MAX_RECENT_TURNS, currentSessionId(state));
   const text = recentTurns.map((entry) => {
@@ -626,11 +579,6 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
 function compactTaskReminder(stepCount: number): string {
   return `${MANAGED_CONTEXT_MARKER}
 [Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call amend when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
-}
-
-function compactWorkspaceHint(workspace: string, reminder: string): string {
-  return `${MANAGED_CONTEXT_MARKER}
-[Workspace: ${workspace}]${reminder ? `\n\n${reminder}` : ""}`;
 }
 
 function stableStringify(value: unknown): string {
@@ -742,15 +690,6 @@ export function fingerprintManagedContextHistory(historyText: string): string {
   return fingerprintHistoryText(historyText);
 }
 
-export function estimatePromptBudgetSnapshot(
-  historyText: string,
-  rewrittenText: string,
-  contextWindow: number,
-  rollingWindowTriggerTokens: number = hardPromptBudgetLimit(contextWindow),
-): ReturnType<typeof buildPromptBudgetReport> {
-  return buildPromptBudgetReport(historyText, rewrittenText, contextWindow, rollingWindowTriggerTokens);
-}
-
 export function getLatestWorkspaceMemory(session: SessionLog): string | null {
   return resolveWorkspaceFromLatestMemory(session);
 }
@@ -760,72 +699,6 @@ export async function resolveSessionStateFromHistory(
   force = false,
 ): Promise<SessionState> {
   return await bootstrapSessionState(ctl, force);
-}
-
-function summarizeToolResultForLog(name: string, args: Record<string, unknown>, result: unknown): string {
-  const data = unwrapToolResult(result);
-
-  if (name === "read_file" && data && typeof data.content === "string") {
-    const filePath = typeof args.filePath === "string" ? args.filePath : "unknown";
-    return JSON.stringify({
-      ok: data.ok !== false,
-      filePath,
-      contentLength: data.content.length,
-      truncated: true,
-      sourcePolicy: "reference-only",
-    });
-  }
-
-  if (name === "list_files" && data && Array.isArray(data.entries)) {
-    return JSON.stringify({
-      ok: data.ok !== false,
-      path: typeof data.path === "string" ? data.path : undefined,
-      count: typeof data.count === "number" ? data.count : data.entries.length,
-      entries: data.entries.slice(0, 10).map((entry: any) => ({
-        name: entry.name,
-        type: entry.type,
-        size: entry.size ?? null,
-      })),
-      truncated: data.entries.length > 10,
-    });
-  }
-
-  if (name === "search_files" && data && Array.isArray(data.results)) {
-    return JSON.stringify({
-      ok: data.ok !== false,
-      pattern: typeof data.pattern === "string" ? data.pattern : undefined,
-      total: typeof data.total === "number" ? data.total : data.results.length,
-      results: data.results.slice(0, 10).map((entry: any) => ({
-        file: entry.file,
-        line: entry.line,
-        content: entry.content,
-      })),
-      truncated: data.results.length > 10,
-    });
-  }
-
-  if (name === "bash_terminal" && data && typeof data === "object") {
-    return JSON.stringify({
-      ok: data.ok !== false,
-      exitCode: (data as any).exitCode ?? null,
-      stdout: truncateText(String((data as any).stdout ?? ""), MAX_NON_CODE_RESULT_CHARS),
-      stderr: truncateText(String((data as any).stderr ?? ""), MAX_NON_CODE_RESULT_CHARS),
-      killed: Boolean((data as any).killed),
-      signal: (data as any).signal ?? null,
-    });
-  }
-
-  if (name === "web_fetch" && data && typeof data.content === "string") {
-    return JSON.stringify({
-      ok: data.ok !== false,
-      url: typeof args.url === "string" ? args.url : undefined,
-      contentLength: data.content.length,
-      truncated: Boolean(data.truncated),
-      preview: truncateText(data.content, MAX_NON_CODE_RESULT_CHARS),
-    });
-  }
-
-  return stringifyToolResult(result);
 }
 
 function safeJsonParse(text: string): any | null {
