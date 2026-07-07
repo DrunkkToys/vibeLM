@@ -1,5 +1,4 @@
 import { createConfigSchematics } from "@lmstudio/sdk";
-import { TOOL_TOGGLES } from "./toolSettings";
 
 export const configSchematics = createConfigSchematics()
   .scope("tools", (builder) => {
@@ -30,18 +29,6 @@ export const configSchematics = createConfigSchematics()
         },
         0,
       );
-
-    for (const tool of TOOL_TOGGLES) {
-      scoped = scoped.field(
-        tool.name,
-        "boolean",
-        {
-          displayName: tool.displayName,
-          subtitle: tool.subtitle,
-        },
-        tool.defaultEnabled,
-      );
-    }
 
     return scoped;
   })
