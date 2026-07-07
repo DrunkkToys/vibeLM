@@ -15,11 +15,11 @@ export const configSchematics = createConfigSchematics()
     50,
   )
   .field(
-    "contextOverflowHeadroomTokens",
+    "rollingWindowTriggerTokens",
     "numeric",
     {
-      displayName: "Rolling Window Trigger Tokens",
-      subtitle: "When the remaining context drops below this many tokens, vibeLM treats the session as near limit and can compact or recommend rolling-window behavior.",
+      displayName: "Rolling Window Trigger Limit (prompt tokens)",
+      subtitle: "Enter a token count, not characters. When the prompt estimate reaches this many tokens, vibeLM treats the session as near limit and can compact or recommend rolling-window behavior.",
       int: true,
       min: 256,
       max: 8192,
