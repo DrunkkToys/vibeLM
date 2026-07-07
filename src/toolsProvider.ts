@@ -267,10 +267,10 @@ function resolveEnabledToolNames(ctl?: any): string[] {
   }
 
   if (sawPluginToggle) {
-    return dedupeTags([...pluginEnabledTools, "respond_to_user"]);
+    return dedupeTags([...pluginEnabledTools, "amend"]);
   }
 
-  return dedupeTags([...DEFAULT_ENABLED_TOOL_NAMES, "respond_to_user"]);
+  return dedupeTags([...DEFAULT_ENABLED_TOOL_NAMES, "amend"]);
 }
 
 function writeConfigSync(config: Record<string, unknown>): void {
@@ -568,7 +568,7 @@ function hardPromptBudgetLimit(contextWindow: number): number {
 function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general"): string {
   return `${MANAGED_CONTEXT_MARKER}
 [Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
-[Action: preserve code verbatim, summarize only the actionable state, and call respond_to_user with the best available handoff.]
+[Action: preserve code verbatim, summarize only the actionable state, and call amend with the best available handoff.]
 [If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
 }
 
@@ -621,7 +621,7 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
 
 function compactTaskReminder(stepCount: number): string {
   return `${MANAGED_CONTEXT_MARKER}
-[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call respond_to_user when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
+[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call amend when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
 }
 
 function compactWorkspaceHint(workspace: string, reminder: string): string {
@@ -1336,10 +1336,10 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       const maxTurns = activeMaxOrchestratorTurns;
       state.turnCounter++;
 
-      if (maxTurns > 0 && name !== "respond_to_user" && state.turnCounter > maxTurns) {
+      if (maxTurns > 0 && name !== "amend" && state.turnCounter > maxTurns) {
         return {
           ok: false,
-          error: `Max turns (${maxTurns}) exceeded. Use respond_to_user with what you have so far.`,
+          error: `Max turns (${maxTurns}) exceeded. Use amend with what you have so far.`,
         };
       }
 
@@ -1347,7 +1347,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       if (looped) {
         return {
           ok: false,
-          error: `Loop detected: tool "${looped}" called ${LOOP_WINDOW}+ times consecutively. Try a different approach or call respond_to_user to produce your answer.`,
+          error: `Loop detected: tool "${looped}" called ${LOOP_WINDOW}+ times consecutively. Try a different approach or call amend to produce your answer.`,
         };
       }
 
@@ -1606,18 +1606,18 @@ NOTE: This uses the system clock. Timezone reflects local machine settings.`,
     },
   }), "get_current_datetime");
 
-  const respondToUserTool = tool({
-    name: "respond_to_user",
+  const amendTool = tool({
+    name: "amend",
     description: text`Return the best available answer, progress update, or handoff summary to the user.
 USE WHEN: the task is complete, blocked, out of budget, or you need to hand off partial progress clearly.
 NOTE: If the session is already at the turn cap, this tool should still be allowed to return the current state even if the task is not fully complete.
-EXAMPLE: respond_to_user({ text: "Here is the current status and the next blocker..." })`,
+EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
     parameters: {
       text: z.string().min(1).max(100000).describe("Your complete final response to the user"),
     },
     implementation: async ({ text }) => {
+      activeSessionState.turnCounter++;
       const atTurnCap = activeMaxOrchestratorTurns > 0 && activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
-      // Detect early/passive responses and reject them
       if (!atTurnCap && /let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
         return {
           ok: false,
@@ -2182,10 +2182,10 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     generate_password: generatePasswordTool,
     encode_base64: encodeBase64Tool,
     decode_base64: decodeBase64Tool,
-    respond_to_user: respondToUserTool,
+    amend: amendTool,
   };
 
-  const MANDATORY_ENABLED = ["respond_to_user"];
+  const MANDATORY_ENABLED = ["amend"];
 
   const enabledNames = dedupeTags([
     ...resolveEnabledToolNames(ctl),
@@ -2195,12 +2195,12 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     .filter((name: string) => ALL_TOOL_MAP[name])
     .map((name: string) => ALL_TOOL_MAP[name]);
 
-  const respondToUserIdx = allTools.indexOf(respondToUserTool);
-  if (respondToUserIdx >= 0) {
+  const amendIdx = allTools.indexOf(amendTool);
+  if (amendIdx >= 0) {
     const lastIdx = allTools.length - 1;
-    if (respondToUserIdx !== lastIdx) {
-      allTools.splice(respondToUserIdx, 1);
-      allTools.push(respondToUserTool);
+    if (amendIdx !== lastIdx) {
+      allTools.splice(amendIdx, 1);
+      allTools.push(amendTool);
     }
   }
 
