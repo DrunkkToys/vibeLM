@@ -313,6 +313,28 @@ describe("session resume helper", () => {
     try { unlinkSync(RUNTIME_STATE_PATH); } catch {}
   });
 
+  it("deduplicates overlapping history fragments before restart replay", async () => {
+    const { composeHistoryText } = await import("../src/toolsProvider");
+
+    const sharedHistory = [
+      "system: starter context",
+      "user: first turn",
+      "assistant: first response",
+    ].join("\n");
+
+    assert.equal(
+      composeHistoryText(sharedHistory, sharedHistory),
+      sharedHistory,
+      "identical history fragments should not be doubled",
+    );
+
+    assert.equal(
+      composeHistoryText(sharedHistory, `${sharedHistory}\nuser: second turn`),
+      `${sharedHistory}\nuser: second turn`,
+      "embedded history fragments should keep the longer replay once",
+    );
+  });
+
   it("boots fresh for missing, invalid, and stale runtime state while reusing matching history", async () => {
     const { resolveSessionStateFromHistory, fingerprintManagedContextHistory } = await import("../src/toolsProvider");
     const historyText = [
@@ -320,8 +342,7 @@ describe("session resume helper", () => {
       "user: first turn",
       "assistant: first response",
     ].join("\n");
-    const historySnapshot = `${historyText}\n${historyText}`;
-    const fingerprint = fingerprintManagedContextHistory(historySnapshot);
+    const fingerprint = fingerprintManagedContextHistory(historyText);
     const ctl = {
       pullHistory: async () => ({
         getSystemPrompt: () => historyText,
@@ -374,5 +395,29 @@ describe("session resume helper", () => {
     assert.equal(resumed.resumedFromPersistedState, true, "matching fingerprint should resume state");
     assert.equal(resumed.sessionId, "session-live", "matching fingerprint should reuse the stored session id");
     assert.equal(resumed.turnCounter, 12, "matching fingerprint should preserve the stored turn counter");
+  });
+});
+
+describe("workspace memory helper", () => {
+  const logDir = join(TEST_DIR, "workspace-memory-test");
+
+  before(() => {
+    rmSync(logDir, { recursive: true, force: true });
+    mkdirSync(logDir, { recursive: true });
+  });
+
+  after(() => {
+    rmSync(logDir, { recursive: true, force: true });
+  });
+
+  it("returns the latest workspace memory without scanning content", async () => {
+    const { SessionLog } = await import("../src/sessionLog");
+    const { getLatestWorkspaceMemory } = await import("../src/toolsProvider");
+    const log = new SessionLog(join(logDir, "workspace.jsonl"));
+
+    log.saveMemory(["workspace"], "older workspace memory", undefined, "session-1", "/workspace-a", "workspace");
+    log.saveMemory(["workspace"], "newer workspace memory", undefined, "session-2", "/workspace-b", "workspace");
+
+    assert.equal(getLatestWorkspaceMemory(log), "/workspace-b");
   });
 });
