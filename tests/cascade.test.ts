@@ -460,25 +460,31 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(secondPrompt, null, "restart should not inject a duplicate managed prompt");
   });
 
-  it("should resolve bare set workspace requests from the latest memory entry", async () => {
-    const { SessionLog } = await import("../src/sessionLog");
-    const { preprocessMessage } = await import("../src/toolsProvider");
+  it("should reject bare set workspace requests without an explicit path", async () => {
+    const { preprocessMessage, toolsProvider } = await import("../src/toolsProvider");
     const workspaceFromMemory = resolve(TEST_DIR, "memory-workspace");
     mkdirSync(workspaceFromMemory, { recursive: true });
 
-    const log = new SessionLog(SESSION_LOG_PATH);
     const configPath = resolve(CONFIG_DIR, "config.json");
     const previousConfig = existsSync(configPath) ? readFileSync(configPath, "utf-8") : null;
 
     try {
-      log.saveMemory(["workspace"], `Workspace: ${workspaceFromMemory}`, undefined, "session-memory", undefined, "workspace");
+      const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+      const saveMemory = tools.find((tool: any) => tool.name === "save_memory");
+      assert.ok(saveMemory, "save_memory tool should be available for the memory-backed workspace test");
+      const saved = await saveMemory.implementation({
+        content: `Workspace: ${workspaceFromMemory}`,
+        tags: ["workspace"],
+        scope: "workspace",
+      });
+      assert.ok(saved?.ok, `save_memory should succeed: ${JSON.stringify(saved)}`);
 
       const result = await preprocessMessage("set workspace");
-      assert.ok(result, "bare set workspace should be rewritten");
-      assert.match(result!, /\[Tool executed: set_workspace\]/, "bare set workspace should stay neutral");
+      assert.ok(result, "bare set workspace should return a controlled error");
+      assert.match(result!, /explicit path required/i, "bare set workspace should no longer search memory");
 
       const configAfter = JSON.parse(readFileSync(configPath, "utf-8"));
-      assert.equal(configAfter.workspacePath, workspaceFromMemory, "bare set workspace should update the config from the latest memory only");
+      assert.equal(configAfter.workspacePath, TEST_DIR, "bare set workspace should not change the workspace without an explicit path");
     } finally {
       if (previousConfig === null) {
         try { unlinkSync(configPath); } catch {}
@@ -487,6 +493,19 @@ describe("vibeLM Cascade Integration", () => {
       }
       makeConfig();
     }
+  });
+
+  it("should ignore older workspace memories when the latest memory is unrelated", async () => {
+    const { SessionLog } = await import("../src/sessionLog");
+    const { getLatestWorkspaceMemory } = await import("../src/toolsProvider");
+    const log = new SessionLog(resolve(SESSION_LOG_PATH));
+    const workspaceFromMemory = resolve(TEST_DIR, "older-memory-workspace");
+    mkdirSync(workspaceFromMemory, { recursive: true });
+
+    log.saveMemory(["workspace"], `Workspace: ${workspaceFromMemory}`, undefined, "session-memory", undefined, "workspace");
+    log.saveMemory(["note"], "latest memory does not mention a workspace", undefined, "session-memory", undefined, "workspace");
+
+    assert.equal(getLatestWorkspaceMemory(log), null, "only the latest memory entry should be considered");
   });
 
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
