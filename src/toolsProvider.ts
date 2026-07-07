@@ -2222,7 +2222,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   if (wsMatch) {
     const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
     if (!requestedPath) {
-      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → explicit path required. Call set_workspace({ path: "/absolute/path" }) or use a dedicated workspace exploration command.]`);
+      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → explicit path required. Call set_workspace({ path: "/absolute/path" }) with an existing folder.]`);
     }
 
     const resolved = resolve(requestedPath);
