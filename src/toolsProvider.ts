@@ -712,12 +712,11 @@ function extractWorkspaceFromMemory(entry: MemoryEntry): string | null {
 }
 
 function resolveWorkspaceFromLatestMemory(session: SessionLog): string | null {
-  const recentEntries = session.readRecentEntries(50);
+  const recentEntries = session.readRecentEntries(3);
   for (let i = recentEntries.length - 1; i >= 0; i--) {
     const entry = recentEntries[i];
     if (entry?.type !== "mem") continue;
-    const workspace = extractWorkspaceFromMemory(entry as MemoryEntry);
-    if (workspace) return workspace;
+    return extractWorkspaceFromMemory(entry as MemoryEntry);
   }
   return null;
 }
@@ -2182,14 +2181,11 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
   if (wsMatch) {
     const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
-    const fallbackSession = getSessionLog();
-    const memoryWorkspace = requestedPath ? null : resolveWorkspaceFromLatestMemory(fallbackSession);
-    const path = requestedPath || memoryWorkspace || "";
-    if (!path) {
-      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → no recent workspace memory found. Call set_workspace({ path: "/absolute/path" }) once or save a workspace memory first.]`);
+    if (!requestedPath) {
+      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → explicit path required. Call set_workspace({ path: "/absolute/path" }) or use a dedicated workspace exploration command.]`);
     }
 
-    const resolved = resolve(path);
+    const resolved = resolve(requestedPath);
     if (existsSync(resolved)) {
       const cfg = readConfigSync();
       cfg.workspacePath = resolved;
