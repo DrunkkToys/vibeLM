@@ -9,17 +9,11 @@ const CONFIG_DIR = resolve(
   homedir(),
   ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm",
 );
+const RUNTIME_STATE_PATH = resolve(CONFIG_DIR, "runtime-state.json");
 
 function makeConfig(overrides: Record<string, unknown> = {}) {
   const base = {
     workspacePath: TEST_DIR,
-    enabledTools: [
-      "set_workspace", "get_config", "save_memory", "compact_context", "search_memory",
-      "web_fetch", "web_search",
-      "read_file", "list_files", "search_files", "bash_terminal",
-      "calculate", "get_current_datetime", "write_file",
-      "respond_to_user",
-    ],
   };
   const merged = { ...base, ...overrides };
   if (!existsSync(CONFIG_DIR)) {
@@ -28,21 +22,55 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
   writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify(merged, null, 2));
 }
 
-function makeCtl(options: { maxOrchestratorTurns?: number; rollingWindowTriggerTokens?: number } = {}) {
+function makeCtl(options: { maxOrchestratorTurns?: number; rollingWindowTriggerTokens?: number; toolToggles?: Record<string, boolean> } = {}) {
   const base = { getWorkingDirectory: () => TEST_DIR };
-  if (typeof options.maxOrchestratorTurns !== "number" && typeof options.rollingWindowTriggerTokens !== "number") {
+  if (typeof options.maxOrchestratorTurns !== "number" && typeof options.rollingWindowTriggerTokens !== "number" && !options.toolToggles) {
     return base as any;
   }
   return {
     ...base,
     getPluginConfig: () => ({
       get: (key: string) => {
-        if (key === "maxOrchestratorTurns") return options.maxOrchestratorTurns;
-        if (key === "rollingWindowTriggerTokens") return options.rollingWindowTriggerTokens;
-        if (key === "contextOverflowHeadroomTokens") return options.rollingWindowTriggerTokens;
+        if (key === "tools.maxOrchestratorTurns" || key === "maxOrchestratorTurns") return options.maxOrchestratorTurns;
+        if (key === "tools.rollingWindowTriggerTokens" || key === "rollingWindowTriggerTokens" || key === "contextOverflowHeadroomTokens") return options.rollingWindowTriggerTokens;
+        if (key.startsWith("tools.") || options.toolToggles) {
+          const toolKey = key.startsWith("tools.") ? key.slice("tools.".length) : key;
+          if (options.toolToggles && toolKey in options.toolToggles) return options.toolToggles[toolKey];
+        }
         return undefined;
       },
     }),
+  } as any;
+}
+
+function makePromptCtl(options: {
+  historyText: string;
+  models?: Array<{ identifier: string; modelKey?: string; path?: string; contextLength: number }>;
+  failLoadedModels?: boolean;
+}): any {
+  const models = options.models ?? [];
+  return {
+    getWorkingDirectory: () => TEST_DIR,
+    pullHistory: async () => ({
+      getSystemPrompt: () => options.historyText,
+      toString: () => options.historyText,
+    }),
+    client: {
+      llm: {
+        listLoaded: async () => {
+          if (options.failLoadedModels) {
+            throw new Error("temporary model lookup failure");
+          }
+          return models.map((model) => ({
+            identifier: model.identifier,
+            modelKey: model.modelKey ?? model.identifier,
+            path: model.path ?? model.identifier,
+            contextLength: model.contextLength,
+            getModelInfo: async () => ({ contextLength: model.contextLength }),
+          }));
+        },
+      },
+    },
   } as any;
 }
 
@@ -64,12 +92,16 @@ describe("vibeLM Cascade Integration", () => {
     );
     writeFileSync(resolve(TEST_DIR, "README.md"), "# vibeLM Test Project\n\nThis is a test.\n");
     makeConfig();
+    try { unlinkSync(RUNTIME_STATE_PATH); } catch {}
   });
 
   after(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     try {
       unlinkSync(resolve(CONFIG_DIR, "config.json"));
+    } catch {}
+    try {
+      unlinkSync(RUNTIME_STATE_PATH);
     } catch {}
   });
 
@@ -93,7 +125,11 @@ describe("vibeLM Cascade Integration", () => {
 
   it("should force respond_to_user on even when config disables it", async () => {
     makeConfig({
-      enabledTools: ["set_workspace", "get_config", "read_file"],
+      toolToggles: {
+        read_file: false,
+        write_file: false,
+        bash_terminal: false,
+      },
     });
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
@@ -115,6 +151,25 @@ describe("vibeLM Cascade Integration", () => {
     }
   });
 
+  it("should allow distinct repeated read_file calls without tripping the loop guard", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    writeFileSync(resolve(TEST_DIR, "src", "alpha.txt"), "alpha\n");
+    writeFileSync(resolve(TEST_DIR, "src", "beta.txt"), "beta\n");
+    writeFileSync(resolve(TEST_DIR, "src", "gamma.txt"), "gamma\n");
+    writeFileSync(resolve(TEST_DIR, "src", "delta.txt"), "delta\n");
+    writeFileSync(resolve(TEST_DIR, "src", "epsilon.txt"), "epsilon\n");
+
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const readFile = tools.find((t: any) => t.name === "read_file");
+    assert.ok(readFile, "read_file tool must be present");
+
+    const paths = ["src/alpha.txt", "src/beta.txt", "src/gamma.txt", "src/delta.txt", "src/epsilon.txt"];
+    for (const [index, filePath] of paths.entries()) {
+      const result = await readFile.implementation({ filePath, maxChars: 200, offset: 0 });
+      assert.ok(result?.ok, `distinct read_file call ${index + 1} should succeed: ${JSON.stringify(result)}`);
+    }
+  });
+
   it("should return real workspace from get_config when workspace is set", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl());
@@ -125,7 +180,45 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(result.data.workspace, TEST_DIR);
     assert.ok(typeof result.data.sessionId === "string" && result.data.sessionId.length > 10, "sessionId must be present");
     assert.equal(result.data.maxOrchestratorTurns, 50, "default max turns should be 50");
-    assert.equal(result.data.rollingWindowTriggerTokens, 1024, "default rolling-window trigger should be 1024 tokens");
+    assert.equal(result.data.rollingWindowTriggerTokensConfigured, 0, "default rolling-window trigger should auto-derive from the model");
+    assert.equal(result.data.rollingWindowTriggerTokens, result.data.promptBudget.hardLimitTokens, "auto rolling-window trigger should match the model-derived hard limit");
+  });
+
+  it("should strip legacy enabledTools from the persisted config", async () => {
+    writeFileSync(
+      resolve(CONFIG_DIR, "config.json"),
+      JSON.stringify({
+        workspacePath: TEST_DIR,
+        preferredModel: "qwen/qwen3-4b",
+        enabledTools: ["read_file", "write_file"],
+      }, null, 2),
+    );
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl());
+    const gc = tools.find((t: any) => t.name === "get_config");
+    assert.ok(gc, "get_config tool must be present");
+
+    const result = await gc.implementation({});
+    assert.ok(result?.ok, `get_config should succeed: ${JSON.stringify(result)}`);
+
+    const normalized = JSON.parse(readFileSync(resolve(CONFIG_DIR, "config.json"), "utf-8"));
+    assert.ok(!Object.prototype.hasOwnProperty.call(normalized, "enabledTools"), "legacy enabledTools should be removed from config.json");
+    assert.ok(Object.prototype.hasOwnProperty.call(normalized, "preferredModel"), "other config fields must remain intact");
+  });
+
+  it("should allow maxOrchestratorTurns to be set to 0 and keep the cap disabled", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 0 }));
+    const gc = tools.find((t: any) => t.name === "get_config");
+    assert.ok(gc, "get_config tool must be present");
+
+    const first = await gc.implementation({});
+    assert.ok(first?.ok, `first call should succeed: ${JSON.stringify(first)}`);
+    assert.equal(first.data.maxOrchestratorTurns, 0, "configured max turns should allow 0");
+
+    const second = await gc.implementation({});
+    assert.ok(second?.ok, `second call should also succeed when the cap is disabled: ${JSON.stringify(second)}`);
   });
 
   it("should honor the configured maxOrchestratorTurns limit", async () => {
@@ -139,7 +232,8 @@ describe("vibeLM Cascade Integration", () => {
     const first = await gc.implementation({});
     assert.ok(first?.ok, `first call should succeed: ${JSON.stringify(first)}`);
     assert.equal(first.data.maxOrchestratorTurns, 1, "configured max turns should be reported");
-    assert.equal(first.data.rollingWindowTriggerTokens, 512, "configured rolling-window trigger should be reported");
+    assert.equal(first.data.rollingWindowTriggerTokensConfigured, 512, "configured rolling-window trigger should be reported");
+    assert.equal(first.data.rollingWindowTriggerTokens, 512, "effective rolling-window trigger should be reported");
 
     const second = await gc.implementation({});
     assert.ok(!second?.ok, "second call should fail when the configured cap is 1");
@@ -147,6 +241,38 @@ describe("vibeLM Cascade Integration", () => {
 
     const finalResponse = await respondToUser.implementation({ text: "Let me know if you want more." });
     assert.ok(finalResponse?.ok, `respond_to_user should remain available after the cap: ${JSON.stringify(finalResponse)}`);
+  });
+
+  it("should accept large rolling-window thresholds up to 16384 tokens", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ rollingWindowTriggerTokens: 16384 }));
+    const gc = tools.find((t: any) => t.name === "get_config");
+    assert.ok(gc, "get_config tool must be present");
+
+    const result = await gc.implementation({});
+    assert.ok(result?.ok, `get_config should succeed: ${JSON.stringify(result)}`);
+    assert.equal(result.data.rollingWindowTriggerTokensConfigured, 16384, "configured rolling-window trigger should allow the new ceiling");
+    assert.ok(
+      result.data.rollingWindowTriggerTokens <= result.data.promptBudget.hardLimitTokens,
+      "effective rolling-window trigger must still respect the model-derived hard limit",
+    );
+  });
+
+  it("should honor per-tool on/off toggles from plugin config", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: {
+        read_file: false,
+        write_file: false,
+        bash_terminal: false,
+      },
+    }));
+
+    const toolNames = tools.map((tool: any) => tool.name);
+    assert.ok(!toolNames.includes("read_file"), "disabled read_file should not be exposed");
+    assert.ok(!toolNames.includes("write_file"), "disabled write_file should not be exposed");
+    assert.ok(!toolNames.includes("bash_terminal"), "disabled bash_terminal should not be exposed");
+    assert.ok(toolNames.includes("respond_to_user"), "respond_to_user must remain exposed");
   });
 
   it("should still reject passive handoffs before the cap is reached", async () => {
@@ -192,27 +318,58 @@ describe("vibeLM Cascade Integration", () => {
     makeConfig();
   });
 
-  it("should reject oversized multi-step prompts before passing them through", async () => {
+  it("should hand off oversized multi-step prompts instead of hard failing", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
     const hugeSteps = Array.from({ length: 3000 }, (_, i) => `${i + 1}. step ${i}`).join("\n");
     const processed = await preprocessMessage(hugeSteps);
     assert.ok(processed, "preprocessMessage should return a response");
-    assert.match(processed!, /too large for the current model context/i);
+    assert.match(processed!, /\[vibeLM:managed-context\]/, "overflow response should preserve managed context");
+    assert.match(processed!, /respond_to_user/i, "overflow response should tell the model to hand off");
   });
 
-  it("should reject a normal prompt when the accumulated history is already over budget", async () => {
+  it("should use the loaded model context and avoid false overflow at 32000 tokens", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
     const hugeHistory = "tool output ".repeat(5000);
-    const ctl = {
-      pullHistory: async () => ({
-        getSystemPrompt: () => hugeHistory,
-        toString: () => hugeHistory,
-      }),
-    } as any;
+    const ctl = makePromptCtl({
+      historyText: hugeHistory,
+      models: [
+        { identifier: "qwen/qwen3.5-9b", contextLength: 32000 },
+      ],
+    });
 
     const processed = await preprocessMessage("hello", ctl);
-    assert.ok(processed, "preprocessMessage should return an overflow response");
-    assert.match(processed!, /request is too large for the current model context/i);
+    assert.equal(processed, null, "preprocessMessage should not overflow when the loaded model context is 32000");
+  });
+
+  it("should reuse the last known loaded context during a transient model lookup failure and invalidate it on model change", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const historyText = "tool output ".repeat(2500);
+    const firstCtl = makePromptCtl({
+      historyText,
+      models: [
+        { identifier: "model-a", contextLength: 16000 },
+      ],
+    });
+
+    const first = await preprocessMessage("hello", firstCtl);
+    assert.equal(first, null, "initial request should fit under the loaded 16000-token context");
+
+    const failedCtl = makePromptCtl({
+      historyText,
+      failLoadedModels: true,
+    });
+    const second = await preprocessMessage("hello", failedCtl);
+    assert.equal(second, null, "transient model lookup failure should reuse the last known loaded context");
+
+    const changedCtl = makePromptCtl({
+      historyText,
+      models: [
+        { identifier: "model-b", contextLength: 8192 },
+      ],
+    });
+    const third = await preprocessMessage("hello", changedCtl);
+    assert.ok(third, "model change should invalidate the cache and restore overflow protection");
+    assert.match(third!, /\[vibeLM:managed-context\]/, "overflow response should be a handoff prompt");
   });
 
   it("should inject managed context once and skip duplicate injection after history reload", async () => {
@@ -232,6 +389,74 @@ describe("vibeLM Cascade Integration", () => {
     historyText = first!;
     const second = await preprocessMessage("1. do the first thing\n2. do the second thing", ctl);
     assert.equal(second, null, "preprocessMessage should not inject a duplicate managed prompt after reload");
+  });
+
+  it("should reuse the same session anchor after a restart without doubling the managed context", async () => {
+    const { preprocessMessage, toolsProvider, estimatePromptBudgetSnapshot } = await import("../src/toolsProvider");
+    let historyText = "";
+    const ctl = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({
+        getSystemPrompt: () => historyText,
+        toString: () => historyText,
+      }),
+      client: {
+        llm: {
+          listLoaded: async () => ([
+            {
+              identifier: "model-a",
+              modelKey: "model-a",
+              path: "model-a",
+              contextLength: 16000,
+              getModelInfo: async () => ({ contextLength: 16000 }),
+            },
+          ]),
+        },
+      },
+    } as any;
+
+    const firstPrompt = await preprocessMessage("1. do the first thing\n2. do the second thing", ctl);
+    assert.ok(firstPrompt, "first preprocess should inject managed context");
+    assert.match(firstPrompt!, /\[vibeLM:managed-context\]/, "first injected prompt should carry the managed context marker");
+    historyText = firstPrompt!;
+
+    const firstTools = await toolsProvider(ctl);
+    const readFileTool = firstTools.find((t: any) => t.name === "read_file");
+    assert.ok(readFileTool, "read_file tool should be available");
+    const getConfigTool = firstTools.find((t: any) => t.name === "get_config");
+    assert.ok(getConfigTool, "get_config tool should be available");
+    const readResult = await readFileTool.implementation({ filePath: "README.md", maxChars: 200, offset: 0 });
+    assert.ok(readResult?.ok, `read_file should succeed before restart: ${JSON.stringify(readResult)}`);
+
+    const firstConfig = await getConfigTool.implementation({});
+    assert.ok(firstConfig?.ok, "get_config should succeed before restart");
+    const firstSessionId = firstConfig.data.sessionId as string;
+    const baseBudget = estimatePromptBudgetSnapshot(firstPrompt!, "1. do the first thing\n2. do the second thing", 16000);
+    const managedBlock = firstPrompt!.slice(0, firstPrompt!.indexOf("\n\n1. do the first thing\n2. do the second thing"));
+    const duplicateBudget = estimatePromptBudgetSnapshot(
+      `${firstPrompt!}\n${managedBlock}`,
+      "1. do the first thing\n2. do the second thing",
+      16000,
+    );
+    assert.equal(
+      duplicateBudget.estimatedTokens,
+      baseBudget.estimatedTokens,
+      "duplicate managed context should be normalized out of prompt-budget estimation",
+    );
+
+    const restartedTools = await toolsProvider(ctl);
+    const restartedConfigTool = restartedTools.find((t: any) => t.name === "get_config");
+    assert.ok(restartedConfigTool, "get_config tool should be available after restart");
+    const restartedConfig = await restartedConfigTool.implementation({});
+    assert.ok(restartedConfig?.ok, "get_config should succeed after restart");
+    assert.equal(restartedConfig.data.sessionId, firstSessionId, "restart should reuse the same session anchor");
+    assert.ok(
+      restartedConfig.data.promptBudget.rollingWindowTriggerTokens <= restartedConfig.data.promptBudget.hardLimitTokens,
+      "restart should keep rolling-window limits aligned with the model budget",
+    );
+
+    const secondPrompt = await preprocessMessage("1. do the first thing\n2. do the second thing", ctl);
+    assert.equal(secondPrompt, null, "restart should not inject a duplicate managed prompt");
   });
 
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
@@ -418,6 +643,10 @@ describe("vibeLM Cascade Integration", () => {
       memorySearch.data.results.some((entry: any) => String(entry.content).includes("workspace, file inspection, memory, compaction")),
       "saved journey memory should be recoverable",
     );
+    assert.ok(
+      typeof memorySearch.data.results[0].matchScore === "number" && Array.isArray(memorySearch.data.results[0].matchedTags),
+      "search_memory results should expose match metadata",
+    );
 
     const compactResult = await toolMap.get("compact_context").implementation({
       maxTokens: 600,
@@ -470,6 +699,45 @@ describe("SessionLog", () => {
     const checkpoints = log.searchCheckpoints("test-1", 10);
     assert.ok(checkpoints.length === 1, `should find checkpoint: got ${checkpoints.length}`);
     assert.ok(checkpoints[0].summary.includes("checkpoint"), "checkpoint summary should contain 'checkpoint'");
+    log.clear();
+  });
+
+  it("should search memories beyond the old 500-line tail window", async () => {
+    const { SessionLog } = await import("../src/sessionLog");
+    const log = new SessionLog(resolve(TEST_DIR, "search-memory-regression.jsonl"));
+    log.clear();
+
+    log.saveMemory(["target", "deep-target"], "needle memory at the start of the log", 1, "session-a", TEST_DIR, "workspace");
+    for (let i = 0; i < 520; i++) {
+      log.saveMemory([`noise:${i}`], `noise content ${i}`, i + 2, "session-a", TEST_DIR, "workspace");
+    }
+
+    const contentResults = log.searchMemoriesByContent("needle memory", 5, { workspace: TEST_DIR, scope: "workspace" });
+    assert.ok(contentResults.length >= 1, "content search should find the older memory");
+    assert.match(contentResults[0].content, /needle memory/, "content search should return the matching memory");
+
+    const tagResults = log.searchMemoriesByTags(["deep-target"], 5, { workspace: TEST_DIR, scope: "workspace" });
+    assert.ok(tagResults.length >= 1, "tag search should find the older memory");
+    assert.ok(tagResults[0].tags.includes("deep-target"), "tag search should return the tagged memory");
+    log.clear();
+  });
+
+  it("should rank exact memory matches ahead of fuzzy ones", async () => {
+    const { SessionLog } = await import("../src/sessionLog");
+    const log = new SessionLog(resolve(TEST_DIR, "search-memory-ranking.jsonl"));
+    log.clear();
+
+    log.saveMemory(["project:alpha"], "match memory", 1, "session-rank", TEST_DIR, "workspace");
+    log.saveMemory(["project:alpha-beta"], "fuzzy match memory", 2, "session-rank", TEST_DIR, "workspace");
+
+    const tagResults = log.searchMemoriesByTags(["project:alpha"], 5, { workspace: TEST_DIR, scope: "workspace" });
+    assert.ok(tagResults.length >= 2, "tag search should return both exact and fuzzy matches");
+    assert.equal(tagResults[0].tags[0], "project:alpha", "exact tag match should rank first");
+
+    const contentResults = log.searchMemoriesByContent("match memory", 5, { workspace: TEST_DIR, scope: "workspace" });
+    assert.ok(contentResults.length >= 2, "content search should return both exact and fuzzy matches");
+    assert.equal(contentResults[0].content, "match memory", "exact content should rank first");
+    assert.ok(typeof contentResults[0].matchScore === "number", "match score should be exposed for debugging");
     log.clear();
   });
 });

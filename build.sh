@@ -3,8 +3,6 @@ set -euo pipefail
 
 SOURCE_DIR="/Users/drunkktoys/Desktop/vibeLM"
 INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibe-lm"
-LEGACY_INSTALL_DIR_1="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/agentic-tools"
-LEGACY_INSTALL_DIR_2="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibeLM"
 
 echo ""
 echo "═══════════════════════════════════════════════════════"
@@ -27,7 +25,6 @@ fi
 
 # 3. Install via LM Studio
 echo "▸ Installing plugin..."
-(rm -rf "$LEGACY_INSTALL_DIR_1" "$LEGACY_INSTALL_DIR_2")
 (cd "$SOURCE_DIR" && lms dev --install --yes)
 echo "  ✓ Plugin installed"
 
@@ -49,6 +46,24 @@ if [ ! -f "$INSTALL_DIR/config.json" ]; then
   echo "  ✓ config.json initialized"
 else
   echo "  ✓ config.json preserved"
+fi
+
+# 6b. Remove legacy enabledTools from the persisted config so LM Studio only shows the toggle-based tool UI.
+if [ -f "$INSTALL_DIR/config.json" ] && command -v node >/dev/null 2>&1; then
+  CONFIG_PATH="$INSTALL_DIR/config.json" node <<'NODE'
+const fs = require("fs");
+const path = process.env.CONFIG_PATH;
+try {
+  const raw = JSON.parse(fs.readFileSync(path, "utf-8"));
+  if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, "enabledTools")) {
+    const { enabledTools, ...cleaned } = raw;
+    fs.writeFileSync(path, JSON.stringify(cleaned, null, 2) + "\n", "utf-8");
+    console.log("  ✓ removed legacy enabledTools from config.json");
+  }
+} catch (err) {
+  console.warn("  ⚠ could not normalize config.json:", err.message);
+}
+NODE
 fi
 
 # 7. Verify

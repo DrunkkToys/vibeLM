@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync
 
 const TEST_DIR = join(tmpdir(), "vibe-lm-test-" + Date.now());
 const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
+const RUNTIME_STATE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "runtime-state.json");
 
 function sandboxPath(workspace: string, requestedPath: string): string {
   const resolved = resolve(workspace, requestedPath);
@@ -300,5 +301,78 @@ describe("SessionLog", () => {
     assert.equal(workspaceResults.length, 1);
     assert.equal(sessionResults.length, 1);
     assert.equal(researchResults.length, 1);
+  });
+});
+
+describe("session resume helper", () => {
+  before(() => {
+    try { unlinkSync(RUNTIME_STATE_PATH); } catch {}
+  });
+
+  after(() => {
+    try { unlinkSync(RUNTIME_STATE_PATH); } catch {}
+  });
+
+  it("boots fresh for missing, invalid, and stale runtime state while reusing matching history", async () => {
+    const { resolveSessionStateFromHistory, fingerprintManagedContextHistory } = await import("../src/toolsProvider");
+    const historyText = [
+      "system: starter context",
+      "user: first turn",
+      "assistant: first response",
+    ].join("\n");
+    const historySnapshot = `${historyText}\n${historyText}`;
+    const fingerprint = fingerprintManagedContextHistory(historySnapshot);
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => historyText,
+        toString: () => historyText,
+      }),
+    } as any;
+
+    try { unlinkSync(RUNTIME_STATE_PATH); } catch {}
+    const fresh = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(fresh.resumedFromPersistedState, false, "missing state should boot fresh");
+    assert.equal(fresh.turnCounter, 0, "fresh state should reset turn count");
+    assert.equal(fresh.historyFingerprint, fingerprint, "fresh state should store the live history fingerprint");
+
+    writeFileSync(RUNTIME_STATE_PATH, "{not valid json", "utf-8");
+    const invalid = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(invalid.resumedFromPersistedState, false, "invalid state should fall back to fresh");
+    assert.notEqual(invalid.sessionId, fresh.sessionId, "invalid state should not be reused");
+
+    writeFileSync(
+      RUNTIME_STATE_PATH,
+      JSON.stringify({
+        version: 1,
+        sessionId: "session-stale",
+        turnCounter: 9,
+        lastCompactionTurn: 4,
+        historyFingerprint: "fingerprint-from-old-history",
+        resumedFromPersistedState: true,
+        updatedAt: new Date().toISOString(),
+      }, null, 2),
+      "utf-8",
+    );
+    const stale = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(stale.resumedFromPersistedState, false, "stale fingerprint should not be reused");
+    assert.notEqual(stale.sessionId, "session-stale", "stale state should be ignored");
+
+    writeFileSync(
+      RUNTIME_STATE_PATH,
+      JSON.stringify({
+        version: 1,
+        sessionId: "session-live",
+        turnCounter: 12,
+        lastCompactionTurn: 8,
+        historyFingerprint: fingerprint,
+        resumedFromPersistedState: true,
+        updatedAt: new Date().toISOString(),
+      }, null, 2),
+      "utf-8",
+    );
+    const resumed = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(resumed.resumedFromPersistedState, true, "matching fingerprint should resume state");
+    assert.equal(resumed.sessionId, "session-live", "matching fingerprint should reuse the stored session id");
+    assert.equal(resumed.turnCounter, 12, "matching fingerprint should preserve the stored turn counter");
   });
 });
