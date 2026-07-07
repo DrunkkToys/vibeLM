@@ -10,6 +10,7 @@ const CONFIG_DIR = resolve(
   ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm",
 );
 const RUNTIME_STATE_PATH = resolve(CONFIG_DIR, "runtime-state.json");
+const SESSION_LOG_PATH = resolve(CONFIG_DIR, "session-log.jsonl");
 
 function makeConfig(overrides: Record<string, unknown> = {}) {
   const base = {
@@ -343,7 +344,7 @@ describe("vibeLM Cascade Integration", () => {
 
   it("should reuse the last known loaded context during a transient model lookup failure and invalidate it on model change", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
-    const historyText = "tool output ".repeat(2500);
+    const historyText = "tool output ".repeat(3500);
     const firstCtl = makePromptCtl({
       historyText,
       models: [
@@ -457,6 +458,35 @@ describe("vibeLM Cascade Integration", () => {
 
     const secondPrompt = await preprocessMessage("1. do the first thing\n2. do the second thing", ctl);
     assert.equal(secondPrompt, null, "restart should not inject a duplicate managed prompt");
+  });
+
+  it("should resolve bare set workspace requests from the latest memory entry", async () => {
+    const { SessionLog } = await import("../src/sessionLog");
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const workspaceFromMemory = resolve(TEST_DIR, "memory-workspace");
+    mkdirSync(workspaceFromMemory, { recursive: true });
+
+    const log = new SessionLog(SESSION_LOG_PATH);
+    const configPath = resolve(CONFIG_DIR, "config.json");
+    const previousConfig = existsSync(configPath) ? readFileSync(configPath, "utf-8") : null;
+
+    try {
+      log.saveMemory(["workspace"], `Workspace: ${workspaceFromMemory}`, undefined, "session-memory", undefined, "workspace");
+
+      const result = await preprocessMessage("set workspace");
+      assert.ok(result, "bare set workspace should be rewritten");
+      assert.match(result!, /\[Tool executed: set_workspace\]/, "bare set workspace should stay neutral");
+
+      const configAfter = JSON.parse(readFileSync(configPath, "utf-8"));
+      assert.equal(configAfter.workspacePath, workspaceFromMemory, "bare set workspace should update the config from the latest memory only");
+    } finally {
+      if (previousConfig === null) {
+        try { unlinkSync(configPath); } catch {}
+      } else {
+        writeFileSync(configPath, previousConfig);
+      }
+      makeConfig();
+    }
   });
 
   it("should compact recent turns, preserve code verbatim, and store reloadable memory", async () => {
@@ -600,8 +630,9 @@ describe("vibeLM Cascade Integration", () => {
 
     const workspaceRequest = await preprocessMessage(`set workspace ${TEST_DIR}`);
     assert.ok(workspaceRequest, "workspace setup should be rewritten by the preprocessor");
-    assert.match(workspaceRequest!, /\[vibeLM:managed-context\]/, "workspace setup should inject managed context");
-    assert.match(workspaceRequest!, new RegExp(TEST_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "workspace path should be preserved in the prompt");
+    assert.match(workspaceRequest!, /\[Tool executed: set_workspace\]/, "workspace setup should stay neutral and not encourage exploration");
+    assert.doesNotMatch(workspaceRequest!, /\[vibeLM:managed-context\]/, "workspace setup should not inject managed context");
+    assert.doesNotMatch(workspaceRequest!, new RegExp(TEST_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "workspace path should not be echoed into the prompt");
 
     const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
     const toolMap = new Map(tools.map((tool: any) => [tool.name, tool]));

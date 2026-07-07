@@ -399,6 +399,17 @@ function normalizeHistoryText(text: string): string {
   return text.replace(/\r\n/g, "\n").trim();
 }
 
+export function composeHistoryText(systemPrompt: string, historyText: string): string {
+  const normalizedSystemPrompt = normalizeHistoryText(systemPrompt);
+  const normalizedHistoryText = normalizeHistoryText(historyText);
+  if (!normalizedSystemPrompt) return normalizedHistoryText;
+  if (!normalizedHistoryText) return normalizedSystemPrompt;
+  if (normalizedSystemPrompt === normalizedHistoryText) return normalizedSystemPrompt;
+  if (normalizedHistoryText.includes(normalizedSystemPrompt)) return normalizedHistoryText;
+  if (normalizedSystemPrompt.includes(normalizedHistoryText)) return normalizedSystemPrompt;
+  return `${normalizedSystemPrompt}\n${normalizedHistoryText}`.trim();
+}
+
 function stripManagedContextBlocks(historyText: string): string {
   const normalized = normalizeHistoryText(historyText);
   if (!normalized.includes(MANAGED_CONTEXT_MARKER)) {
@@ -454,7 +465,7 @@ async function readHistoryText(ctl?: PromptPreprocessorController | ToolsProvide
   try {
     const history = await (ctl as any)?.pullHistory?.();
     if (!history) return null;
-    return `${history.getSystemPrompt()}\n${history.toString()}`;
+    return composeHistoryText(history.getSystemPrompt(), history.toString());
   } catch {
     return null;
   }
@@ -673,7 +684,7 @@ async function getHistoryText(ctl?: PromptPreprocessorController): Promise<strin
   if (!ctl) return "";
   try {
     const history = await ctl.pullHistory();
-    return `${history.getSystemPrompt()}\n${history.toString()}`;
+    return composeHistoryText(history.getSystemPrompt(), history.toString());
   } catch {
     return "";
   }
@@ -681,6 +692,34 @@ async function getHistoryText(ctl?: PromptPreprocessorController): Promise<strin
 
 function hasManagedContext(historyText: string): boolean {
   return historyText.includes(MANAGED_CONTEXT_MARKER);
+}
+
+function extractWorkspaceFromMemory(entry: MemoryEntry): string | null {
+  if (typeof entry.workspace === "string" && entry.workspace.trim()) {
+    return entry.workspace.trim();
+  }
+
+  const content = entry.content?.trim();
+  if (!content) return null;
+
+  const workspaceLine = content.match(/^(?:workspace|Workspace):\s*(.+)$/m);
+  if (workspaceLine?.[1]?.trim()) {
+    return workspaceLine[1].trim();
+  }
+
+  const absolutePathMatch = content.match(/\/(?:[^/\s]+\/)*[^/\s]+/);
+  return absolutePathMatch?.[0]?.trim() || null;
+}
+
+function resolveWorkspaceFromLatestMemory(session: SessionLog): string | null {
+  const recentEntries = session.readRecentEntries(50);
+  for (let i = recentEntries.length - 1; i >= 0; i--) {
+    const entry = recentEntries[i];
+    if (entry?.type !== "mem") continue;
+    const workspace = extractWorkspaceFromMemory(entry as MemoryEntry);
+    if (workspace) return workspace;
+  }
+  return null;
 }
 
 export function normalizeManagedContextHistory(historyText: string): string {
@@ -698,6 +737,10 @@ export function estimatePromptBudgetSnapshot(
   rollingWindowTriggerTokens: number = hardPromptBudgetLimit(contextWindow),
 ): ReturnType<typeof buildPromptBudgetReport> {
   return buildPromptBudgetReport(historyText, rewrittenText, contextWindow, rollingWindowTriggerTokens);
+}
+
+export function getLatestWorkspaceMemory(session: SessionLog): string | null {
+  return resolveWorkspaceFromLatestMemory(session);
 }
 
 export async function resolveSessionStateFromHistory(
@@ -2136,30 +2179,22 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const normalizedHistoryText = normalizeManagedContextHistory(historyText);
   const managedContextPresent = hasManagedContext(historyText) || activeSessionState.resumedFromPersistedState;
 
-  const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
+  const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
   if (wsMatch) {
-    if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-      if (plainReport.overflow) {
-        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
-      }
-      return null;
+    const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
+    const fallbackSession = getSessionLog();
+    const memoryWorkspace = requestedPath ? null : resolveWorkspaceFromLatestMemory(fallbackSession);
+    const path = requestedPath || memoryWorkspace || "";
+    if (!path) {
+      return recordProcessedPrompt(historyText, `[Tool error: set_workspace → no recent workspace memory found. Call set_workspace({ path: "/absolute/path" }) once or save a workspace memory first.]`);
     }
-    const path = wsMatch[1].trim().replace(/^["'`]|["'`]$/g, "");
+
     const resolved = resolve(path);
     if (existsSync(resolved)) {
       const cfg = readConfigSync();
       cfg.workspacePath = resolved;
       writeConfigSync(cfg);
-      const rest = t.replace(wsMatch[0], "").trim();
-      const stepsMatch = rest.match(/^\d+\.\s/gm);
-      const reminder = stepsMatch ? compactTaskReminder(stepsMatch.length) : "";
-      const processed = `${compactWorkspaceHint(resolved, reminder)}${rest ? `\n\n${rest}` : ""}`;
-      const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
-      if (report.overflow) {
-        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "workspace"));
-      }
-      return recordProcessedPrompt(historyText, processed);
+      return recordProcessedPrompt(historyText, `[Tool executed: set_workspace]`);
     }
     return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
   }
@@ -2174,12 +2209,11 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       }
       return null;
     }
-    const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
-    const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
+    const report = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
     if (report.overflow) {
       return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step"));
     }
-    return recordProcessedPrompt(historyText, processed);
+    return recordProcessedPrompt(historyText, compactTaskReminder(steps.length));
   }
 
   const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
