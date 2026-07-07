@@ -27,10 +27,12 @@ const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
 const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 1200;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
+const DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS = 1024;
 const LOOP_WINDOW = 5;
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
 let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
+let activeContextOverflowHeadroomTokens = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS;
 
 const LM_STUDIO_URL = "http://127.0.0.1:1234";
 let cachedContextWindow: { value: number; ts: number } | null = null;
@@ -164,6 +166,17 @@ function resolveMaxOrchestratorTurns(ctl?: { getPluginConfig?: (schematics: type
   return DEFAULT_MAX_ORCHESTRATOR_TURNS;
 }
 
+function resolveContextOverflowHeadroomTokens(ctl?: { getPluginConfig?: (schematics: typeof configSchematics) => { get: (key: "contextOverflowHeadroomTokens") => unknown } }): number {
+  try {
+    const pluginConfig = ctl?.getPluginConfig?.(configSchematics);
+    const rawValue = pluginConfig?.get("contextOverflowHeadroomTokens");
+    if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+      return Math.max(256, Math.min(8192, Math.floor(rawValue)));
+    }
+  } catch {}
+  return DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS;
+}
+
 function writeConfigSync(config: Record<string, unknown>): void {
   const dir = dirname(CONFIG_PATH);
   if (!existsSync(dir)) require("fs").mkdirSync(dir, { recursive: true });
@@ -295,33 +308,38 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function promptBudgetLimit(contextWindow: number): number {
-  return Math.max(512, contextWindow - COMPACT_CONTEXT_SAFETY_MARGIN);
+function promptBudgetLimit(contextWindow: number, headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS): number {
+  return Math.max(512, contextWindow - Math.max(COMPACT_CONTEXT_SAFETY_MARGIN, headroomTokens));
 }
 
 function buildPromptBudgetReport(
   historyText: string,
   rewrittenText: string,
   contextWindow: number,
+  headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS,
 ): {
   estimatedTokens: number;
   limitTokens: number;
   safetyMargin: number;
+  headroomTokens: number;
   overflow: boolean;
+  nearLimit: boolean;
 } {
   const combined = [historyText, rewrittenText].filter(Boolean).join("\n");
   const estimatedTokens = estimateTokens(combined);
-  const limitTokens = promptBudgetLimit(contextWindow);
+  const limitTokens = promptBudgetLimit(contextWindow, headroomTokens);
   return {
     estimatedTokens,
     limitTokens,
     safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
+    headroomTokens,
     overflow: estimatedTokens > limitTokens,
+    nearLimit: estimatedTokens >= Math.max(512, limitTokens - Math.floor(headroomTokens / 2)),
   };
 }
 
-function isOverPromptBudget(text: string, contextWindow: number): boolean {
-  return estimateTokens(text) > promptBudgetLimit(contextWindow);
+function isOverPromptBudget(text: string, contextWindow: number, headroomTokens: number = DEFAULT_CONTEXT_OVERFLOW_HEADROOM_TOKENS): boolean {
+  return estimateTokens(text) > promptBudgetLimit(contextWindow, headroomTokens);
 }
 
 function formatPromptBudgetError(contextWindow: number, estimatedTokens: number): string {
@@ -1083,6 +1101,7 @@ export async function toolsProvider(ctl: ToolsProviderController) {
   const sessionState = resetSessionState();
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
+  activeContextOverflowHeadroomTokens = resolveContextOverflowHeadroomTokens(ctl);
 
   const setWorkspaceTool = wrapTool(tool({
     name: "set_workspace",
@@ -1127,12 +1146,19 @@ EXAMPLE: get_config()`,
         totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
         maxOrchestratorTurns: activeMaxOrchestratorTurns,
+        contextOverflowHeadroomTokens: activeContextOverflowHeadroomTokens,
         promptBudget: {
           contextWindow,
-          limitTokens: promptBudgetLimit(contextWindow),
+          limitTokens: promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens),
           estimatedTokens: promptEstimate,
           safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
-          risk: promptEstimate >= promptBudgetLimit(contextWindow) ? "high" : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow) * 0.85) ? "medium" : "low",
+          headroomTokens: activeContextOverflowHeadroomTokens,
+          risk: promptEstimate >= promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) ? "high" : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) * 0.85) ? "medium" : "low",
+          recommendedOverflowPolicy: promptEstimate >= promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens)
+            ? "compact_context"
+            : promptEstimate >= Math.floor(promptBudgetLimit(contextWindow, activeContextOverflowHeadroomTokens) * 0.85)
+              ? "rollingWindow"
+              : "stopAtLimit",
         },
       });
     },
@@ -1800,13 +1826,14 @@ const DEFAULT_ENABLED = [
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   const contextWindow = await getContextWindow();
+  const contextOverflowHeadroomTokens = resolveContextOverflowHeadroomTokens(ctl as any);
   const historyText = await getHistoryText(ctl);
   const managedContextPresent = hasManagedContext(historyText);
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace\s+(.+)/i) || t.match(/^workspace\s+(.+)/i);
   if (wsMatch) {
     if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
       if (plainReport.overflow) {
         return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
       }
@@ -1822,7 +1849,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const stepsMatch = rest.match(/^\d+\.\s/gm);
       const reminder = stepsMatch ? compactTaskReminder(stepsMatch.length) : "";
       const processed = `${compactWorkspaceHint(resolved, reminder)}${rest ? `\n\n${rest}` : ""}`;
-      const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+      const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
       if (report.overflow) {
         return formatPromptBudgetError(contextWindow, report.estimatedTokens);
       }
@@ -1835,14 +1862,14 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
     if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+      const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
       if (plainReport.overflow) {
         return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
       }
       return null;
     }
     const processed = `${compactTaskReminder(steps.length)}\n\n${t}`;
-    const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+    const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
     if (report.overflow) {
       return formatPromptBudgetError(contextWindow, report.estimatedTokens);
     }
@@ -1855,7 +1882,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const calcResp = await import("mathjs").then(m => m.evaluate(calcMatch[1]));
       if (typeof calcResp === "number" || typeof calcResp === "string") {
         const processed = `[Tool executed: calculate → ${calcResp}]`;
-        const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+        const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
         if (report.overflow) {
           return formatPromptBudgetError(contextWindow, report.estimatedTokens);
         }
@@ -1873,7 +1900,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       if (results.length > 0) {
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
-        const report = buildPromptBudgetReport(historyText, processed, contextWindow);
+        const report = buildPromptBudgetReport(historyText, processed, contextWindow, contextOverflowHeadroomTokens);
         if (report.overflow) {
           return formatPromptBudgetError(contextWindow, report.estimatedTokens);
         }
@@ -1885,7 +1912,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
     }
   }
 
-  const plainReport = buildPromptBudgetReport(historyText, t, contextWindow);
+  const plainReport = buildPromptBudgetReport(historyText, t, contextWindow, contextOverflowHeadroomTokens);
   if (plainReport.overflow) {
     return formatPromptBudgetError(contextWindow, plainReport.estimatedTokens);
   }

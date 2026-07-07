@@ -28,15 +28,19 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
   writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify(merged, null, 2));
 }
 
-function makeCtl(maxOrchestratorTurns?: number) {
+function makeCtl(options: { maxOrchestratorTurns?: number; contextOverflowHeadroomTokens?: number } = {}) {
   const base = { getWorkingDirectory: () => TEST_DIR };
-  if (typeof maxOrchestratorTurns !== "number") {
+  if (typeof options.maxOrchestratorTurns !== "number" && typeof options.contextOverflowHeadroomTokens !== "number") {
     return base as any;
   }
   return {
     ...base,
     getPluginConfig: () => ({
-      get: (key: string) => (key === "maxOrchestratorTurns" ? maxOrchestratorTurns : undefined),
+      get: (key: string) => {
+        if (key === "maxOrchestratorTurns") return options.maxOrchestratorTurns;
+        if (key === "contextOverflowHeadroomTokens") return options.contextOverflowHeadroomTokens;
+        return undefined;
+      },
     }),
   } as any;
 }
@@ -120,11 +124,12 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(result.data.workspace, TEST_DIR);
     assert.ok(typeof result.data.sessionId === "string" && result.data.sessionId.length > 10, "sessionId must be present");
     assert.equal(result.data.maxOrchestratorTurns, 50, "default max turns should be 50");
+    assert.equal(result.data.contextOverflowHeadroomTokens, 1024, "default rolling-window trigger should be 1024 tokens");
   });
 
   it("should honor the configured maxOrchestratorTurns limit", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
-    const tools = await toolsProvider(makeCtl(1));
+    const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 1, contextOverflowHeadroomTokens: 512 }));
     const gc = tools.find((t: any) => t.name === "get_config");
     const respondToUser = tools.find((t: any) => t.name === "respond_to_user");
     assert.ok(gc, "get_config tool must be present");
@@ -133,6 +138,7 @@ describe("vibeLM Cascade Integration", () => {
     const first = await gc.implementation({});
     assert.ok(first?.ok, `first call should succeed: ${JSON.stringify(first)}`);
     assert.equal(first.data.maxOrchestratorTurns, 1, "configured max turns should be reported");
+    assert.equal(first.data.contextOverflowHeadroomTokens, 512, "configured rolling-window trigger should be reported");
 
     const second = await gc.implementation({});
     assert.ok(!second?.ok, "second call should fail when the configured cap is 1");
@@ -144,7 +150,7 @@ describe("vibeLM Cascade Integration", () => {
 
   it("should still reject passive handoffs before the cap is reached", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
-    const tools = await toolsProvider(makeCtl(50));
+    const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 50 }));
     const respondToUser = tools.find((t: any) => t.name === "respond_to_user");
     assert.ok(respondToUser, "respond_to_user tool must be present");
 
