@@ -9,6 +9,7 @@ It gives a model practical tooling for real work:
 - save and reload memory across sessions
 - summarize long sessions into reusable memory
 - delegate harder work to a sub-agent
+- keep sessions alive autonomously with self-recalling loops
 
 The goal is simple: keep the model useful in long, read-heavy sessions without forcing the user to switch tools or lose important context.
 
@@ -24,7 +25,7 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 
 | Area | Tools |
 |---|---|
-| **Workspace** | `set_workspace`, `pick_workspace` (macOS Finder), `get_config` |
+| **Workspace** | `set_workspace`, `get_config` |
 | **Files** | `list_files`, `read_file`, `write_file`, `append_file`, `rename_file`, `search_files`, `delete_file` |
 | **Shell** | `bash_terminal` |
 | **Memory** | `save_memory`, `search_memory`, `list_memories`, `update_memory`, `delete_memory`, `clear_memories` |
@@ -32,8 +33,44 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 | **Web** | `web_fetch`, `web_search` |
 | **Math & Time** | `calculate` (mathjs), `get_current_datetime` |
 | **Utilities** | `generate_uuid`, `generate_password`, `encode_base64`, `decode_base64` |
+| **Infrastructure** | `ssh_exec`, `check_service` |
 | **Sub-agent** | `consult_expert` (coder, debugger, architect, reviewer, writer, analyst, researcher, data_scientist, knowledge_keeper) |
-| **Response control** | `respond_to_user` |
+| **Response control** | `amend` |
+| **Autonomy** | `vibe_bridge` — self-recalling autonomous loop for keep-alive sessions |
+
+## Autonomous Sessions (vibe_bridge)
+
+`vibe_bridge` keeps the session alive without user input by periodically injecting a prompt into the chat.
+
+```bash
+# Start with defaults (configured in plugin settings)
+vibe_bridge({ action: "start" })
+
+# Start with custom settings
+vibe_bridge({
+  action: "start",
+  prompt: "Continue implementing the feature",
+  interval: 600,       # every 10 minutes
+  maxDuration: 21600   # stop after 6 hours
+})
+
+# Check status
+vibe_bridge({ action: "status" })
+
+# Stop
+vibe_bridge({ action: "stop" })
+```
+
+### Configuration
+
+In LM Studio plugin settings (`tools.vibe_bridge.*`):
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `tools.vibe_bridge` | boolean | `false` | Enable the tool |
+| `tools.vibe_bridge.prompt` | string | `"Continue working on the current task."` | Default injection prompt |
+| `tools.vibe_bridge.interval` | number | `600` | Seconds between injections |
+| `tools.vibe_bridge.maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
 
 ## How It Works
 
@@ -43,12 +80,12 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 - Code is preserved verbatim or referenced by path, never paraphrased.
 - Memory entries are tagged with workspace, session, and semantic scope so you can search by `session`, `workspace`, `research`, or `all`.
 - `get_config` shows the current prompt-budget estimate, safety margin, and overflow risk.
-- LM Studio’s plugin settings UI groups the agent controls under a `tools` section.
+- LM Studio's plugin settings UI groups the agent controls under a `tools` section.
 - `maxOrchestratorTurns` defaults to `50`, accepts values from `0` to `100`, and `0` disables the hard turn cap.
-- `Rolling Window Trigger Limit (prompt tokens)` controls the maximum prompt size before vibeLM switches to rolling-window behavior. Set it to `0` to auto-derive the trigger from the selected model’s context window minus a safety margin.
+- `Rolling Window Trigger Limit (prompt tokens)` controls the maximum prompt size before vibeLM switches to rolling-window behavior. Set it to `0` to auto-derive the trigger from the selected model's context window minus a safety margin.
 - The `tools` section also exposes on/off toggles for the individual tools, so you can disable capabilities you do not want the orchestrator to use.
-- `respond_to_user` is gated so the orchestrator does not stop too early.
-- The plugin tries to stay under the model’s prompt budget and auto-compacts when sessions get large.
+- `amend` is gated so the orchestrator does not stop too early.
+- The plugin tries to stay under the model's prompt budget and auto-compacts when sessions get large.
 
 ## Install
 
@@ -82,6 +119,10 @@ Example:
 ```
 
 Set it from the plugin with `set_workspace`, or use `pick_workspace` on macOS.
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for the full release history.
 
 ## Publishing
 

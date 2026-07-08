@@ -9,7 +9,12 @@ const CONFIG_DIR = resolve(homedir(), ".lmstudio", "extensions", "plugins", "dru
 
 function makeConfig() {
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify({ workspacePath: TEST_DIR }, null, 2));
+  writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify({
+    workspacePath: TEST_DIR,
+    vibeBridgePrompt: "Custom configured prompt",
+    vibeBridgeInterval: 120,
+    vibeBridgeMaxDuration: 3600,
+  }, null, 2));
 }
 
 function makeCtl() {
@@ -18,7 +23,6 @@ function makeCtl() {
     getPluginConfig: () => ({
       get: (key: string) => {
         if (key === "tools.vibe_bridge") return true;
-        if (key === "tools.vibe_bridge.prompt") return "Custom configured prompt";
         return undefined;
       },
     }),
@@ -74,6 +78,8 @@ describe("vibe_bridge Cascade", () => {
     assert.ok(result?.ok, "start without prompt should succeed (uses default)");
     assert.equal(result.data.active, true);
     assert.ok(result.data.prompt.includes("Custom configured prompt"));
+    assert.equal(result.data.interval, 120);
+    assert.equal(result.data.maxDuration, 3600);
 
     await bridge.implementation({ action: "stop" });
   });
@@ -86,11 +92,13 @@ describe("vibe_bridge Cascade", () => {
       action: "start",
       prompt: "Continue working on the feature",
       interval: 60,
+      maxDuration: 1800,
       maxIterations: 10,
     });
     assert.ok(result?.ok, "start should succeed");
     assert.equal(result.data.active, true);
     assert.equal(result.data.interval, 60);
+    assert.equal(result.data.maxDuration, 1800);
     assert.equal(result.data.maxIterations, 10);
 
     await bridge.implementation({ action: "stop" });
@@ -104,11 +112,15 @@ describe("vibe_bridge Cascade", () => {
       action: "start",
       prompt: "Status check test",
       interval: 120,
+      maxDuration: 3600,
     });
     const status = await bridge.implementation({ action: "status" });
     assert.equal(status.data.active, true);
     assert.equal(status.data.interval, 120);
+    assert.equal(status.data.maxDuration, 3600);
     assert.ok(status.data.prompt.includes("Status check test"));
+    assert.ok(typeof status.data.elapsed === "number");
+    assert.ok(typeof status.data.remaining === "number");
 
     await bridge.implementation({ action: "stop" });
   });
@@ -118,13 +130,14 @@ describe("vibe_bridge Cascade", () => {
     const tools = await toolsProvider(makeCtl());
     const bridge = tools.find((t: any) => t.name === "vibe_bridge");
 
-    await bridge.implementation({ action: "start", prompt: "First bridge", interval: 30 });
-    const result = await bridge.implementation({ action: "start", prompt: "Second bridge", interval: 60 });
+    await bridge.implementation({ action: "start", prompt: "First bridge", interval: 30, maxDuration: 600 });
+    const result = await bridge.implementation({ action: "start", prompt: "Second bridge", interval: 60, maxDuration: 1200 });
     assert.ok(result?.ok, "second start should succeed");
 
     const status = await bridge.implementation({ action: "status" });
     assert.ok(status.data.prompt.includes("Second bridge"), "should reflect the new bridge");
     assert.equal(status.data.interval, 60);
+    assert.equal(status.data.maxDuration, 1200);
 
     await bridge.implementation({ action: "stop" });
   });

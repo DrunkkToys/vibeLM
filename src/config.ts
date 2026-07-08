@@ -29,6 +29,43 @@ export const configSchematics = createConfigSchematics()
           slider: { min: 0, max: 16384, step: 256 },
         },
         0,
+      )
+      .field(
+        "vibe_bridge_prompt",
+        "string",
+        {
+          displayName: "Vibe Bridge: Default Prompt",
+          subtitle: "The prompt injected on each keep-alive cycle. Override per-call with the prompt parameter.",
+          isParagraph: true,
+          placeholder: "Continue working on the current task.",
+        },
+        "Continue working on the current task.",
+      )
+      .field(
+        "vibe_bridge_interval",
+        "numeric",
+        {
+          displayName: "Vibe Bridge: Interval (seconds)",
+          subtitle: "Seconds between keep-alive injections. E.g. 600 = every 10 minutes.",
+          int: true,
+          min: 5,
+          max: 3600,
+          slider: { min: 5, max: 3600, step: 5 },
+        },
+        600,
+      )
+      .field(
+        "vibe_bridge_maxDuration",
+        "numeric",
+        {
+          displayName: "Vibe Bridge: Max Duration (seconds)",
+          subtitle: "Maximum total runtime before auto-stop. E.g. 21600 = 6 hours. Set 0 for unlimited.",
+          int: true,
+          min: 0,
+          max: 86400,
+          slider: { min: 0, max: 86400, step: 600 },
+        },
+        21600,
       );
 
     for (const tool of TOOL_TOGGLES) {

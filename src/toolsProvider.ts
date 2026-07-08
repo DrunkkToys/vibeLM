@@ -55,6 +55,7 @@ let _bridgeMaxIterations = 0;
 let _bridgeMaxDuration = 0;
 let _bridgeStartedAt = 0;
 let _bridgeTimer: ReturnType<typeof setTimeout> | null = null;
+const _bridgePendingInjections: Array<{ prompt: string; role: string; tag?: string }> = [];
 
 function makeModelCacheKey(model: { identifier?: string; modelKey?: string; path?: string } | null | undefined): string {
   return [model?.identifier, model?.modelKey, model?.path].filter((part) => typeof part === "string" && part.trim().length > 0).join("::");
@@ -180,7 +181,7 @@ function defaultConfig() {
   return { workspacePath: homedir() };
 }
 
-function readConfigSync(): { workspacePath: string; preferredModel?: string; searchEndpoint?: string } {
+function readConfigSync(): { workspacePath: string; preferredModel?: string; searchEndpoint?: string; vibeBridgePrompt?: string; vibeBridgeInterval?: number; vibeBridgeMaxDuration?: number } {
   try {
     const raw = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) : {};
     if (raw && typeof raw === "object" && !Array.isArray(raw) && "enabledTools" in raw) {
@@ -320,6 +321,9 @@ type SessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
+  managedContextBlocks: string[];
+  lastHandoffSummary: string;
+  lastHandoffTurn: number;
 };
 
 function createSessionState(): SessionState {
@@ -330,6 +334,9 @@ function createSessionState(): SessionState {
     lastCompactionTurn: 0,
     historyFingerprint: "",
     resumedFromPersistedState: false,
+    managedContextBlocks: [],
+    lastHandoffSummary: "",
+    lastHandoffTurn: 0,
   };
 }
 
@@ -360,6 +367,9 @@ type PersistedSessionState = {
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
   updatedAt: string;
+  managedContextBlocks?: string[];
+  lastHandoffSummary?: string;
+  lastHandoffTurn?: number;
 };
 
 function escapeRegExp(value: string): string {
@@ -409,6 +419,9 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       historyFingerprint: parsed.historyFingerprint,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+      managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
+      lastHandoffSummary: typeof parsed.lastHandoffSummary === "string" ? parsed.lastHandoffSummary : "",
+      lastHandoffTurn: typeof parsed.lastHandoffTurn === "number" ? parsed.lastHandoffTurn : 0,
     };
   } catch {
     return null;
@@ -427,6 +440,9 @@ function writeRuntimeStateSync(state: SessionState): void {
       historyFingerprint: state.historyFingerprint,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
+      managedContextBlocks: state.managedContextBlocks,
+      lastHandoffSummary: state.lastHandoffSummary,
+      lastHandoffTurn: state.lastHandoffTurn,
     };
     writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
   } catch {}
@@ -469,6 +485,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             lastCompactionTurn: persisted.lastCompactionTurn,
             historyFingerprint,
             resumedFromPersistedState: true,
+            managedContextBlocks: persisted.managedContextBlocks ?? [],
+            lastHandoffSummary: persisted.lastHandoffSummary ?? "",
+            lastHandoffTurn: persisted.lastHandoffTurn ?? 0,
           };
         } else {
           activeSessionState = createSessionState();
@@ -1531,6 +1550,18 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
           error: "This response looks like a passive handoff. Return concrete progress, blockers, or the final answer instead.",
         };
       }
+      activeSessionState.lastHandoffSummary = text;
+      activeSessionState.lastHandoffTurn = activeSessionState.turnCounter;
+      const managedBlock = new RegExp(`${escapeRegExp(MANAGED_CONTEXT_MARKER)}[\\s\\S]*?(?=\\n{2,}|$)`, "g");
+      const blocks: string[] = [];
+      let match: RegExpExecArray | null;
+      while ((match = managedBlock.exec(text)) !== null) {
+        blocks.push(match[0]);
+      }
+      if (blocks.length > 0) {
+        activeSessionState.managedContextBlocks = blocks;
+      }
+      writeRuntimeStateSync(activeSessionState);
       return {
         ok: true,
         data: { text },
@@ -2062,7 +2093,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 
   function _scheduleNextBridgeIteration() {
     if (!_bridgeActive) return;
-    _bridgeTimer = setTimeout(async () => {
+    _bridgeTimer = setTimeout(() => {
       if (!_bridgeActive) return;
       _bridgeIteration++;
       if (_bridgeMaxIterations > 0 && _bridgeIteration > _bridgeMaxIterations) {
@@ -2075,18 +2106,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         _bridgeTimer = null;
         return;
       }
-      try {
-        await fetch(`${API_BASE}/v1/chat/completions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: (await getModel()) || "default",
-            messages: [{ role: "user", content: _bridgePrompt }],
-            stream: false,
-            temperature: 0.7,
-          }),
-        });
-      } catch {}
+      _bridgePendingInjections.push({ prompt: _bridgePrompt, role: "user", tag: `bridge-cycle-${_bridgeIteration}` });
       if (_bridgeActive) _scheduleNextBridgeIteration();
     }, _bridgeInterval * 1000);
   }
@@ -2104,9 +2124,9 @@ The default prompt can be configured in tool settings.`,
     parameters: {
       action: z.enum(["start", "stop", "status"]).default("status").describe("Control the keep-alive loop"),
       prompt: z.string().min(1).max(10000).optional().describe("Prompt to inject on each cycle (uses configured default if omitted)"),
-      interval: z.number().int().min(5).max(3600).optional().default(30).describe("Seconds between injections, e.g. 600 for every 10 minutes (5-3600)"),
-      maxDuration: z.number().int().min(0).max(86400).optional().default(0).describe("Max total runtime in seconds, e.g. 21600 for 6 hours (0=unlimited)"),
-      maxIterations: z.number().int().min(0).max(1000).optional().default(0).describe("Max cycles before auto-stop (0=unlimited)"),
+      interval: z.number().int().min(5).max(3600).optional().describe("Seconds between injections, e.g. 600 for every 10 minutes (5-3600)"),
+      maxDuration: z.number().int().min(0).max(86400).optional().describe("Max total runtime in seconds, e.g. 21600 for 6 hours (0=unlimited)"),
+      maxIterations: z.number().int().min(0).max(1000).optional().describe("Max cycles before auto-stop (0=unlimited)"),
     },
     implementation: async ({ action, prompt, interval, maxDuration, maxIterations }, ctx) => {
       if (action === "status") {
@@ -2131,13 +2151,13 @@ The default prompt can be configured in tool settings.`,
         ctx?.status?.("Bridge stopped");
         return ok({ stopped: true, iteration: _bridgeIteration });
       }
-      const resolvedPrompt = prompt || readPluginConfigValue(ctl, ["tools.vibe_bridge.prompt", "vibe_bridge.prompt"]) as string | undefined
+      const resolvedPrompt = prompt || readConfigSync().vibeBridgePrompt
         || TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultPrompt
         || "Continue working on the current task.";
-      const resolvedInterval = interval ?? (readPluginConfigValue(ctl, ["tools.vibe_bridge.interval", "vibe_bridge.interval"]) as number | undefined)
+      const resolvedInterval = interval ?? readConfigSync().vibeBridgeInterval
         ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultInterval
         ?? 30;
-      const resolvedMaxDuration = maxDuration ?? (readPluginConfigValue(ctl, ["tools.vibe_bridge.maxDuration", "vibe_bridge.maxDuration"]) as number | undefined)
+      const resolvedMaxDuration = maxDuration ?? readConfigSync().vibeBridgeMaxDuration
         ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultMaxDuration
         ?? 0;
       if (_bridgeTimer) clearTimeout(_bridgeTimer);
@@ -2224,11 +2244,13 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const historyText = await getHistoryText(ctl);
   syncRuntimeState(historyText, activeSessionState);
   const normalizedHistoryText = normalizeManagedContextHistory(historyText);
-  const managedContextPresent = hasManagedContext(historyText) || activeSessionState.resumedFromPersistedState;
+  const hasBlocksInHistory = hasManagedContext(historyText);
+  const hasStoredBlocks = activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0;
+  const managedContextPresent = hasBlocksInHistory || hasStoredBlocks;
 
-  if (_bridgeActive && _bridgeIteration > 0) {
-    const injection = `[Keep-alive cycle ${_bridgeIteration}/${_bridgeMaxIterations || "∞"}]\n\n${_bridgePrompt}`;
-    return recordProcessedPrompt(historyText, `${injection}\n\n${t}`);
+  if (_bridgeActive && _bridgePendingInjections.length > 0) {
+    const injection = _bridgePendingInjections.shift()!;
+    return recordProcessedPrompt(historyText, `[Keep-alive: ${injection.tag || "bridge"}]\n\n${injection.prompt}\n\n${t}`);
   }
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
@@ -2316,6 +2338,13 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   }
   // Continuation in managed-context session: prevent LLM from re-executing stale instructions
   if (managedContextPresent && CONTINUATION_PATTERN.test(t)) {
+    if (hasStoredBlocks) {
+      const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${activeSessionState.managedContextBlocks.join("\n\n")}\n\n[Continue from the last completed step. Do NOT restart. Read the history and proceed with the next uncompleted step.]`;
+      activeSessionState.managedContextBlocks = [];
+      activeSessionState.resumedFromPersistedState = false;
+      writeRuntimeStateSync(activeSessionState);
+      return recordProcessedPrompt(historyText, rehydrated);
+    }
     return recordProcessedPrompt(historyText, compactContinueInstruction());
   }
   return null;
