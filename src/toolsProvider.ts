@@ -33,6 +33,12 @@ const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 500;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
 const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
+// vibe_bridge ticks are a standalone model.act() call outside the main orchestrator, so they
+// don't inherit maxOrchestratorTurns. Without their own cap, a model stuck reasoning without
+// calling any tool (e.g. looping on "Wait... Actually...") can run unbounded — confirmed live,
+// one tick ran 43 minutes with zero tool calls after a set_workspace error it never recovered from.
+const VIBE_BRIDGE_TICK_MAX_ROUNDS = 8;
+const VIBE_BRIDGE_TICK_TIMEOUT_MS = 180_000;
 const LOOP_WINDOW = 5;
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
@@ -2208,7 +2214,10 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
           exploreWorkspaceTool, listFilesTool, readFileTool, writeFileTool, appendFileTool,
           searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
         ];
-        await model.act(chat, bridgeTickTools);
+        await model.act(chat, bridgeTickTools, {
+          maxPredictionRounds: VIBE_BRIDGE_TICK_MAX_ROUNDS,
+          signal: AbortSignal.timeout(VIBE_BRIDGE_TICK_TIMEOUT_MS),
+        });
 
         _bridgeConsecutiveFailures = 0;
         console.log(`[vibe_bridge] Tick ${_bridgeIteration} completed at ${new Date().toLocaleTimeString()}`);
