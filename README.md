@@ -70,7 +70,7 @@ In LM Studio plugin settings (`tools.*`):
 | `tools.vibe_bridge_interval` | number | `600` | Seconds between injections |
 | `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
 
-Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below).
+Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at 8 prediction rounds and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
 
 ## How It Works
 

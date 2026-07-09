@@ -178,4 +178,31 @@ describe("vibe_bridge Cascade", () => {
     assert.equal(status.data.consecutiveFailures, 3, "should have recorded 3 consecutive failures");
     assert.equal(status.data.stoppedAfterFailures, true, "status should indicate it stopped due to failures");
   });
+
+  it("should cap model.act() rounds and set a timeout signal on each tick", async () => {
+    let capturedOpts: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (_chat: any, _tools: any, opts: any) => { capturedOpts = opts; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl(), capturingClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    await bridge.implementation({ action: "start", prompt: "Capture opts test", interval: 5 });
+
+    // Wait for at least one tick to fire at the minimum 5s interval, plus margin for scheduling jitter.
+    await new Promise((r) => setTimeout(r, 7000));
+
+    await bridge.implementation({ action: "stop" });
+
+    assert.ok(capturedOpts, "model.act() should have been called with an opts argument");
+    assert.equal(capturedOpts.maxPredictionRounds, 8, "tick should cap prediction rounds so a stuck non-tool-calling loop can't run unbounded");
+    assert.ok(capturedOpts.signal instanceof AbortSignal, "tick should pass an AbortSignal so a stuck tick can't block subsequent ticks");
+  });
 });
