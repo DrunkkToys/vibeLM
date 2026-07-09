@@ -1,6 +1,12 @@
 import { createConfigSchematics } from "@lmstudio/sdk";
 import { TOOL_TOGGLES } from "./toolSettings";
 
+// Single source of truth for vibe_bridge defaults — read by toolsProvider.ts's fallback chain
+// instead of duplicating these values in a second place.
+export const DEFAULT_VIBE_BRIDGE_PROMPT = "Check progress to reach your goal, if you are failing adjust trajectory.";
+export const DEFAULT_VIBE_BRIDGE_INTERVAL = 600;
+export const DEFAULT_VIBE_BRIDGE_MAX_DURATION = 21600;
+
 export const configSchematics = createConfigSchematics()
   .scope("tools", (builder) => {
     let scoped = builder
@@ -37,9 +43,9 @@ export const configSchematics = createConfigSchematics()
           displayName: "Vibe Bridge: Default Prompt",
           subtitle: "The prompt injected on each keep-alive cycle. Override per-call with the prompt parameter.",
           isParagraph: true,
-          placeholder: "Check progress to reach your goal, if you are failing adjust trajectory.",
+          placeholder: DEFAULT_VIBE_BRIDGE_PROMPT,
         },
-        "Check progress to reach your goal, if you are failing adjust trajectory.",
+        DEFAULT_VIBE_BRIDGE_PROMPT,
       )
       .field(
         "vibe_bridge_interval",
@@ -52,7 +58,7 @@ export const configSchematics = createConfigSchematics()
           max: 3600,
           slider: { min: 5, max: 3600, step: 5 },
         },
-        600,
+        DEFAULT_VIBE_BRIDGE_INTERVAL,
       )
       .field(
         "vibe_bridge_maxDuration",
@@ -65,7 +71,7 @@ export const configSchematics = createConfigSchematics()
           max: 86400,
           slider: { min: 0, max: 86400, step: 600 },
         },
-        21600,
+        DEFAULT_VIBE_BRIDGE_MAX_DURATION,
       );
 
     for (const tool of TOOL_TOGGLES) {
