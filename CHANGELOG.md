@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-09
+
+### Fixed
+- `vibe_bridge`'s keep-alive tick called `model.act(chat, bridgeTickTools)` as a standalone call
+  outside the main orchestrator, so it never inherited `maxOrchestratorTurns` and had no round or
+  time cap of its own. A model that got stuck reasoning without calling a tool could loop
+  indefinitely — confirmed live, one tick ran 43 minutes straight on repeating "Plan... Wait...
+  Actually..." text after a `set_workspace` error it never recovered from, blocking all subsequent
+  ticks. The tick now passes `maxPredictionRounds` (8) and a 3-minute timeout signal, so a stuck
+  generation is canceled and flows into the existing consecutive-failure handling instead of
+  hanging.
+
 ## [0.2.0] - 2026-07-09
 
 ### Added
