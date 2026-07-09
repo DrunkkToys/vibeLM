@@ -37,9 +37,9 @@ export const configSchematics = createConfigSchematics()
           displayName: "Vibe Bridge: Default Prompt",
           subtitle: "The prompt injected on each keep-alive cycle. Override per-call with the prompt parameter.",
           isParagraph: true,
-          placeholder: "Continue working on the current task.",
+          placeholder: "Check progress to reach your goal, if you are failing adjast trajectory.",
         },
-        "Continue working on the current task.",
+        "Check progress to reach your goal, if you are failing adjast trajectory.",
       )
       .field(
         "vibe_bridge_interval",

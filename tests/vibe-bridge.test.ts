@@ -23,6 +23,9 @@ function makeCtl() {
     getPluginConfig: () => ({
       get: (key: string) => {
         if (key === "tools.vibe_bridge") return true;
+        if (key === "tools.vibe_bridge_prompt" || key === "vibe_bridge_prompt") return "Custom configured prompt";
+        if (key === "tools.vibe_bridge_interval" || key === "vibe_bridge_interval") return 120;
+        if (key === "tools.vibe_bridge_maxDuration" || key === "vibe_bridge_maxDuration") return 3600;
         return undefined;
       },
     }),
@@ -74,7 +77,7 @@ describe("vibe_bridge Cascade", () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl());
     const bridge = tools.find((t: any) => t.name === "vibe_bridge");
-    const result = await bridge.implementation({ action: "start" });
+    const result = await bridge.implementation({ action: "start" }, makeCtl());
     assert.ok(result?.ok, "start without prompt should succeed (uses default)");
     assert.equal(result.data.active, true);
     assert.ok(result.data.prompt.includes("Custom configured prompt"));

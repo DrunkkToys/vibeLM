@@ -1,6 +1,6 @@
 console.log("[ENTRY] dist/index.js loaded");
 
-import { type PluginContext, type ChatMessage } from "@lmstudio/sdk";
+import { type PluginContext, type ChatMessage, LMStudioClient } from "@lmstudio/sdk";
 import { configSchematics } from "./config";
 import { toolsProvider, preprocessMessage } from "./toolsProvider";
 
@@ -19,10 +19,17 @@ export async function main(context: PluginContext) {
     console.warn(`[AgenticTools] Cannot reach LM Studio API (localhost:${process.env.LMSTUDIO_API_PORT || "1234"}). Run 'lms server start'`);
   }
 
+  const clientIdentifier = process.env.LMS_PLUGIN_CLIENT_IDENTIFIER;
+  const clientPasskey = process.env.LMS_PLUGIN_CLIENT_PASSKEY;
+  const baseUrl = process.env.LMS_PLUGIN_BASE_URL;
+  const bridgeClient = (clientIdentifier && clientPasskey && baseUrl)
+    ? new LMStudioClient({ clientIdentifier, clientPasskey, baseUrl })
+    : null;
+
   console.log("[AgenticTools] Registering tools provider...");
   try {
     context.withConfigSchematics(configSchematics);
-    context.withToolsProvider(toolsProvider);
+    context.withToolsProvider((ctl) => toolsProvider(ctl, bridgeClient));
   } catch (error) {
     console.error("[AgenticTools] Failed to register tools provider.");
     throw error;

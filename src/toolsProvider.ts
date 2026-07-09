@@ -1,4 +1,4 @@
-import { text, tool, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
+import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
@@ -55,7 +55,9 @@ let _bridgeMaxIterations = 0;
 let _bridgeMaxDuration = 0;
 let _bridgeStartedAt = 0;
 let _bridgeTimer: ReturnType<typeof setTimeout> | null = null;
-const _bridgePendingInjections: Array<{ prompt: string; role: string; tag?: string }> = [];
+let _bridgeHandover: string[] = [];
+let _bridgePredictionRunning = false;
+let _bridgeClient: LMStudioClient | null = null;
 
 function makeModelCacheKey(model: { identifier?: string; modelKey?: string; path?: string } | null | undefined): string {
   return [model?.identifier, model?.modelKey, model?.path].filter((part) => typeof part === "string" && part.trim().length > 0).join("::");
@@ -1357,7 +1359,8 @@ function fail(msg: string) {
 
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
 
-export async function toolsProvider(ctl: ToolsProviderController) {
+export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
+  _bridgeClient = client ?? null;
   const sessionState = await bootstrapSessionState(ctl, true);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
@@ -2093,7 +2096,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
 
   function _scheduleNextBridgeIteration() {
     if (!_bridgeActive) return;
-    _bridgeTimer = setTimeout(() => {
+    _bridgeTimer = setTimeout(async () => {
       if (!_bridgeActive) return;
       _bridgeIteration++;
       if (_bridgeMaxIterations > 0 && _bridgeIteration > _bridgeMaxIterations) {
@@ -2106,8 +2109,62 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         _bridgeTimer = null;
         return;
       }
-      _bridgePendingInjections.push({ prompt: _bridgePrompt, role: "user", tag: `bridge-cycle-${_bridgeIteration}` });
-      if (_bridgeActive) _scheduleNextBridgeIteration();
+
+      // Guard: skip if prediction already running
+      if (_bridgePredictionRunning) {
+        if (_bridgeActive) _scheduleNextBridgeIteration();
+        return;
+      }
+
+      _bridgePredictionRunning = true;
+      try {
+        if (!_bridgeClient) {
+          console.log("[vibe_bridge] No LMStudio client, skipping tick");
+          _scheduleNextBridgeIteration();
+          return;
+        }
+
+        const loadedModels = await _bridgeClient.llm.listLoaded();
+        if (loadedModels.length === 0) {
+          console.log("[vibe_bridge] No model loaded, skipping tick");
+          _scheduleNextBridgeIteration();
+          return;
+        }
+
+        const model = loadedModels[0];
+
+        // Step 1: Summarize handover context
+        let handover = "";
+        if (_bridgeHandover.length > 0) {
+          const buffer = _bridgeHandover.join("\n\n");
+          const summarizePrompt = `Summarize this conversation in 2-3 concise sentences, focusing on what the user was working on and any open questions:\n\n${buffer}`;
+          const result = await model.complete(summarizePrompt, { maxTokens: 200 });
+          handover = result.content.trim();
+        }
+
+        // Step 2: Build chat with handover + bridge prompt
+        const chatMessages: Array<{ role: "system" | "user"; content: string }> = [];
+        if (handover) {
+          chatMessages.push({
+            role: "system",
+            content: `Context from the current session:\n${handover}`,
+          });
+        }
+        chatMessages.push({
+          role: "user",
+          content: _bridgePrompt,
+        });
+
+        const chat = Chat.from(chatMessages);
+        await model.act(chat, []);
+
+        console.log(`[vibe_bridge] Tick ${_bridgeIteration} completed at ${new Date().toLocaleTimeString()}`);
+      } catch (err) {
+        console.error("[vibe_bridge] Tick failed:", err);
+      } finally {
+        _bridgePredictionRunning = false;
+        if (_bridgeActive) _scheduleNextBridgeIteration();
+      }
     }, _bridgeInterval * 1000);
   }
 
@@ -2151,15 +2208,15 @@ The default prompt can be configured in tool settings.`,
         ctx?.status?.("Bridge stopped");
         return ok({ stopped: true, iteration: _bridgeIteration });
       }
-      const resolvedPrompt = prompt || readConfigSync().vibeBridgePrompt
+      const resolvedPrompt = prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
         || TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultPrompt
-        || "Continue working on the current task.";
-      const resolvedInterval = interval ?? readConfigSync().vibeBridgeInterval
+        || "Check progress to reach your goal, if you are failing adjast trajectory.");
+      const resolvedInterval = interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
         ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultInterval
-        ?? 30;
-      const resolvedMaxDuration = maxDuration ?? readConfigSync().vibeBridgeMaxDuration
+        ?? 30);
+      const resolvedMaxDuration = maxDuration ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_maxDuration", "vibe_bridge_maxDuration"])
         ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultMaxDuration
-        ?? 0;
+        ?? 0);
       if (_bridgeTimer) clearTimeout(_bridgeTimer);
       _bridgeActive = true;
       _bridgePrompt = resolvedPrompt;
@@ -2248,9 +2305,12 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const hasStoredBlocks = activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0;
   const managedContextPresent = hasBlocksInHistory || hasStoredBlocks;
 
-  if (_bridgeActive && _bridgePendingInjections.length > 0) {
-    const injection = _bridgePendingInjections.shift()!;
-    return recordProcessedPrompt(historyText, `[Keep-alive: ${injection.tag || "bridge"}]\n\n${injection.prompt}\n\n${t}`);
+  // Capture user message for handover context (rolling window of last 5)
+  if (t.length > 0) {
+    _bridgeHandover.push(t);
+    if (_bridgeHandover.length > 5) {
+      _bridgeHandover = _bridgeHandover.slice(-5);
+    }
   }
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
