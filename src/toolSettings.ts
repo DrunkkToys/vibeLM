@@ -3,9 +3,6 @@ export type ToolToggleDefinition = {
   displayName: string;
   subtitle: string;
   defaultEnabled: boolean;
-  defaultPrompt?: string;
-  defaultInterval?: number;
-  defaultMaxDuration?: number;
 };
 
 export const TOOL_TOGGLES: ToolToggleDefinition[] = [
@@ -182,9 +179,6 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
     displayName: "Vibe Bridge",
     subtitle: "Self-recalling autonomous loop for keep-alive sessions.",
     defaultEnabled: false,
-    defaultPrompt: "Continue working on the current task.",
-    defaultInterval: 600,
-    defaultMaxDuration: 21600,
   },
 ];
 

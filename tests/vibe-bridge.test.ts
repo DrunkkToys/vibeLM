@@ -153,4 +153,29 @@ describe("vibe_bridge Cascade", () => {
     const toolNames = tools.map((t: any) => t.name);
     assert.ok(toolNames.includes("vibe_bridge"), "vibe_bridge should be in exposed tools when enabled via config");
   });
+
+  it("should auto-stop after 3 consecutive tick failures instead of retrying forever", async () => {
+    const failingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async () => { throw new Error("simulated tick failure"); },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl(), failingClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    await bridge.implementation({ action: "start", prompt: "Will keep failing", interval: 5 });
+
+    // 3 consecutive failures at the minimum 5s interval, plus margin for scheduling jitter.
+    await new Promise((r) => setTimeout(r, 17000));
+
+    const status = await bridge.implementation({ action: "status" });
+    assert.equal(status.data.active, false, "bridge should have auto-stopped");
+    assert.equal(status.data.consecutiveFailures, 3, "should have recorded 3 consecutive failures");
+    assert.equal(status.data.stoppedAfterFailures, true, "status should indicate it stopped due to failures");
+  });
 });

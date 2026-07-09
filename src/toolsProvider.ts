@@ -7,7 +7,7 @@ import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
 import * as math from "mathjs";
 import { SessionLog, type MemoryEntry, type SearchMemoryResult, type TurnEntry } from "./sessionLog";
-import { configSchematics } from "./config";
+import { configSchematics, DEFAULT_VIBE_BRIDGE_PROMPT, DEFAULT_VIBE_BRIDGE_INTERVAL, DEFAULT_VIBE_BRIDGE_MAX_DURATION } from "./config";
 import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
@@ -39,6 +39,28 @@ const CHECKPOINT_INTERVAL_EARLY = 4;
 const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
 const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
+// Denylist, not allowlist: bash_terminal is a general-purpose dev tool (git, npm, build scripts,
+// etc.), so an allowlist would block too much legitimate use. This blocks clearly destructive or
+// privilege-escalating patterns rather than trying to enumerate every safe command.
+const BASH_DANGEROUS_PATTERNS: RegExp[] = [
+  /rm\s+(-\w*[rf]\w*[rf]?\w*|--recursive|--force)\s+(-\w*\s+)*(\/|~|\$HOME|\*)(\s|$)/i,
+  /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
+  />\s*\/dev\/(sd|nvme|disk|hd|null\s*;)/i,
+  /\bmkfs(\.\w+)?\b/i,
+  /\bdd\b[^\n]*\bof=\/dev\//i,
+  /\bchmod\s+(-R\s+)?(777|a\+rwx)\s+\//i,
+  /\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i,
+  /\bsudo\b/i,
+];
+
+function checkBashCommandSafety(command: string): string | null {
+  for (const pattern of BASH_DANGEROUS_PATTERNS) {
+    if (pattern.test(command)) {
+      return `Command blocked: it matches a denylisted destructive/privilege-escalating pattern. If this was a false positive, rephrase the command or run it manually outside vibeLM.`;
+    }
+  }
+  return null;
+}
 type MemoryScope = "session" | "workspace" | "research" | "all";
 let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
 let activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
@@ -61,6 +83,8 @@ let _bridgeStartedAt = 0;
 let _bridgeTimer: ReturnType<typeof setTimeout> | null = null;
 let _bridgeHandover: string[] = [];
 let _bridgePredictionRunning = false;
+let _bridgeConsecutiveFailures = 0;
+const BRIDGE_MAX_CONSECUTIVE_FAILURES = 3;
 let _bridgeClient: LMStudioClient | null = null;
 
 function makeModelCacheKey(model: { identifier?: string; modelKey?: string; path?: string } | null | undefined): string {
@@ -87,7 +111,9 @@ async function resolveLoadedContextWindow(ctl?: any): Promise<ContextWindowCache
         ts: Date.now(),
       };
     }
-  } catch {}
+  } catch (err) {
+    console.error("[AgenticTools] resolveLoadedContextWindow failed, falling back to default context window:", err);
+  }
   return null;
 }
 
@@ -111,7 +137,9 @@ async function readLoadedModelContextWindow(model: any): Promise<number | null> 
     if (typeof ctx === "number" && ctx > 0) {
       return ctx;
     }
-  } catch {}
+  } catch (err) {
+    console.error("[AgenticTools] readLoadedModelContextWindow failed, falling back to default context window:", err);
+  }
   return null;
 }
 
@@ -208,7 +236,9 @@ function readPluginConfigValue(ctl: any, keys: string[]): unknown {
         return rawValue;
       }
     }
-  } catch {}
+  } catch (err) {
+    console.error(`[AgenticTools] readPluginConfigValue failed for keys [${keys.join(", ")}], falling back to hardcoded defaults:`, err);
+  }
   return undefined;
 }
 
@@ -451,7 +481,9 @@ function writeRuntimeStateSync(state: SessionState): void {
       lastHandoffTurn: state.lastHandoffTurn,
     };
     writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
-  } catch {}
+  } catch (err) {
+    console.error("[AgenticTools] writeRuntimeStateSync failed, session state was not persisted:", err);
+  }
 }
 
 async function readHistoryText(ctl?: PromptPreprocessorController | ToolsProviderController): Promise<string | null> {
@@ -1361,7 +1393,7 @@ function fail(msg: string) {
   return { ok: false, error: msg };
 }
 
-export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
+export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashCommandSafety };
 
 export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
   _bridgeClient = client ?? null;
@@ -1787,6 +1819,8 @@ NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 
       timeout: z.number().int().min(1000).max(120000).optional().default(30000).describe("Timeout ms (default 30000, max 120000)"),
     },
     implementation: async ({ command, timeout }) => {
+      const blockedReason = checkBashCommandSafety(command);
+      if (blockedReason) return fail(blockedReason);
       try {
         const { exec } = await import("child_process");
         return await new Promise((res) => {
@@ -2025,9 +2059,18 @@ NOTE: Requires sshpass to be installed on the host machine. Password is sent via
     },
     implementation: async ({ host, user, password, command, port, timeout }) => {
       try {
-        const { execSync } = await import("child_process");
-        const sshCmd = `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${port} ${user}@${host} ${command.split(" ").map((s) => `'${s.replace(/'/g, "'\\''")}'`).join(" ")}`;
-        const result = execSync(sshCmd, { encoding: "utf-8", timeout, maxBuffer: 10 * 1024 * 1024 });
+        const { execFileSync } = await import("child_process");
+        // execFileSync (no local shell) instead of execSync on a concatenated string: host/user
+        // were previously interpolated unescaped into a shell command, which was a local command
+        // injection vector (e.g. host: "x; rm -rf ~"). Passing args as an array sidesteps that
+        // entirely — none of these values are ever interpreted by a local shell.
+        const result = execFileSync("sshpass", [
+          "-p", password,
+          "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+          "-p", String(port),
+          `${user}@${host}`,
+          command,
+        ], { encoding: "utf-8", timeout, maxBuffer: 10 * 1024 * 1024 });
         return ok({ exitCode: 0, stdout: result.trim(), stderr: "" });
       } catch (e: unknown) {
         const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -2124,14 +2167,12 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
       try {
         if (!_bridgeClient) {
           console.log("[vibe_bridge] No LMStudio client, skipping tick");
-          _scheduleNextBridgeIteration();
           return;
         }
 
         const loadedModels = await _bridgeClient.llm.listLoaded();
         if (loadedModels.length === 0) {
           console.log("[vibe_bridge] No model loaded, skipping tick");
-          _scheduleNextBridgeIteration();
           return;
         }
 
@@ -2169,9 +2210,16 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         ];
         await model.act(chat, bridgeTickTools);
 
+        _bridgeConsecutiveFailures = 0;
         console.log(`[vibe_bridge] Tick ${_bridgeIteration} completed at ${new Date().toLocaleTimeString()}`);
       } catch (err) {
-        console.error("[vibe_bridge] Tick failed:", err);
+        _bridgeConsecutiveFailures++;
+        console.error(`[vibe_bridge] Tick ${_bridgeIteration} failed (${_bridgeConsecutiveFailures}/${BRIDGE_MAX_CONSECUTIVE_FAILURES} consecutive failures):`, err);
+        if (_bridgeConsecutiveFailures >= BRIDGE_MAX_CONSECUTIVE_FAILURES) {
+          console.error(`[vibe_bridge] Stopping after ${_bridgeConsecutiveFailures} consecutive failures. Last error:`, err);
+          _bridgeActive = false;
+          _bridgeTimer = null;
+        }
       } finally {
         _bridgePredictionRunning = false;
         if (_bridgeActive) _scheduleNextBridgeIteration();
@@ -2210,6 +2258,8 @@ The default prompt can be configured in tool settings.`,
           elapsed,
           remaining,
           nextIn: _bridgeActive && _bridgeTimer ? `${_bridgeInterval}s` : "n/a",
+          consecutiveFailures: _bridgeConsecutiveFailures,
+          stoppedAfterFailures: !_bridgeActive && _bridgeConsecutiveFailures >= BRIDGE_MAX_CONSECUTIVE_FAILURES,
         });
       }
       if (action === "stop") {
@@ -2220,19 +2270,17 @@ The default prompt can be configured in tool settings.`,
         return ok({ stopped: true, iteration: _bridgeIteration });
       }
       const resolvedPrompt = prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
-        || TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultPrompt
-        || "Check progress to reach your goal, if you are failing adjust trajectory.");
+        || DEFAULT_VIBE_BRIDGE_PROMPT);
       const resolvedInterval = interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
-        ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultInterval
-        ?? 30);
+        ?? DEFAULT_VIBE_BRIDGE_INTERVAL);
       const resolvedMaxDuration = maxDuration ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_maxDuration", "vibe_bridge_maxDuration"])
-        ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultMaxDuration
-        ?? 0);
+        ?? DEFAULT_VIBE_BRIDGE_MAX_DURATION);
       if (_bridgeTimer) clearTimeout(_bridgeTimer);
       _bridgeActive = true;
       _bridgePrompt = resolvedPrompt;
       _bridgeInterval = resolvedInterval;
       _bridgeIteration = 0;
+      _bridgeConsecutiveFailures = 0;
       _bridgeMaxIterations = maxIterations ?? 0;
       _bridgeMaxDuration = resolvedMaxDuration;
       _bridgeStartedAt = Date.now();
