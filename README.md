@@ -8,7 +8,6 @@ It gives a model practical tooling for real work:
 - search and fetch the web
 - save and reload memory across sessions
 - summarize long sessions into reusable memory
-- delegate harder work to a sub-agent
 - keep sessions alive autonomously with self-recalling loops
 
 The goal is simple: keep the model useful in long, read-heavy sessions without forcing the user to switch tools or lose important context.
@@ -34,7 +33,6 @@ The point is not to pretend local models behave like hosted frontier systems. Th
 | **Math & Time** | `calculate` (mathjs), `get_current_datetime` |
 | **Utilities** | `generate_uuid`, `generate_password`, `encode_base64`, `decode_base64` |
 | **Infrastructure** | `ssh_exec`, `check_service` |
-| **Sub-agent** | `consult_expert` (coder, debugger, architect, reviewer, writer, analyst, researcher, data_scientist, knowledge_keeper) |
 | **Response control** | `amend` |
 | **Autonomy** | `vibe_bridge` — self-recalling autonomous loop for keep-alive sessions |
 
@@ -63,14 +61,16 @@ vibe_bridge({ action: "stop" })
 
 ### Configuration
 
-In LM Studio plugin settings (`tools.vibe_bridge.*`):
+In LM Studio plugin settings (`tools.*`):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `tools.vibe_bridge` | boolean | `false` | Enable the tool |
-| `tools.vibe_bridge.prompt` | string | `"Continue working on the current task."` | Default injection prompt |
-| `tools.vibe_bridge.interval` | number | `600` | Seconds between injections |
-| `tools.vibe_bridge.maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
+| `tools.vibe_bridge_prompt` | string | `"Check progress to reach your goal, if you are failing adjust trajectory."` | Default injection prompt |
+| `tools.vibe_bridge_interval` | number | `600` | Seconds between injections |
+| `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
+
+Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below).
 
 ## How It Works
 
@@ -106,19 +106,21 @@ npm test       # unit + integration coverage
 
 ## Config
 
-vibeLM stores its config in:
+vibeLM stores its runtime config, session state, and memory log in `extensions/data`, not `extensions/plugins` — the plugin install directory gets wiped on every `lms dev --install`, so persistent data lives outside it:
 
 ```text
-~/.lmstudio/extensions/plugins/drunkktoys/vibe-lm/config.json
+~/.lmstudio/extensions/data/drunkktoys/vibe-lm/config.json
+~/.lmstudio/extensions/data/drunkktoys/vibe-lm/runtime-state.json
+~/.lmstudio/extensions/data/drunkktoys/vibe-lm/session-log.jsonl
 ```
 
-Example:
+Example `config.json`:
 
 ```json
 { "workspacePath": "/Users/you/my-project" }
 ```
 
-Set it from the plugin with `set_workspace`, or use `pick_workspace` on macOS.
+Set it from the plugin with `set_workspace`.
 
 ## Changelog
 
