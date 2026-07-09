@@ -18,7 +18,7 @@ vibeLM turns a local LM Studio model into a real agent instead of a chat-only as
 
 That matters because the workflow is different from cloud LLMs. With a smaller model like Qwen3 4B, the agent can still execute useful tool flows, but the work is more fragmented and the context has to be managed carefully. With a stronger local model like GLM 4.6 Flash, Qwen3.5, or Gemma 4 E, vibeLM can sustain more reliable multi-step orchestration and keep the session moving.
 
-The point is not to pretend local models behave like hosted frontier systems. The point is to make local models genuinely useful for agentic work, with scoped memory, explicit workspace access, compact session handoff, and a prompt budget gate that fails early instead of blowing up mid-session.
+It doesn't pretend local models behave like hosted frontier systems — it makes them genuinely useful for agentic work, with scoped memory, explicit workspace access, compact session handoff, and a prompt budget gate that fails early instead of blowing up mid-session.
 
 ## What It Does
 
