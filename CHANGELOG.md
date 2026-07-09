@@ -7,11 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-09
+
 ### Added
 - `vibe_bridge` tool for autonomous session keep-alive via self-recalling timer loop
   - Configurable prompt, interval (5-3600s), max duration, max iterations
   - GUI toggle in LM Studio plugin settings
   - Reads defaults from plugin config (`tools.vibe_bridge.*`)
+
+### Fixed
+- `vibe_bridge`'s keep-alive tick called `model.act(chat, [])` with an empty tools array, so it
+  ran on schedule but could never actually call a tool — confirmed live, the autonomous loop was
+  functionally inert. It now gets a curated tool set (workspace explore/list/read/write/append/
+  search, memory save/search, web fetch/search); `bash_terminal` stays excluded pending a command
+  allowlist.
+- `config.json`, `runtime-state.json`, and `session-log.jsonl` lived inside the plugin's own
+  install directory, which `lms dev --install` wipes on every deploy — a routine rebuild was
+  silently destroying all persisted memory, session state, and the configured workspace path.
+  Persistent data now lives under `extensions/data`, outside the path that gets wiped.
+- `npm test` was independently corrupting the same real, production runtime files on every run
+  (deleting the live `runtime-state.json`, overwriting the live `config.json` with test fixtures
+  and never restoring it). Tests now use an isolated `VIBE_LM_DATA_DIR` override.
+- Typo in the default `vibe_bridge` prompt ("adjast" → "adjust").
+
+### Changed
+- Bridge timer now calls `model.complete()` for handover summarization and `model.act()` to drive
+  autonomous responses, using a rolling window of the last 5 user messages as context, instead of
+  passive prompt injection.
 
 ## [0.1.1] - 2025-07-08
 
@@ -67,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/DrunkkToys/vibeLM/releases/tag/v0.1.0

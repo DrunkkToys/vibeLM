@@ -2,10 +2,11 @@ import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 
 const TEST_DIR = resolve(tmpdir(), `vibelm-vibe-bridge-test-${Date.now()}`);
-const CONFIG_DIR = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm");
+const CONFIG_DIR = resolve(tmpdir(), `vibelm-vibe-bridge-data-${Date.now()}`);
+process.env.VIBE_LM_DATA_DIR = CONFIG_DIR;
 
 function makeConfig() {
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
@@ -45,6 +46,7 @@ describe("vibe_bridge Cascade", () => {
 
   after(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(CONFIG_DIR)) rmSync(CONFIG_DIR, { recursive: true });
   });
 
   it("should expose vibe_bridge tool from toolsProvider", async () => {

@@ -1,12 +1,13 @@
 import { describe, it, mock, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { tmpdir, homedir } from "os";
+import { tmpdir } from "os";
 import { join, resolve, relative, dirname } from "path";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from "fs";
 
 const TEST_DIR = join(tmpdir(), "vibe-lm-test-" + Date.now());
-const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
-const RUNTIME_STATE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "runtime-state.json");
+const DATA_DIR = join(tmpdir(), "vibe-lm-test-data-" + Date.now());
+process.env.VIBE_LM_DATA_DIR = DATA_DIR;
+const RUNTIME_STATE_PATH = resolve(DATA_DIR, "runtime-state.json");
 
 function sandboxPath(workspace: string, requestedPath: string): string {
   const resolved = resolve(workspace, requestedPath);

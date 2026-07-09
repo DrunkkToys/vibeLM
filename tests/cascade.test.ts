@@ -2,13 +2,11 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 
 const TEST_DIR = resolve(tmpdir(), `vibelm-cascade-test-${Date.now()}`);
-const CONFIG_DIR = resolve(
-  homedir(),
-  ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm",
-);
+const CONFIG_DIR = resolve(tmpdir(), `vibelm-cascade-data-${Date.now()}`);
+process.env.VIBE_LM_DATA_DIR = CONFIG_DIR;
 
 function makeConfig(overrides: Record<string, unknown> = {}) {
   const base = { workspacePath: TEST_DIR };
@@ -51,6 +49,7 @@ describe("vibeLM Cascade Integration", () => {
 
   after(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(CONFIG_DIR)) rmSync(CONFIG_DIR, { recursive: true });
   });
 
   it("should load tools provider and return tools", async () => {

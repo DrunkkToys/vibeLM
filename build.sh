@@ -3,6 +3,10 @@ set -euo pipefail
 
 SOURCE_DIR="/Users/drunkktoys/Desktop/vibeLM"
 INSTALL_DIR="/Users/drunkktoys/.lmstudio/extensions/plugins/drunkktoys/vibe-lm"
+# Persistent runtime data (config.json, runtime-state.json, session-log.jsonl) lives here, NOT in
+# INSTALL_DIR, because `lms dev --install` wipes INSTALL_DIR on every deploy. Must match DATA_DIR
+# in src/toolsProvider.ts.
+DATA_DIR="/Users/drunkktoys/.lmstudio/extensions/data/drunkktoys/vibe-lm"
 
 echo ""
 echo "═══════════════════════════════════════════════════════"
@@ -39,18 +43,19 @@ echo "▸ Copying dist/ to install dir..."
 cp -r "$SOURCE_DIR/dist" "$INSTALL_DIR/dist"
 echo "  ✓ dist/ copied"
 
-# 6. Preserve runtime config.json when it already exists.
+# 6. Seed runtime config.json in DATA_DIR (outside INSTALL_DIR, so reinstalls never touch it).
 echo "▸ Preserving config.json..."
-if [ ! -f "$INSTALL_DIR/config.json" ]; then
-  cp "$SOURCE_DIR/config.json" "$INSTALL_DIR/config.json"
+mkdir -p "$DATA_DIR"
+if [ ! -f "$DATA_DIR/config.json" ]; then
+  cp "$SOURCE_DIR/config.json" "$DATA_DIR/config.json"
   echo "  ✓ config.json initialized"
 else
   echo "  ✓ config.json preserved"
 fi
 
 # 6b. Remove legacy enabledTools from the persisted config so LM Studio only shows the toggle-based tool UI.
-if [ -f "$INSTALL_DIR/config.json" ] && command -v node >/dev/null 2>&1; then
-  CONFIG_PATH="$INSTALL_DIR/config.json" node <<'NODE'
+if [ -f "$DATA_DIR/config.json" ] && command -v node >/dev/null 2>&1; then
+  CONFIG_PATH="$DATA_DIR/config.json" node <<'NODE'
 const fs = require("fs");
 const path = process.env.CONFIG_PATH;
 try {

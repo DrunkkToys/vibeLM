@@ -13,9 +13,13 @@ import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
 
-const CONFIG_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "config.json");
-const RUNTIME_STATE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "runtime-state.json");
-const JSONL_CACHE_PATH = resolve(homedir(), ".lmstudio", "extensions", "plugins", "drunkktoys", "vibe-lm", "session-log.jsonl");
+// Persistent runtime data lives under extensions/data, NOT extensions/plugins — `lms dev --install`
+// wipes the plugin install directory on every deploy, which would otherwise destroy this data.
+// VIBE_LM_DATA_DIR lets tests point this at an isolated directory instead of the real user install.
+const DATA_DIR = process.env.VIBE_LM_DATA_DIR || resolve(homedir(), ".lmstudio", "extensions", "data", "drunkktoys", "vibe-lm");
+const CONFIG_PATH = resolve(DATA_DIR, "config.json");
+const RUNTIME_STATE_PATH = resolve(DATA_DIR, "runtime-state.json");
+const JSONL_CACHE_PATH = resolve(DATA_DIR, "session-log.jsonl");
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
 const PROMPT_BUDGET_RATIO = 0.50;
@@ -2156,7 +2160,14 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         });
 
         const chat = Chat.from(chatMessages);
-        await model.act(chat, []);
+        // bash_terminal is intentionally excluded from unattended ticks until it has a command
+        // allowlist — see NOTES.md. vibe_bridge/amend are excluded to avoid nested bridge starts
+        // and orchestrator-specific finalize semantics that don't apply to this standalone act() call.
+        const bridgeTickTools = [
+          exploreWorkspaceTool, listFilesTool, readFileTool, writeFileTool, appendFileTool,
+          searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
+        ];
+        await model.act(chat, bridgeTickTools);
 
         console.log(`[vibe_bridge] Tick ${_bridgeIteration} completed at ${new Date().toLocaleTimeString()}`);
       } catch (err) {
@@ -2210,7 +2221,7 @@ The default prompt can be configured in tool settings.`,
       }
       const resolvedPrompt = prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
         || TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultPrompt
-        || "Check progress to reach your goal, if you are failing adjast trajectory.");
+        || "Check progress to reach your goal, if you are failing adjust trajectory.");
       const resolvedInterval = interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
         ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultInterval
         ?? 30);
