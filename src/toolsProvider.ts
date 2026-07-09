@@ -1,4 +1,4 @@
-import { text, tool, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
+import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
@@ -32,6 +32,7 @@ const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
 const LOOP_WINDOW = 5;
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
+const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
 const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 type MemoryScope = "session" | "workspace" | "research" | "all";
@@ -45,6 +46,18 @@ type ContextWindowCacheEntry = {
 };
 
 let cachedContextWindow: ContextWindowCacheEntry | null = null;
+
+let _bridgeActive = false;
+let _bridgePrompt = "";
+let _bridgeInterval = 0;
+let _bridgeIteration = 0;
+let _bridgeMaxIterations = 0;
+let _bridgeMaxDuration = 0;
+let _bridgeStartedAt = 0;
+let _bridgeTimer: ReturnType<typeof setTimeout> | null = null;
+let _bridgeHandover: string[] = [];
+let _bridgePredictionRunning = false;
+let _bridgeClient: LMStudioClient | null = null;
 
 function makeModelCacheKey(model: { identifier?: string; modelKey?: string; path?: string } | null | undefined): string {
   return [model?.identifier, model?.modelKey, model?.path].filter((part) => typeof part === "string" && part.trim().length > 0).join("::");
@@ -170,7 +183,7 @@ function defaultConfig() {
   return { workspacePath: homedir() };
 }
 
-function readConfigSync(): { workspacePath: string; preferredModel?: string; searchEndpoint?: string } {
+function readConfigSync(): { workspacePath: string; preferredModel?: string; searchEndpoint?: string; vibeBridgePrompt?: string; vibeBridgeInterval?: number; vibeBridgeMaxDuration?: number } {
   try {
     const raw = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) : {};
     if (raw && typeof raw === "object" && !Array.isArray(raw) && "enabledTools" in raw) {
@@ -310,6 +323,9 @@ type SessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
+  managedContextBlocks: string[];
+  lastHandoffSummary: string;
+  lastHandoffTurn: number;
 };
 
 function createSessionState(): SessionState {
@@ -320,6 +336,9 @@ function createSessionState(): SessionState {
     lastCompactionTurn: 0,
     historyFingerprint: "",
     resumedFromPersistedState: false,
+    managedContextBlocks: [],
+    lastHandoffSummary: "",
+    lastHandoffTurn: 0,
   };
 }
 
@@ -350,6 +369,9 @@ type PersistedSessionState = {
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
   updatedAt: string;
+  managedContextBlocks?: string[];
+  lastHandoffSummary?: string;
+  lastHandoffTurn?: number;
 };
 
 function escapeRegExp(value: string): string {
@@ -399,6 +421,9 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       historyFingerprint: parsed.historyFingerprint,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+      managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
+      lastHandoffSummary: typeof parsed.lastHandoffSummary === "string" ? parsed.lastHandoffSummary : "",
+      lastHandoffTurn: typeof parsed.lastHandoffTurn === "number" ? parsed.lastHandoffTurn : 0,
     };
   } catch {
     return null;
@@ -417,6 +442,9 @@ function writeRuntimeStateSync(state: SessionState): void {
       historyFingerprint: state.historyFingerprint,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
+      managedContextBlocks: state.managedContextBlocks,
+      lastHandoffSummary: state.lastHandoffSummary,
+      lastHandoffTurn: state.lastHandoffTurn,
     };
     writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(payload, null, 2), "utf-8");
   } catch {}
@@ -459,6 +487,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             lastCompactionTurn: persisted.lastCompactionTurn,
             historyFingerprint,
             resumedFromPersistedState: true,
+            managedContextBlocks: persisted.managedContextBlocks ?? [],
+            lastHandoffSummary: persisted.lastHandoffSummary ?? "",
+            lastHandoffTurn: persisted.lastHandoffTurn ?? 0,
           };
         } else {
           activeSessionState = createSessionState();
@@ -547,7 +578,10 @@ function buildPromptBudgetReport(
   overflow: boolean;
   nearLimit: boolean;
 } {
-  const combined = [stripManagedContextBlocks(historyText), rewrittenText].filter(Boolean).join("\n");
+  const stripped = stripManagedContextBlocks(historyText);
+  const combined = rewrittenText && stripped.includes(rewrittenText)
+    ? stripped
+    : [stripped, rewrittenText].filter(Boolean).join("\n");
   const estimatedTokens = estimateTokens(combined);
   const hardLimitTokens = hardPromptBudgetLimit(contextWindow);
   return {
@@ -579,6 +613,11 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
 function compactTaskReminder(stepCount: number): string {
   return `${MANAGED_CONTEXT_MARKER}
 [Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call amend when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
+}
+
+function compactContinueInstruction(): string {
+  return `${MANAGED_CONTEXT_MARKER}
+[Continue from the last completed step. Do NOT restart. Read the history and proceed with the next uncompleted step.]`;
 }
 
 function stableStringify(value: unknown): string {
@@ -1221,6 +1260,9 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
     implementation: async (args: Record<string, unknown>, ctx: any) => {
       const maxTurns = activeMaxOrchestratorTurns;
       state.turnCounter++;
+      if (state.resumedFromPersistedState) {
+        state.resumedFromPersistedState = false;
+      }
 
       if (maxTurns > 0 && name !== "amend" && state.turnCounter > maxTurns) {
         return {
@@ -1317,7 +1359,8 @@ function fail(msg: string) {
 
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS };
 
-export async function toolsProvider(ctl: ToolsProviderController) {
+export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
+  _bridgeClient = client ?? null;
   const sessionState = await bootstrapSessionState(ctl, true);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
@@ -1510,6 +1553,18 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
           error: "This response looks like a passive handoff. Return concrete progress, blockers, or the final answer instead.",
         };
       }
+      activeSessionState.lastHandoffSummary = text;
+      activeSessionState.lastHandoffTurn = activeSessionState.turnCounter;
+      const managedBlock = new RegExp(`${escapeRegExp(MANAGED_CONTEXT_MARKER)}[\\s\\S]*?(?=\\n{2,}|$)`, "g");
+      const blocks: string[] = [];
+      let match: RegExpExecArray | null;
+      while ((match = managedBlock.exec(text)) !== null) {
+        blocks.push(match[0]);
+      }
+      if (blocks.length > 0) {
+        activeSessionState.managedContextBlocks = blocks;
+      }
+      writeRuntimeStateSync(activeSessionState);
       return {
         ok: true,
         data: { text },
@@ -2039,6 +2094,149 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     },
   }), "update_memory");
 
+  function _scheduleNextBridgeIteration() {
+    if (!_bridgeActive) return;
+    _bridgeTimer = setTimeout(async () => {
+      if (!_bridgeActive) return;
+      _bridgeIteration++;
+      if (_bridgeMaxIterations > 0 && _bridgeIteration > _bridgeMaxIterations) {
+        _bridgeActive = false;
+        _bridgeTimer = null;
+        return;
+      }
+      if (_bridgeMaxDuration > 0 && (Date.now() - _bridgeStartedAt) / 1000 >= _bridgeMaxDuration) {
+        _bridgeActive = false;
+        _bridgeTimer = null;
+        return;
+      }
+
+      // Guard: skip if prediction already running
+      if (_bridgePredictionRunning) {
+        if (_bridgeActive) _scheduleNextBridgeIteration();
+        return;
+      }
+
+      _bridgePredictionRunning = true;
+      try {
+        if (!_bridgeClient) {
+          console.log("[vibe_bridge] No LMStudio client, skipping tick");
+          _scheduleNextBridgeIteration();
+          return;
+        }
+
+        const loadedModels = await _bridgeClient.llm.listLoaded();
+        if (loadedModels.length === 0) {
+          console.log("[vibe_bridge] No model loaded, skipping tick");
+          _scheduleNextBridgeIteration();
+          return;
+        }
+
+        const model = loadedModels[0];
+
+        // Step 1: Summarize handover context
+        let handover = "";
+        if (_bridgeHandover.length > 0) {
+          const buffer = _bridgeHandover.join("\n\n");
+          const summarizePrompt = `Summarize this conversation in 2-3 concise sentences, focusing on what the user was working on and any open questions:\n\n${buffer}`;
+          const result = await model.complete(summarizePrompt, { maxTokens: 200 });
+          handover = result.content.trim();
+        }
+
+        // Step 2: Build chat with handover + bridge prompt
+        const chatMessages: Array<{ role: "system" | "user"; content: string }> = [];
+        if (handover) {
+          chatMessages.push({
+            role: "system",
+            content: `Context from the current session:\n${handover}`,
+          });
+        }
+        chatMessages.push({
+          role: "user",
+          content: _bridgePrompt,
+        });
+
+        const chat = Chat.from(chatMessages);
+        await model.act(chat, []);
+
+        console.log(`[vibe_bridge] Tick ${_bridgeIteration} completed at ${new Date().toLocaleTimeString()}`);
+      } catch (err) {
+        console.error("[vibe_bridge] Tick failed:", err);
+      } finally {
+        _bridgePredictionRunning = false;
+        if (_bridgeActive) _scheduleNextBridgeIteration();
+      }
+    }, _bridgeInterval * 1000);
+  }
+
+  const vibeBridgeTool = wrapTool(tool({
+    name: "vibe_bridge",
+    description: text`Self-recalling autonomous loop. Starts a timer that periodically injects a prompt into the chat to keep the session alive without user input.
+USE WHEN: you need to work autonomously on a multi-step task without user interaction.
+EXAMPLES:
+  vibe_bridge({ action: "start", prompt: "Continue implementing the feature", interval: 30 })
+  vibe_bridge({ action: "stop" })
+  vibe_bridge({ action: "status" })
+NOTE: Only one bridge can be active at a time. Starting a new bridge replaces the previous one.
+The default prompt can be configured in tool settings.`,
+    parameters: {
+      action: z.enum(["start", "stop", "status"]).default("status").describe("Control the keep-alive loop"),
+      prompt: z.string().min(1).max(10000).optional().describe("Prompt to inject on each cycle (uses configured default if omitted)"),
+      interval: z.number().int().min(5).max(3600).optional().describe("Seconds between injections, e.g. 600 for every 10 minutes (5-3600)"),
+      maxDuration: z.number().int().min(0).max(86400).optional().describe("Max total runtime in seconds, e.g. 21600 for 6 hours (0=unlimited)"),
+      maxIterations: z.number().int().min(0).max(1000).optional().describe("Max cycles before auto-stop (0=unlimited)"),
+    },
+    implementation: async ({ action, prompt, interval, maxDuration, maxIterations }, ctx) => {
+      if (action === "status") {
+        const elapsed = _bridgeStartedAt ? Math.floor((Date.now() - _bridgeStartedAt) / 1000) : 0;
+        const remaining = _bridgeMaxDuration > 0 ? Math.max(0, _bridgeMaxDuration - elapsed) : null;
+        return ok({
+          active: _bridgeActive,
+          prompt: _bridgePrompt.slice(0, 100),
+          interval: _bridgeInterval,
+          iteration: _bridgeIteration,
+          maxIterations: _bridgeMaxIterations,
+          maxDuration: _bridgeMaxDuration,
+          elapsed,
+          remaining,
+          nextIn: _bridgeActive && _bridgeTimer ? `${_bridgeInterval}s` : "n/a",
+        });
+      }
+      if (action === "stop") {
+        if (_bridgeTimer) clearTimeout(_bridgeTimer);
+        _bridgeActive = false;
+        _bridgeTimer = null;
+        ctx?.status?.("Bridge stopped");
+        return ok({ stopped: true, iteration: _bridgeIteration });
+      }
+      const resolvedPrompt = prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
+        || TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultPrompt
+        || "Check progress to reach your goal, if you are failing adjast trajectory.");
+      const resolvedInterval = interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
+        ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultInterval
+        ?? 30);
+      const resolvedMaxDuration = maxDuration ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_maxDuration", "vibe_bridge_maxDuration"])
+        ?? TOOL_TOGGLES.find(t => t.name === "vibe_bridge")?.defaultMaxDuration
+        ?? 0);
+      if (_bridgeTimer) clearTimeout(_bridgeTimer);
+      _bridgeActive = true;
+      _bridgePrompt = resolvedPrompt;
+      _bridgeInterval = resolvedInterval;
+      _bridgeIteration = 0;
+      _bridgeMaxIterations = maxIterations ?? 0;
+      _bridgeMaxDuration = resolvedMaxDuration;
+      _bridgeStartedAt = Date.now();
+      _scheduleNextBridgeIteration();
+      ctx?.status?.(`Bridge started: ${_bridgeInterval}s interval, max ${_bridgeMaxDuration ? `${_bridgeMaxDuration}s` : "∞"}`);
+      return ok({
+        active: true,
+        prompt: _bridgePrompt.slice(0, 100),
+        interval: _bridgeInterval,
+        maxDuration: _bridgeMaxDuration,
+        maxIterations: _bridgeMaxIterations || "unlimited",
+      });
+    },
+  }), "vibe_bridge");
+
   const ALL_TOOL_MAP: Record<string, any> = {
     set_workspace: setWorkspaceTool,
     explore_workspace: exploreWorkspaceTool,
@@ -2069,6 +2267,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
     encode_base64: encodeBase64Tool,
     decode_base64: decodeBase64Tool,
     amend: amendTool,
+    vibe_bridge: vibeBridgeTool,
   };
 
   const MANDATORY_ENABLED = ["amend"];
@@ -2102,7 +2301,17 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const historyText = await getHistoryText(ctl);
   syncRuntimeState(historyText, activeSessionState);
   const normalizedHistoryText = normalizeManagedContextHistory(historyText);
-  const managedContextPresent = hasManagedContext(historyText) || activeSessionState.resumedFromPersistedState;
+  const hasBlocksInHistory = hasManagedContext(historyText);
+  const hasStoredBlocks = activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0;
+  const managedContextPresent = hasBlocksInHistory || hasStoredBlocks;
+
+  // Capture user message for handover context (rolling window of last 5)
+  if (t.length > 0) {
+    _bridgeHandover.push(t);
+    if (_bridgeHandover.length > 5) {
+      _bridgeHandover = _bridgeHandover.slice(-5);
+    }
+  }
 
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
   if (wsMatch) {
@@ -2133,6 +2342,10 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
       const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
       if (plainReport.overflow) {
         return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step"));
+      }
+      // Continuation: replace stale "follow all steps" instruction with a continue directive
+      if (CONTINUATION_PATTERN.test(t)) {
+        return recordProcessedPrompt(historyText, compactContinueInstruction());
       }
       return null;
     }
@@ -2182,6 +2395,17 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
   if (plainReport.overflow) {
     return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
+  }
+  // Continuation in managed-context session: prevent LLM from re-executing stale instructions
+  if (managedContextPresent && CONTINUATION_PATTERN.test(t)) {
+    if (hasStoredBlocks) {
+      const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${activeSessionState.managedContextBlocks.join("\n\n")}\n\n[Continue from the last completed step. Do NOT restart. Read the history and proceed with the next uncompleted step.]`;
+      activeSessionState.managedContextBlocks = [];
+      activeSessionState.resumedFromPersistedState = false;
+      writeRuntimeStateSync(activeSessionState);
+      return recordProcessedPrompt(historyText, rehydrated);
+    }
+    return recordProcessedPrompt(historyText, compactContinueInstruction());
   }
   return null;
 }
