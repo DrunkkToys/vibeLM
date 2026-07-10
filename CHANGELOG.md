@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-10
+
 ### Fixed
 - **`bash_terminal` reported genuinely installed tools (node, npm, anything managed by nvm/Homebrew/
   asdf/volta) as "not found."** Commands ran via a bare `exec()` inheriting LM Studio.app's own

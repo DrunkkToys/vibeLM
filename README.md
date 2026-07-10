@@ -169,4 +169,5 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full release history.
 - Traversal paths like `../` are rejected.
 - Binary files are blocked from `read_file`.
 - `calculate` uses `mathjs`, not raw code execution.
-- `bash_terminal` runs with user-level permissions.
+- `bash_terminal` runs with user-level permissions, through your login shell (`$SHELL -ilc`) so it
+  sees the same `PATH` a real terminal would — including anything added by nvm, Homebrew, asdf, etc.
