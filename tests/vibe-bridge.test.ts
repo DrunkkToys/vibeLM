@@ -18,7 +18,7 @@ function makeConfig() {
   }, null, 2));
 }
 
-function makeCtl() {
+function makeCtl(overrides: { maxThinkingSteps?: number } = {}) {
   return {
     getWorkingDirectory: () => TEST_DIR,
     getPluginConfig: () => ({
@@ -27,6 +27,7 @@ function makeCtl() {
         if (key === "tools.vibe_bridge_prompt" || key === "vibe_bridge_prompt") return "Custom configured prompt";
         if (key === "tools.vibe_bridge_interval" || key === "vibe_bridge_interval") return 120;
         if (key === "tools.vibe_bridge_maxDuration" || key === "vibe_bridge_maxDuration") return 3600;
+        if (key === "tools.maxThinkingSteps" || key === "maxThinkingSteps") return overrides.maxThinkingSteps;
         return undefined;
       },
     }),
@@ -204,6 +205,29 @@ describe("vibe_bridge Cascade", () => {
     assert.ok(capturedOpts, "model.act() should have been called with an opts argument");
     assert.equal(capturedOpts.maxPredictionRounds, 8, "tick should cap prediction rounds so a stuck non-tool-calling loop can't run unbounded");
     assert.ok(capturedOpts.signal instanceof AbortSignal, "tick should pass an AbortSignal so a stuck tick can't block subsequent ticks");
+  });
+
+  it("should honor the configured Max Thinking Steps as the tick's prediction-round cap", async () => {
+    let capturedOpts: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (_chat: any, _tools: any, opts: any) => { capturedOpts = opts; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ maxThinkingSteps: 3 }), capturingClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    await bridge.implementation({ action: "start", prompt: "Configured thinking steps test", interval: 5 });
+    await new Promise((r) => setTimeout(r, 7000));
+    await bridge.implementation({ action: "stop" });
+
+    assert.ok(capturedOpts, "model.act() should have been called");
+    assert.equal(capturedOpts.maxPredictionRounds, 3, "tick should use the configured maxThinkingSteps");
   });
 
   it("should auto-start when enabled in plugin settings, without an explicit start call", async () => {

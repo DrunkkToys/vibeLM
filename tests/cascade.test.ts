@@ -164,4 +164,80 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(checkpoints.length === 1, `should find checkpoint: got ${checkpoints.length}`);
     log.clear();
   });
+
+  it("effectiveContextWindow caps the reported window against the sustainable ceiling", async () => {
+    const { effectiveContextWindow } = await import("../src/toolsProvider");
+    // cap disabled → trust the reported window
+    assert.equal(effectiveContextWindow(262144, 0), 262144);
+    // cap below reported → clamp to cap (the real crash-avoidance case)
+    assert.equal(effectiveContextWindow(262144, 32768), 32768);
+    // cap above reported → reported wins (never inflate a small model's window)
+    assert.equal(effectiveContextWindow(8192, 32768), 8192);
+  });
+
+  it("parseLoadedModelInfo reads the loaded context length, not the model's max ceiling", async () => {
+    const { parseLoadedModelInfo } = await import("../src/toolsProvider");
+    // Mirrors the live payload: the loaded model's real window (40640) is far below its max (262144).
+    const info = parseLoadedModelInfo({
+      data: [
+        { id: "other", state: "not-loaded", arch: "llama", loaded_context_length: 999999 },
+        { id: "qwen/qwen3.5-9b", state: "loaded", arch: "qwen3_5", loaded_context_length: 40640 },
+      ],
+    } as any);
+    assert.equal(info.loadedContextLength, 40640, "must use loaded_context_length of the loaded model, not max");
+    assert.equal(info.arch, "qwen3_5");
+    // Missing loaded_context_length → null (falls back to SDK/default resolution downstream).
+    assert.equal(parseLoadedModelInfo({ data: [{ id: "m", state: "loaded", arch: "gemma4" }] } as any).loadedContextLength, null);
+  });
+
+  it("budget/compaction thresholds computed from the real loaded window fire before overflow", async () => {
+    const { parseLoadedModelInfo } = await import("../src/toolsProvider");
+    const window = parseLoadedModelInfo({ data: [{ state: "loaded", arch: "qwen3_5", loaded_context_length: 40640 }] } as any).loadedContextLength!;
+    // hardPromptBudgetLimit = window * 0.50; shouldAutoCompactSession trips at window * 0.30.
+    const budgetLimit = Math.floor(window * 0.5);
+    const autoCompactTrigger = Math.floor(window * 0.3);
+    assert.equal(budgetLimit, 20320, "budget warning should trip at ~20K (half the real 40K window)");
+    assert.ok(autoCompactTrigger < window, `auto-compaction (${autoCompactTrigger}) must trip below the real window (${window})`);
+    assert.ok(autoCompactTrigger <= 12192, `auto-compaction trigger should be ~12K: got ${autoCompactTrigger}`);
+  });
+
+  it("resolveCompactionTriggerRatio reads the configured percent, clamps it, and defaults to 30%", async () => {
+    const { resolveCompactionTriggerRatio } = await import("../src/toolsProvider");
+    const ctlWith = (percent: unknown) => ({
+      getPluginConfig: () => ({ get: (k: string) => (k === "tools.compactionTriggerPercent" || k === "compactionTriggerPercent" ? percent : undefined) }),
+    } as any);
+    assert.equal(resolveCompactionTriggerRatio(ctlWith(50)), 0.5, "50% → 0.5");
+    assert.equal(resolveCompactionTriggerRatio(ctlWith(95)), 0.9, "clamps above 90%");
+    assert.equal(resolveCompactionTriggerRatio(ctlWith(1)), 0.1, "clamps below 10%");
+    assert.equal(resolveCompactionTriggerRatio({} as any), 0.3, "no config → default 30%");
+    // At a real 40640 window, a higher trigger keeps more live context before compacting.
+    assert.equal(Math.floor(40640 * resolveCompactionTriggerRatio(ctlWith(60))), 24384);
+  });
+
+  it("effectiveContextWindow still clamps further when the optional cap is set", async () => {
+    const { effectiveContextWindow } = await import("../src/toolsProvider");
+    // With cap disabled (default 0) the loaded window passes through untouched.
+    assert.equal(effectiveContextWindow(40640, 0), 40640);
+    // A user-set cap lowers the budget further for machines that can't sustain the loaded length.
+    assert.equal(effectiveContextWindow(40640, 16384), 16384);
+  });
+
+  it("reasoningDirectiveFor maps effort + arch to each family's native thinking control", async () => {
+    const { reasoningDirectiveFor } = await import("../src/toolsProvider");
+    // gpt-oss: native Harmony tiers, deterministic; off/low both hit its floor
+    assert.equal(reasoningDirectiveFor("off", "gpt-oss"), "Reasoning: low");
+    assert.equal(reasoningDirectiveFor("low", "gpt_oss"), "Reasoning: low");
+    assert.equal(reasoningDirectiveFor("medium", "gptoss"), "Reasoning: medium");
+    assert.equal(reasoningDirectiveFor("high", "gpt-oss"), "Reasoning: high");
+    // Qwen soft switches: off suppresses, any active tier enables thinking
+    assert.equal(reasoningDirectiveFor("off", "qwen3"), "/no_think");
+    assert.equal(reasoningDirectiveFor("low", "qwen35"), "/think");
+    assert.equal(reasoningDirectiveFor("medium", "qwen3_5"), "/think");
+    assert.equal(reasoningDirectiveFor("high", "qwen3"), "/think");
+    // Models without an explicit control: natural-language nudge for off/low, no-op for medium/high
+    assert.match(reasoningDirectiveFor("off", "gemma4"), /do not produce extended/i);
+    assert.match(reasoningDirectiveFor("low", "glm4v"), /brief/i);
+    assert.equal(reasoningDirectiveFor("medium", "gemma4"), "");
+    assert.equal(reasoningDirectiveFor("high", "llama"), "");
+  });
 });
