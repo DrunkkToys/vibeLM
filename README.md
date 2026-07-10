@@ -62,12 +62,16 @@ In LM Studio plugin settings (`tools.*`):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `tools.maxEffectiveContextTokens` | number | `0` | Optional hard cap on the budgeting window. `0` = use the model's actual loaded context length (read automatically). Raise it only if your machine can't sustain even the configured length. |
+| `tools.reasoningEffort` | select | `off` | Calibrates model thinking: `off`/`low`/`medium`/`high`. gpt-oss uses native Harmony tiers, Qwen uses `/no_think`·`/think`, others get a natural-language nudge. |
+| `tools.compactionTriggerPercent` | number | `30` | How full the context gets (% of the loaded window) before vibeLM auto-compacts older history into memory (10–90). Higher keeps more live context; lower compacts earlier. |
+| `tools.maxThinkingSteps` | number | `8` | Max prediction rounds per unattended `vibe_bridge` tick, so a model stuck reasoning without calling a tool can't run unbounded (1–50). |
 | `tools.vibe_bridge` | boolean | `false` | Enable the tool and auto-start it with the settings below |
 | `tools.vibe_bridge_prompt` | string | `"Check progress to reach your goal, if you are failing adjust trajectory."` | Default injection prompt |
 | `tools.vibe_bridge_interval` | number | `600` | Seconds between injections |
 | `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
 
-Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at 8 prediction rounds and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
+Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at `Max Thinking Steps` prediction rounds (default 8, configurable via `tools.maxThinkingSteps`) and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
 
 ## How It Works
 
@@ -80,6 +84,9 @@ Each keep-alive tick can call a curated set of tools (explore/list/read/write/ap
 - LM Studio's plugin settings UI groups the agent controls under a `tools` section.
 - `maxOrchestratorTurns` defaults to `50`, accepts values from `0` to `100`, and `0` disables the hard turn cap.
 - `Rolling Window Trigger Limit (prompt tokens)` controls the maximum prompt size before vibeLM switches to rolling-window behavior. Set it to `0` to auto-derive the trigger from the selected model's context window minus a safety margin.
+- vibeLM sizes its prompt budget from the model's **loaded context length** — the value you actually configure when loading the model in LM Studio (read from `loaded_context_length` in the REST API), not the model's larger max ceiling. This is what makes auto-compaction fire in time: e.g. a model loaded at 40K compacts around 12K and warns around 20K, instead of never triggering because it assumed a 256K window.
+- `Max Effective Context (tokens)` is an optional hard cap on top of that. Default `0` uses the loaded window as-is. Set it only if your machine can't sustain even the configured length (e.g. a large vision model whose KV cache exhausts unified memory — note KV-cache quantization is not available for VLMs); vibeLM will then compact against this lower ceiling.
+- `Reasoning Effort` calibrates how much the model "thinks" before answering: `off` suppresses extended reasoning (leanest sessions, avoids reasoning-loop hangs), `low` keeps it brief, `high` leaves the model's default untouched. Qwen models honor `/no_think` and `/think` soft switches; other architectures receive an equivalent natural-language directive. The directive is applied to both interactive turns and unattended `vibe_bridge` ticks.
 - The `tools` section also exposes on/off toggles for the individual tools, so you can disable capabilities you do not want the orchestrator to use.
 - `amend` is gated so the orchestrator does not stop too early.
 - The plugin tries to stay under the model's prompt budget and auto-compacts when sessions get large.

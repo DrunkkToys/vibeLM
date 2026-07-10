@@ -37,6 +37,60 @@ export const configSchematics = createConfigSchematics()
         0,
       )
       .field(
+        "maxEffectiveContextTokens",
+        "numeric",
+        {
+          displayName: "Max Effective Context (tokens)",
+          subtitle: "Optional hard cap on the token budget vibeLM plans against. vibeLM already reads the model's actual loaded context length, so leave this at 0 for normal use. Set it only if your machine can't sustain even the configured length (e.g. a large VLM whose KV cache exhausts unified memory) — vibeLM will then compact against this lower ceiling instead.",
+          int: true,
+          min: 0,
+          max: 1048576,
+          slider: { min: 0, max: 262144, step: 1024 },
+        },
+        0,
+      )
+      .field(
+        "compactionTriggerPercent",
+        "numeric",
+        {
+          displayName: "Auto-Compaction Trigger (% of context)",
+          subtitle: "How full the context gets before vibeLM auto-summarizes older history into memory. Lower = compact earlier (more headroom, but compaction is lossy and costs a model call, so it runs more often); higher = keep more live context (better fidelity for long tasks, closer to the limit). Works on top of the actual loaded context window; the Rolling Window and Max Effective Context settings govern warnings/caps, this one governs compaction.",
+          int: true,
+          min: 10,
+          max: 90,
+          slider: { min: 10, max: 90, step: 5 },
+        },
+        30,
+      )
+      .field(
+        "reasoningEffort",
+        "select",
+        {
+          displayName: "Reasoning Effort",
+          subtitle: "Calibrates how much the model 'thinks' before answering. Mapped per model family: gpt-oss uses its native Harmony 'Reasoning: low/medium/high' tiers (deterministic); Qwen uses /no_think and /think soft switches; other models get an equivalent natural-language directive. 'off' keeps sessions leanest and avoids reasoning-loop hangs.",
+          options: [
+            { value: "off", displayName: "Off — answer directly" },
+            { value: "low", displayName: "Low — brief reasoning" },
+            { value: "medium", displayName: "Medium — moderate reasoning" },
+            { value: "high", displayName: "High — full reasoning" },
+          ],
+        },
+        "off",
+      )
+      .field(
+        "maxThinkingSteps",
+        "numeric",
+        {
+          displayName: "Max Thinking Steps",
+          subtitle: "Caps the number of prediction rounds an unattended vibe_bridge tick may take, so a model stuck reasoning without calling a tool (looping on 'Wait... Actually...') can't run unbounded — it is canceled and counted as a failed tick instead. Lower this to fail fast; raise it to allow more multi-step work per tick.",
+          int: true,
+          min: 1,
+          max: 50,
+          slider: { min: 1, max: 50, step: 1 },
+        },
+        8,
+      )
+      .field(
         "vibe_bridge_prompt",
         "string",
         {

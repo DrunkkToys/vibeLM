@@ -2,7 +2,7 @@ console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage, LMStudioClient } from "@lmstudio/sdk";
 import { configSchematics } from "./config";
-import { toolsProvider, preprocessMessage } from "./toolsProvider";
+import { toolsProvider, preprocessMessage, reasoningDirectiveForSession } from "./toolsProvider";
 
 export async function main(context: PluginContext) {
   console.log("[AgenticTools] main() called");
@@ -42,8 +42,17 @@ export async function main(context: PluginContext) {
       if (!text) return userMessage;
 
       const processed = await preprocessMessage(text, _ctl);
-      if (processed) return processed;
+      // Reasoning-effort directive is applied here (after preprocessMessage) so it stays out of the
+      // recorded/hashed managed-context state and applies uniformly to every outgoing message.
+      const directive = await reasoningDirectiveForSession(_ctl);
 
+      if (processed) {
+        return directive ? `${processed}\n\n${directive}` : processed;
+      }
+      // No text transform: append to the ChatMessage in place so image/file attachments (VLMs) survive.
+      if (directive) {
+        userMessage.appendText(`\n\n${directive}`);
+      }
       return userMessage;
     });
   } catch (error) {

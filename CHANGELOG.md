@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-10
+
+### Added
+- **`reasoningEffort` setting** (`off`/`low`/`medium`/`high`) — calibrates model thinking, mapped per
+  model family: gpt-oss uses its native Harmony `Reasoning: low/medium/high` tiers, Qwen uses the
+  `/no_think`·`/think` soft switches, and other models get an equivalent natural-language directive.
+  Applied to both interactive turns and unattended `vibe_bridge` ticks.
+- **`compactionTriggerPercent` setting** (10–90, default 30) — how full the context gets before vibeLM
+  auto-compacts older history into memory. Higher keeps more live context; lower compacts earlier.
+- **`maxThinkingSteps` setting** (1–50, default 8) — the per-tick prediction-round cap for `vibe_bridge`
+  is now user-configurable (previously hardcoded at 8).
+- **`maxEffectiveContextTokens` setting** (default 0 = disabled) — optional hard cap on the token budget
+  vibeLM plans against, for machines that can't sustain even the configured loaded context length.
+
+### Fixed
+- Prompt budgeting and auto-compaction now size from the model's actual **loaded context length**
+  (`loaded_context_length`, read from LM Studio's REST API) instead of its larger max ceiling.
+  Previously a model loaded at ~40K but reporting a 256K max was budgeted against 256K, so
+  auto-compaction (30% trigger) and the budget warning (50%) never fired before the session overflowed
+  its real window and died — confirmed live on a remote M5 around 40–60K tokens.
+
 ## [0.2.1] - 2026-07-09
 
 ### Changed

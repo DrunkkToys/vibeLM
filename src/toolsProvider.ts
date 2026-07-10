@@ -33,11 +33,17 @@ const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 500;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
 const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
+// Secondary safety net on top of reading the real loaded context length: an optional hard cap on the
+// window vibeLM budgets against, for machines that can't sustain even the configured length. Default 0
+// = trust the loaded window; users raise it via tools.maxEffectiveContextTokens when they need it.
+const DEFAULT_MAX_EFFECTIVE_CONTEXT_TOKENS = 0;
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = "off";
 // vibe_bridge ticks are a standalone model.act() call outside the main orchestrator, so they
 // don't inherit maxOrchestratorTurns. Without their own cap, a model stuck reasoning without
 // calling any tool (e.g. looping on "Wait... Actually...") can run unbounded — confirmed live,
 // one tick ran 43 minutes with zero tool calls after a set_workspace error it never recovered from.
-const VIBE_BRIDGE_TICK_MAX_ROUNDS = 8;
+// Exposed to users as the "Max Thinking Steps" setting (tools.maxThinkingSteps).
+const DEFAULT_MAX_THINKING_STEPS = 8;
 const VIBE_BRIDGE_TICK_TIMEOUT_MS = 180_000;
 const LOOP_WINDOW = 5;
 const CHECKPOINT_INTERVAL_MAX = 10;
@@ -78,6 +84,16 @@ type ContextWindowCacheEntry = {
 };
 
 let cachedContextWindow: ContextWindowCacheEntry | null = null;
+
+type ReasoningEffort = "off" | "low" | "medium" | "high";
+
+// Info about the currently loaded model, read from LM Studio's native REST API. `loadedContextLength`
+// is the context the user ACTUALLY configured for this load (LM Studio also exposes a larger
+// `max_context_length` — the model's ceiling — which is NOT what the session runs at). `arch` picks the
+// thinking-control directive. Cached with a short TTL so we don't hit the API on every message.
+const LOADED_MODEL_CACHE_TTL_MS = 30_000;
+type LoadedModelInfo = { arch: string; loadedContextLength: number | null };
+let cachedLoadedModelInfo: { info: LoadedModelInfo; ts: number } | null = null;
 
 let _bridgeActive = false;
 let _bridgePrompt = "";
@@ -149,7 +165,15 @@ async function readLoadedModelContextWindow(model: any): Promise<number | null> 
   return null;
 }
 
-async function getContextWindow(ctl?: any): Promise<number> {
+// The window the loaded model runs at, before applying the effective-context cap. Prefers the REST
+// API's `loaded_context_length` (what the user configured) and only falls back to the SDK path — which
+// reports the model's max ceiling — when the REST value is unavailable.
+async function getReportedContextWindow(ctl?: any): Promise<number> {
+  const loadedContextLength = (await fetchLoadedModelInfo()).loadedContextLength;
+  if (typeof loadedContextLength === "number" && loadedContextLength > 0) {
+    return loadedContextLength;
+  }
+
   const now = Date.now();
   const resolved = await resolveLoadedContextWindow(ctl);
   if (resolved) {
@@ -166,6 +190,21 @@ async function getContextWindow(ctl?: any): Promise<number> {
   }
 
   return DEFAULT_CONTEXT_WINDOW;
+}
+
+// Clamp the reported window to the token budget the machine can actually sustain. cap <= 0 disables.
+export function effectiveContextWindow(reported: number, cap: number): number {
+  if (typeof cap === "number" && cap > 0) {
+    return Math.min(reported, cap);
+  }
+  return reported;
+}
+
+// Every budgeting/compaction decision routes through here, so capping here makes the whole guardrail
+// (hardPromptBudgetLimit, rolling window, shouldAutoCompactSession) fire against the effective window.
+async function getContextWindow(ctl?: any): Promise<number> {
+  const reported = await getReportedContextWindow(ctl);
+  return effectiveContextWindow(reported, resolveMaxEffectiveContextTokens(ctl));
 }
 
 const BINARY_EXTS = new Set([
@@ -254,6 +293,108 @@ function resolveMaxOrchestratorTurns(ctl?: any): number {
     return Math.max(0, Math.min(100, Math.floor(rawValue)));
   }
   return DEFAULT_MAX_ORCHESTRATOR_TURNS;
+}
+
+function resolveMaxEffectiveContextTokens(ctl?: any): number {
+  const rawValue = readPluginConfigValue(ctl, ["tools.maxEffectiveContextTokens", "maxEffectiveContextTokens"]);
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(0, Math.floor(rawValue));
+  }
+  return DEFAULT_MAX_EFFECTIVE_CONTEXT_TOKENS;
+}
+
+// The auto-compaction trigger, as a fraction of the context window. Exposed as a percentage
+// (tools.compactionTriggerPercent) and clamped to a sane 10–90% band.
+export function resolveCompactionTriggerRatio(ctl?: any): number {
+  const rawValue = readPluginConfigValue(ctl, ["tools.compactionTriggerPercent", "compactionTriggerPercent"]);
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(10, Math.min(90, Math.floor(rawValue))) / 100;
+  }
+  return COMPACT_CONTEXT_TRIGGER_RATIO;
+}
+
+function resolveMaxThinkingSteps(ctl?: any): number {
+  const rawValue = readPluginConfigValue(ctl, ["tools.maxThinkingSteps", "maxThinkingSteps"]);
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(1, Math.min(50, Math.floor(rawValue)));
+  }
+  return DEFAULT_MAX_THINKING_STEPS;
+}
+
+function resolveReasoningEffort(ctl?: any): ReasoningEffort {
+  const rawValue = readPluginConfigValue(ctl, ["tools.reasoningEffort", "reasoningEffort"]);
+  if (rawValue === "off" || rawValue === "low" || rawValue === "medium" || rawValue === "high") {
+    return rawValue;
+  }
+  return DEFAULT_REASONING_EFFORT;
+}
+
+// Read the loaded model's arch + configured (loaded) context length from LM Studio's native REST API,
+// which reports `arch`, per-model `state`, and `loaded_context_length`. Cached with a short TTL.
+// Pure parse of the /api/v0/models payload: pick the loaded model (or first entry) and read its arch +
+// configured context length. Deliberately reads `loaded_context_length`, never `max_context_length`.
+export function parseLoadedModelInfo(data: { data?: Array<{ arch?: string; state?: string; loaded_context_length?: number }> } | null | undefined): LoadedModelInfo {
+  const loaded = data?.data?.find((m) => m.state === "loaded") ?? data?.data?.[0];
+  return {
+    arch: typeof loaded?.arch === "string" ? loaded.arch : "",
+    loadedContextLength: typeof loaded?.loaded_context_length === "number" && loaded.loaded_context_length > 0
+      ? loaded.loaded_context_length
+      : null,
+  };
+}
+
+async function fetchLoadedModelInfo(): Promise<LoadedModelInfo> {
+  const now = Date.now();
+  if (cachedLoadedModelInfo && now - cachedLoadedModelInfo.ts < LOADED_MODEL_CACHE_TTL_MS) {
+    return cachedLoadedModelInfo.info;
+  }
+  try {
+    const resp = await fetch(`${API_BASE}/api/v0/models`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const info = parseLoadedModelInfo(await resp.json());
+      cachedLoadedModelInfo = { info, ts: now };
+      return info;
+    }
+  } catch (err) {
+    console.error("[AgenticTools] fetchLoadedModelInfo failed, falling back to SDK context/arch resolution:", err);
+  }
+  return { arch: "", loadedContextLength: null };
+}
+
+async function getLoadedModelArch(): Promise<string> {
+  return (await fetchLoadedModelInfo()).arch;
+}
+
+// Pure mapping from (effort, arch) to a thinking-control directive appended to the outgoing prompt.
+// Each family gets its native control where one exists:
+//  - gpt-oss: Harmony "Reasoning: low/medium/high" — deterministic, with explicit tiers (its floor is
+//    "low", so both off and low map there).
+//  - Qwen: the /no_think and /think soft switches.
+//  - everything else: a natural-language nudge. medium/high are no-ops there because a nudge can't
+//    reliably force *more* reasoning than the model's default.
+export function reasoningDirectiveFor(effort: ReasoningEffort, arch: string): string {
+  if (/gpt.?oss/i.test(arch)) {
+    switch (effort) {
+      case "high": return "Reasoning: high";
+      case "medium": return "Reasoning: medium";
+      default: return "Reasoning: low";
+    }
+  }
+  if (/qwen/i.test(arch)) {
+    return effort === "off" ? "/no_think" : "/think";
+  }
+  switch (effort) {
+    case "off": return "Answer directly and concisely; do not produce extended step-by-step reasoning.";
+    case "low": return "Keep any reasoning brief.";
+    default: return "";
+  }
+}
+
+// Resolve the directive for the current session (effort from config + arch from the loaded model).
+export async function reasoningDirectiveForSession(ctl?: any): Promise<string> {
+  const effort = resolveReasoningEffort(ctl);
+  const arch = await getLoadedModelArch();
+  return reasoningDirectiveFor(effort, arch);
 }
 
 function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
@@ -1190,6 +1331,7 @@ function shouldAutoCompactSession(
   session: SessionLog,
   state: SessionState,
   contextWindow: number,
+  triggerRatio: number = COMPACT_CONTEXT_TRIGGER_RATIO,
 ): boolean {
   if (state.turnCounter < COMPACT_CONTEXT_TRIGGER_TURNS) return false;
   if (state.turnCounter - state.lastCompactionTurn < COMPACT_CONTEXT_MIN_GAP_TURNS) return false;
@@ -1204,7 +1346,7 @@ function shouldAutoCompactSession(
     ].join("\n");
   }).join("\n");
   const tokenEstimate = estimateTokens(text);
-  return tokenEstimate >= Math.floor(contextWindow * COMPACT_CONTEXT_TRIGGER_RATIO);
+  return tokenEstimate >= Math.floor(contextWindow * triggerRatio);
 }
 
 function saveCompactContext(
@@ -1357,7 +1499,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         );
       }
 
-      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx))) {
+      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx), resolveCompactionTriggerRatio(ctx))) {
         const compact = await compactSessionContext(log, state, {
           saveToMemory: true,
           includeCode: true,
@@ -2201,9 +2343,13 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
             content: `Context from the current session:\n${handover}`,
           });
         }
+        // Apply the configured reasoning-effort directive to the tick prompt. Besides honoring the
+        // user's setting, suppressing reasoning here curbs the unbounded "Wait... Actually..." loops
+        // that the round/timeout caps above were added to bound.
+        const tickDirective = await reasoningDirectiveForSession(ctl);
         chatMessages.push({
           role: "user",
-          content: _bridgePrompt,
+          content: tickDirective ? `${_bridgePrompt}\n\n${tickDirective}` : _bridgePrompt,
         });
 
         const chat = Chat.from(chatMessages);
@@ -2215,7 +2361,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
           searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
         ];
         await model.act(chat, bridgeTickTools, {
-          maxPredictionRounds: VIBE_BRIDGE_TICK_MAX_ROUNDS,
+          maxPredictionRounds: resolveMaxThinkingSteps(ctl),
           signal: AbortSignal.timeout(VIBE_BRIDGE_TICK_TIMEOUT_MS),
         });
 
