@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Cut-the-middle context retention via a pinned "context spine".** Previously, when the LM Studio
+  host rolled raw history it dropped the *oldest* turns first — the goal and everything the agent had
+  established — and vibeLM only re-asserted its last directive, so early context was effectively lost
+  (a rolling/tail strategy). vibeLM now rebuilds a pinned **head** from durable state — the plan
+  (goal + step statuses) plus the top distilled facts — and re-injects it on resume after a detected
+  roll. The head survives, the recent tail is whatever the host still holds, and the middle is
+  deliberately not reproduced (only its distilled facts carry forward). Facts fall back to the most
+  recent across sessions when a roll has regenerated the session id, so the "what we've learned"
+  block isn't empty exactly when it's needed most.
+
 ### Changed
 - **Memory now stores distilled, deduplicated facts instead of raw tool-result dumps.** Every non-read
   tool call used to append the full (truncated) result blob to memory and a contentless

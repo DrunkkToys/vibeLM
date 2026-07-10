@@ -2913,12 +2913,49 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   return null;
 }
 
+// The pinned "head" of a cut-the-middle retention strategy. When the host rolls raw history it drops
+// the oldest turns first — i.e. the goal and everything the agent has already established. This
+// reassembles that head from durable state (the plan) plus the distilled facts (Layer 2), so it can be
+// re-injected after a roll. The middle is deliberately NOT reproduced — only its distilled facts
+// survive — and the recent tail is whatever the host still holds. Returns null when there's no head
+// worth pinning yet.
+const SPINE_MAX_FACTS = 8;
+export function buildContextSpine(session: SessionLog, state: SessionState): string | null {
+  const parts: string[] = [];
+  if (state.plan) {
+    parts.push(`[Goal] ${truncateText(state.plan.goal, 300)}`);
+    const steps = state.plan.steps
+      .map((s) => `  ${s.index}. [${s.status}] ${truncateText(s.description, 120)}`)
+      .join("\n");
+    if (steps) parts.push(`[Plan]\n${steps}`);
+  }
+  // Top established facts — what the agent has learned, which would otherwise roll off the head.
+  const isFact = (m: MemoryEntry) => Array.isArray(m.tags) && m.tags.some((t) => t.startsWith("fact:"));
+  let facts = session.readRecentMemories(FACT_DEDUP_SCAN, currentSessionId(state)).filter(isFact);
+  if (facts.length === 0) {
+    // After a history roll, bootstrapSessionState regenerates the session id (it distrusts session
+    // identity once raw history no longer fingerprints the same), so session-scoped retrieval misses
+    // the very facts we need to pin. Fall back to the most recent facts regardless of session — right
+    // after a roll those are still this session's, just recorded under the previous id.
+    facts = session.readRecentMemories(FACT_DEDUP_SCAN).filter(isFact);
+  }
+  const factLines = facts.slice(-SPINE_MAX_FACTS).map((m) => `  - ${truncateText(m.content, FACT_DETAIL_CHARS)}`);
+  if (factLines.length) parts.push(`[Established facts]\n${factLines.join("\n")}`);
+  if (parts.length === 0) return null;
+  return `${MANAGED_CONTEXT_MARKER}\n[Context spine — pinned so it survives history rolls; do not restate, just build on it]\n${parts.join("\n")}`;
+}
+
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   await bootstrapSessionState(ctl as any);
   const rehydrationBlocks = (activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0)
     ? activeSessionState.managedContextBlocks.slice()
     : null;
-  if (rehydrationBlocks) {
+  // Rebuild the pinned head BEFORE consuming state below. It's built whenever we resumed from
+  // persisted state (a detected roll/restart) — the exact moment the host has dropped the head.
+  const spine = activeSessionState.resumedFromPersistedState
+    ? buildContextSpine(getSessionLog(), activeSessionState)
+    : null;
+  if (rehydrationBlocks || spine) {
     // Consume immediately so it only fires once, and so preprocessMessageCore's own
     // managedContextPresent/hasStoredBlocks checks don't see stale state.
     activeSessionState.managedContextBlocks = [];
@@ -2926,7 +2963,10 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
     writeRuntimeStateSync(activeSessionState);
   }
   const result = await preprocessMessageCore(text, ctl);
-  if (!rehydrationBlocks) return result;
-  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${rehydrationBlocks.join("\n\n")}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
+  // The spine can fire even when there are no stored directive blocks (e.g. a plan exists but no
+  // directive was captured), so inject it whenever it's non-null.
+  if (!rehydrationBlocks && !spine) return result;
+  const preserved = [spine, ...(rehydrationBlocks ?? [])].filter(Boolean).join("\n\n");
+  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${preserved}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
   return result ? `${rehydrated}\n\n${result}` : rehydrated;
 }

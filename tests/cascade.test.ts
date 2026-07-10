@@ -391,4 +391,38 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(!s.key.includes("SUPERSECRET123"), "the fact key must not embed the password");
     assert.ok(!s.fact.includes("SUPERSECRET123"), "the fact text must not embed the password");
   });
+
+  it("buildContextSpine pins goal + plan + facts as the head (cut-the-middle retention)", async () => {
+    const { buildContextSpine } = await import("../src/toolsProvider");
+    const { SessionLog } = await import("../src/sessionLog");
+    const logPath = resolve(CONFIG_DIR, `spine-${Date.now()}.jsonl`);
+    const log = new SessionLog(logPath);
+    const sid = "spine-sess";
+    log.saveMemory(["fact:bash_terminal:ls:fail", `session:${sid}`], "bash_terminal `ls /x` → failed: not found", 1, sid, "/ws", "workspace");
+    log.saveMemory(["fact:bash_terminal:#abc:ok", `session:${sid}`], "bash_terminal `cat a.txt` → ok: ALPHA-DATA", 2, sid, "/ws", "workspace");
+
+    const state: any = {
+      sessionId: sid,
+      plan: {
+        goal: "Build the widget",
+        steps: [
+          { index: 1, description: "scaffold project", status: "done" },
+          { index: 2, description: "wire it up", status: "pending" },
+        ],
+        createdAt: "", updatedAt: "",
+      },
+    };
+
+    const spine = buildContextSpine(log, state);
+    assert.ok(spine, "spine must be built when a plan and facts exist");
+    assert.match(spine as string, /Context spine/, "spine is a managed-context head block");
+    assert.match(spine as string, /\[Goal\] Build the widget/, "goal is pinned in the head");
+    assert.match(spine as string, /2\. \[pending\] wire it up/, "plan step statuses are pinned");
+    assert.match(spine as string, /\[Established facts\]/, "distilled facts are pinned");
+    assert.match(spine as string, /ALPHA-DATA/, "the learned fact survives the roll");
+
+    // No plan, no facts → nothing worth pinning → null (never inject an empty head).
+    const emptyLog = new SessionLog(resolve(CONFIG_DIR, `spine-empty-${Date.now()}.jsonl`));
+    assert.equal(buildContextSpine(emptyLog, { sessionId: "empty", plan: null } as any), null, "no head to pin → null");
+  });
 });
