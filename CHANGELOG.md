@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`bash_terminal` reported genuinely installed tools (node, npm, anything managed by nvm/Homebrew/
+  asdf/volta) as "not found."** Commands ran via a bare `exec()` inheriting LM Studio.app's own
+  environment — launched via Launch Services (Dock/Finder), never an interactive login shell — so
+  `PATH` never picked up anything a version manager adds by sourcing `.zshrc`/`.zprofile`. Live testing
+  caught the agent confidently telling the user to reinstall Node.js that was already installed via
+  nvm. Commands now run through `${SHELL} -ilc` (interactive + login), sourcing the same profile a
+  real Terminal session would — generically, without hardcoding any tool's install path.
+- **`delete_file`'s parameter was named `path` while `read_file`/`write_file` use `filePath`.** Live
+  testing caught the model calling `delete_file({ filePath: ... })` — consistent with every other file
+  tool in the same conversation — and getting rejected by the schema. Renamed to `filePath` for
+  consistency; the tool's own inconsistency was silently degrading tool-call reliability with no
+  logged bug up to now.
+
 ### Added
 - **Importance-tiered context budgeting (Layer 3).** Replaces the blunt fixed limits with tiers keyed
   on importance:

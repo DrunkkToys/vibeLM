@@ -426,6 +426,23 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(buildContextSpine(emptyLog, { sessionId: "empty", plan: null } as any), null, "no head to pin → null");
   });
 
+  it("bash_terminal runs through an interactive login shell, so PATH additions from rc files (nvm, Homebrew, etc.) are visible", async () => {
+    // Regression for a live-testing finding: a bare exec() inherits LM Studio.app's own env, which is
+    // never an interactive login shell (GUI apps are launched via Launch Services, not a terminal), so
+    // nvm/Homebrew/asdf — which extend PATH by sourcing .zshrc/.zprofile — were invisible to
+    // bash_terminal even though the tools were genuinely installed. `$-` contains "i" only when the
+    // shell that ran the command was interactive; this is what makes rc-file-sourced PATH edits (like
+    // nvm's) actually take effect, portably on both zsh (macOS) and bash (Linux CI).
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    const result: any = await bash.implementation({ command: "echo FLAGS=$-" }, {});
+    assert.ok(result.ok, "the command must execute successfully");
+    assert.match(result.data.stdout, /FLAGS=\S*i\S*/, "the shell must run in interactive mode so rc-file PATH edits are sourced");
+  });
+
   it("importance-tiered tool-result caps: reads keep more, failures keep less", async () => {
     const { resultCharBudget } = await import("../src/toolsProvider");
     assert.equal(resultCharBudget("read_file", { ok: true, data: "x".repeat(9000) }), 1500, "reads get the high tier");
@@ -494,5 +511,20 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(resumed.resumedFromPersistedState, true, "a roll is detected as a resume");
     assert.ok(resumed.plan, "the goal-only plan must survive the persisted round-trip");
     assert.match(resumed.plan.goal, /CSV to JSON/, "the restored goal is intact");
+  });
+
+  it("delete_file uses the filePath param name, consistent with read_file/write_file (caught live: model used filePath from those tools, delete_file rejected it)", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0, toolToggles: { delete_file: true } });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const deleteFile = tools.find((t: any) => t.name === "delete_file");
+    assert.ok(deleteFile?.implementation, "delete_file must be present");
+
+    const target = resolve(TEST_DIR, "delete-me.txt");
+    writeFileSync(target, "temp");
+    const result: any = await deleteFile.implementation({ filePath: "delete-me.txt" });
+    assert.ok(result.ok, "delete_file must accept filePath, matching read_file/write_file's param name");
+    assert.ok(!existsSync(target), "the file must actually be deleted");
   });
 });

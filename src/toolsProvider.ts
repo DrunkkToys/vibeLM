@@ -2217,15 +2217,15 @@ NOTE: This is a text-based search, not a regex search. The pattern is matched ca
     name: "delete_file",
     description: text`Deletes a file or empty directory. Path is relative to workspace.
 USE WHEN: you need to remove a file or empty directory.
-EXAMPLE: delete_file({ path: "temp/output.txt" })
+EXAMPLE: delete_file({ filePath: "temp/output.txt" })
 NOTE: Will NOT delete non-empty directories. Use bash_terminal 'rm -rf' for that.`,
     parameters: {
-      path: z.string().min(1).describe("Path relative to workspace"),
+      filePath: z.string().min(1).describe("File path relative to workspace"),
     },
-    implementation: async ({ path }) => {
+    implementation: async ({ filePath }) => {
       try {
         const ws = requireWorkspace(ctl);
-        const resolved = sandboxPath(ws, path);
+        const resolved = sandboxPath(ws, filePath);
         if (!existsSync(resolved)) return fail(`Not found: ${resolved}`);
         const st = statSync(resolved);
         if (st.isDirectory()) {
@@ -2252,9 +2252,17 @@ NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 
       const blockedReason = checkBashCommandSafety(command);
       if (blockedReason) return fail(blockedReason);
       try {
-        const { exec } = await import("child_process");
+        const { execFile } = await import("child_process");
+        // LM Studio.app is launched via Launch Services (Dock/Finder), not an interactive login
+        // shell, so process.env.PATH never picks up nvm/Homebrew/asdf/volta — anything a version
+        // manager adds by sourcing .zshrc/.zprofile. A bare exec() with process.env therefore reports
+        // real, installed tools as "not found". Running through `${shell} -ilc` (interactive + login +
+        // command-string) sources the same profile a real Terminal session would, generically, without
+        // hardcoding any single tool's install path. `command` stays a single argv element passed to
+        // -c, so the shell parses it exactly as before — pipes/redirects/&& all keep working unchanged.
+        const shell = process.env.SHELL || (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
         return await new Promise((res) => {
-          exec(command, { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          execFile(shell, ["-ilc", command], { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
             res(ok({ exitCode: err?.code ?? 0, stdout: stdout || "", stderr: stderr || "", killed: !!err?.killed, signal: err?.signal ?? null }));
           });
         });
@@ -2866,9 +2874,12 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       const cfg = readConfigSync();
       cfg.workspacePath = resolved;
       writeConfigSync(cfg);
-      return recordProcessedPrompt(historyText, `[Tool executed: set_workspace]`);
+      // Must be unambiguous: the preprocessor already performed the change and stripped the path from
+      // the message, so a terse "[Tool executed: set_workspace]" left small models re-calling the tool
+      // (now without a path) and asking the user for it again. State the outcome and forbid the retry.
+      return recordProcessedPrompt(historyText, `[The workspace is already set to ${resolved}. This is done — do NOT call the set_workspace tool. Reply to the user with a one-line confirmation, e.g. "Workspace set to ${resolved}.", then wait for their next instruction.]`);
     }
-    return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
+    return recordProcessedPrompt(historyText, `[The workspace was NOT changed: the path "${resolved}" does not exist. Do NOT call set_workspace. Tell the user the path was not found and ask them for a valid absolute path to an existing folder.]`);
   }
 
   const exploreMatch = t.match(/^(?:explore|inspect|scan|survey)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+explore|inspect|scan|survey)(?:\s+(.+))?$/i);
