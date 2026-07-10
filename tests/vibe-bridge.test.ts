@@ -207,6 +207,43 @@ describe("vibe_bridge Cascade", () => {
     assert.ok(capturedOpts.signal instanceof AbortSignal, "tick should pass an AbortSignal so a stuck tick can't block subsequent ticks");
   });
 
+  it("should give the tick a generous maxTokens floor when the loaded model's architecture can't actually turn reasoning off (live-tested: gemma-4/phi-4-mini-reasoning/Nemotron-H all kept reasoning regardless of directive)", async () => {
+    let capturedOpts: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (_chat: any, _tools: any, opts: any) => { capturedOpts = opts; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).includes("/api/v0/models")) {
+        return new Response(JSON.stringify({ data: [{ arch: "phi-4", state: "loaded" }] }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch in test: ${url}`);
+    }) as any;
+
+    const { toolsProvider, __resetLoadedModelInfoCacheForTests } = await import("../src/toolsProvider");
+    __resetLoadedModelInfoCacheForTests();
+    try {
+      const tools = await toolsProvider(makeCtl(), capturingClient);
+      const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+      await bridge.implementation({ action: "start", prompt: "Reasoning-heavy arch test", interval: 5 });
+      await new Promise((r) => setTimeout(r, 7000));
+      await bridge.implementation({ action: "stop" });
+
+      assert.ok(capturedOpts, "model.act() should have been called");
+      assert.equal(capturedOpts.maxTokens, 6000, "an always-reasoning architecture should get the generous token floor, not whatever ambient default might otherwise apply");
+    } finally {
+      globalThis.fetch = originalFetch;
+      __resetLoadedModelInfoCacheForTests();
+    }
+  });
+
   it("should honor the configured Max Thinking Steps as the tick's prediction-round cap", async () => {
     let capturedOpts: any = undefined;
     const capturingClient = {

@@ -58,8 +58,19 @@ describe("plan execution", () => {
     makeConfig();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (!existsSync(TEST_DIR)) mkdirSync(TEST_DIR, { recursive: true });
+    // Each test expects a clean plan/session slate. toolsProvider() itself no longer force-resets
+    // state on every call (that was the live-testing bug fixed in src/toolsProvider.ts — it discarded
+    // real session continuity every turn in production), so tests must reset explicitly instead.
+    // Also delete any persisted runtime-state.json left by the previous test: bootstrapSessionState's
+    // "no history at all" path now legitimately carries over a persisted plan (fixed a live bug where a
+    // hot-reloaded/restarted process dropped an in-progress plan instead), so a stale plan on disk
+    // would otherwise leak into this "clean slate" the same way it would in a real restart.
+    const runtimeStatePath = resolve(CONFIG_DIR, "runtime-state.json");
+    if (existsSync(runtimeStatePath)) rmSync(runtimeStatePath);
+    const { resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    await resolveSessionStateFromHistory(makeCtl(), true);
   });
 
   afterEach(async () => {

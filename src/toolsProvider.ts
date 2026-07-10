@@ -115,6 +115,12 @@ const LOADED_MODEL_CACHE_TTL_MS = 30_000;
 type LoadedModelInfo = { arch: string; loadedContextLength: number | null };
 let cachedLoadedModelInfo: { info: LoadedModelInfo; ts: number } | null = null;
 
+// Test-only: force the next fetchLoadedModelInfo() call to hit the network again instead of serving
+// a stale cached arch from an earlier test in the same process.
+export function __resetLoadedModelInfoCacheForTests(): void {
+  cachedLoadedModelInfo = null;
+}
+
 let _bridgeActive = false;
 let _bridgePrompt = "";
 let _bridgeInterval = 0;
@@ -421,9 +427,26 @@ export function reasoningDirectiveFor(effort: ReasoningEffort, arch: string): st
 
 // Resolve the directive for the current session (effort from config + arch from the loaded model).
 export async function reasoningDirectiveForSession(ctl?: any): Promise<string> {
-  const effort = resolveReasoningEffort(ctl);
+  const effort = currentPlanStepThinking() ?? resolveReasoningEffort(ctl);
   const arch = await getLoadedModelArch();
   return reasoningDirectiveFor(effort, arch);
+}
+
+// Architectures with reasoning baked into a separate channel that no prompt-text directive can turn
+// off — confirmed live against real loaded models: LM Studio's own native `reasoning` REST setting
+// (which authoritatively reports per-model support) accepted "off" for gemma4 but the model still
+// verbalized its full reasoning inline anyway, and outright REJECTED "off" for Phi-3/Phi-4-reasoning
+// with "Supported settings: 'on'" — i.e. LM Studio itself confirms there is no off-switch. Nemotron's
+// hybrid (Nemotron-H) architecture showed the same behavior against both vibeLM's own directive and
+// NVIDIA's documented "detailed thinking off" convention. For these, a tight token budget is actively
+// dangerous rather than just wasteful: reasoning can consume the entire budget before the model ever
+// reaches its answer, returning empty content (reproduced live on phi-4-mini-reasoning). Give them a
+// generous explicit floor instead of whatever ambient per-model limit might otherwise apply.
+const ALWAYS_REASONING_ARCH_PATTERN = /gemma.?4|phi.?[34]|nemotron/i;
+const ALWAYS_REASONING_TICK_MAX_TOKENS = 6000;
+
+export function resolveBridgeTickMaxTokens(arch: string): number | undefined {
+  return ALWAYS_REASONING_ARCH_PATTERN.test(arch) ? ALWAYS_REASONING_TICK_MAX_TOKENS : undefined;
 }
 
 function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
@@ -527,8 +550,20 @@ function getSessionLog(): SessionLog {
 }
 
 type PlanStepStatus = "pending" | "in_progress" | "done" | "blocked";
-type PlanStep = { index: number; description: string; status: PlanStepStatus; note?: string };
+type PlanStep = { index: number; description: string; status: PlanStepStatus; note?: string; thinking?: ReasoningEffort };
 type Plan = { goal: string; steps: PlanStep[]; createdAt: string; updatedAt: string };
+
+const REASONING_EFFORT_VALUES = ["off", "low", "medium", "high"] as const;
+
+// The step a bridge tick or agentic loop is currently working on: the first in_progress step, or
+// failing that the first pending one. Its `thinking` override (if any) takes precedence over the
+// session-wide reasoningEffort config, letting a plan mark individual steps as needing more/less
+// reasoning than the rest (e.g. "off" for a mechanical file write, "high" for a tricky refactor step).
+function currentPlanStepThinking(): ReasoningEffort | undefined {
+  const steps = activeSessionState.plan?.steps ?? [];
+  const step = steps.find((s) => s.status === "in_progress") ?? steps.find((s) => s.status === "pending");
+  return step?.thinking;
+}
 
 type SessionState = {
   sessionId: string;
@@ -636,6 +671,7 @@ function parsePersistedPlan(value: unknown): Plan | null {
         ? (s.status as PlanStepStatus)
         : "pending",
       note: typeof s.note === "string" ? s.note : undefined,
+      thinking: REASONING_EFFORT_VALUES.includes(s.thinking as ReasoningEffort) ? (s.thinking as ReasoningEffort) : undefined,
     }))
     .filter((s) => s.description.length > 0);
   // A goal-only plan (no steps yet) is valid: the auto-seeded session goal must survive persistence so
@@ -722,7 +758,19 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
     activeSessionBootstrapPromise = (async () => {
       const historyText = await readHistoryText(ctl);
       if (!historyText) {
+        // No history available at all (e.g. a vibe_bridge tick's internal ctl right after a hot
+        // reload/process restart wiped module state, before any real preprocessMessage call has run
+        // again). Session identity/counters can't be trusted, but — same as the fingerprint-mismatch
+        // branch below — the last-known plan/managed-context is still worth re-asserting instead of
+        // silently discarding it. Caught live: a mid-conversation `lms dev` rebuild dropped an
+        // in-progress plan entirely because this branch had no such fallback while the sibling one did.
         activeSessionState = createSessionState();
+        const persisted = readRuntimeStateSync();
+        if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
+          activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
+          activeSessionState.plan = persisted.plan ?? null;
+          activeSessionState.resumedFromPersistedState = true;
+        }
       } else {
         const historyFingerprint = fingerprintHistoryText(historyText);
         const persisted = readRuntimeStateSync();
@@ -1754,7 +1802,14 @@ export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashComman
 
 export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
   _bridgeClient = client ?? null;
-  const sessionState = await bootstrapSessionState(ctl, true);
+  // No force here: ToolsProviderController has no pullHistory() (unlike PromptPreprocessorController),
+  // so a forced bootstrap can never read real history and always falls back to a fresh session — wiping
+  // sessionId/turnCounter on every single call. toolsProvider() runs once per turn, so that discarded
+  // the session state preprocessMessage() had just correctly established moments earlier, every turn
+  // (caught live: sessionId regenerated and turnCounter stayed 0 across an entire multi-turn chat).
+  // The un-forced call reuses that state; the one legitimate resume-from-restart check still happens
+  // via whichever of preprocessMessage/toolsProvider runs first after a process restart.
+  const sessionState = await bootstrapSessionState(ctl);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
   activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
@@ -1983,10 +2038,17 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
     name: "create_plan",
     description: text`Creates or replaces the session's execution plan — an ordered list of concrete steps toward a goal.
 USE WHEN: a request needs more than one action to complete. Create the plan, THEN execute each step yourself with your other tools (bash_terminal, file tools, etc.) — do not just describe the plan to the user and stop. Before claiming a capability (node, npm, docker, cron, etc.) is missing, check it yourself with bash_terminal rather than assuming a bare environment.
-EXAMPLE: create_plan({ goal: "Set up a nightly backup of /data", steps: ["Check what's installed: which cron crontab", "Write backup script to /data/backup.sh", "Register the crontab entry", "Verify with crontab -l"] })`,
+Each step can optionally set "thinking" ("off"|"low"|"medium"|"high") to override the session's reasoning-effort setting just for that step — mark mechanical steps "off" and tricky ones "high" instead of applying one uniform level everywhere.
+EXAMPLE: create_plan({ goal: "Set up a nightly backup of /data", steps: ["Check what's installed: which cron crontab", { description: "Design the backup retention policy", thinking: "high" }, "Write backup script to /data/backup.sh", "Register the crontab entry", "Verify with crontab -l"] })`,
     parameters: {
       goal: z.string().min(1).max(2000),
-      steps: z.array(z.string().min(1).max(1000)).min(1).max(30),
+      steps: z.array(z.union([
+        z.string().min(1).max(1000),
+        z.object({
+          description: z.string().min(1).max(1000),
+          thinking: z.enum(REASONING_EFFORT_VALUES).optional(),
+        }),
+      ])).min(1).max(30),
       autoStart: z.boolean().optional().describe("Auto-start vibe_bridge (if enabled) so the plan keeps executing across ticks unattended. Defaults to true."),
     },
     implementation: async ({ goal, steps, autoStart }) => {
@@ -1995,7 +2057,9 @@ EXAMPLE: create_plan({ goal: "Set up a nightly backup of /data", steps: ["Check 
         goal,
         createdAt: now,
         updatedAt: now,
-        steps: steps.map((description, index) => ({ index, description, status: "pending" as const })),
+        steps: steps.map((s, index) => typeof s === "string"
+          ? { index, description: s, status: "pending" as const }
+          : { index, description: s.description, status: "pending" as const, thinking: s.thinking }),
       };
       writeRuntimeStateSync(activeSessionState);
       const shouldAutoStart = autoStart !== false;
@@ -2017,14 +2081,16 @@ EXAMPLE: update_plan_step({ index: 0, status: "done" })`,
       index: z.number().int().min(0),
       status: z.enum(["pending", "in_progress", "done", "blocked"]),
       note: z.string().max(1000).optional().describe("Context for the status change, required in practice when marking a step blocked"),
+      thinking: z.enum(REASONING_EFFORT_VALUES).optional().describe("Override the reasoning effort for this step (in place of the session-wide default) while it's current."),
     },
-    implementation: async ({ index, status, note }) => {
+    implementation: async ({ index, status, note, thinking }) => {
       const plan = activeSessionState.plan;
       if (!plan) return fail("No active plan. Call create_plan first.");
       const step = plan.steps[index];
       if (!step) return fail(`No step at index ${index}; plan has ${plan.steps.length} steps.`);
       step.status = status;
       if (note) step.note = note;
+      if (thinking) step.thinking = thinking;
       plan.updatedAt = new Date().toISOString();
       writeRuntimeStateSync(activeSessionState);
       return ok({ plan });
@@ -2660,9 +2726,11 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
           searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
           updatePlanStepTool, getPlanTool,
         ];
+        const bridgeTickMaxTokens = resolveBridgeTickMaxTokens(await getLoadedModelArch());
         await model.act(chat, bridgeTickTools, {
           maxPredictionRounds: resolveMaxThinkingSteps(ctl),
           signal: AbortSignal.timeout(VIBE_BRIDGE_TICK_TIMEOUT_MS),
+          ...(bridgeTickMaxTokens !== undefined ? { maxTokens: bridgeTickMaxTokens } : {}),
         });
 
         _bridgeConsecutiveFailures = 0;
