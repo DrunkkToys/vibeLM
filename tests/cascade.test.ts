@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
@@ -45,6 +45,15 @@ describe("vibeLM Cascade Integration", () => {
     mkdirSync(resolve(TEST_DIR, "src"), { recursive: true });
     writeFileSync(resolve(TEST_DIR, "src", "main.ts"), 'console.log("hello from vibeLM");\n');
     makeConfig();
+  });
+
+  beforeEach(() => {
+    // Each test expects a clean slate. bootstrapSessionState's "no history at all" path now correctly
+    // carries over a persisted plan/managedContextBlocks (fixed a live bug where a hot-reloaded/
+    // restarted process silently dropped an in-progress plan), so a plan left on disk by a previous
+    // test would otherwise leak forward into tests that expect no plan/no managed-context yet.
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    if (existsSync(rsPath)) rmSync(rsPath);
   });
 
   after(() => {
@@ -256,6 +265,73 @@ describe("vibeLM Cascade Integration", () => {
     assert.notEqual(genericHigh, "");
     assert.notEqual(genericMedium, genericHigh);
     assert.notEqual(genericLow, genericMedium);
+  });
+
+  it("resolveBridgeTickMaxTokens gives a generous floor to architectures that can't actually turn reasoning off (live-tested: gemma-4, phi-4-mini-reasoning, and Nemotron-H all kept producing full reasoning_content regardless of directive — LM Studio's own native reasoning API even outright rejected 'off' for phi-4-mini-reasoning), so a tight token budget can't silently starve the tick before it reaches its answer", async () => {
+    const { resolveBridgeTickMaxTokens } = await import("../src/toolsProvider");
+    // Confirmed-unsuppressable architectures from live testing get an explicit generous floor.
+    for (const arch of ["gemma4", "Gemma-4", "Phi-3", "phi-4", "nemotron_h_moe", "nemotron"]) {
+      assert.equal(resolveBridgeTickMaxTokens(arch), 6000, `${arch} should get the reasoning-safe token floor`);
+    }
+    // Architectures with a real, confirmed-working off-switch (or none of this baked-in behavior)
+    // are left alone — no artificial cap where the default already works fine.
+    for (const arch of ["qwen3", "gpt-oss", "Llama", "granitehybrid", "DeepSeek 2", "glm4v", ""]) {
+      assert.equal(resolveBridgeTickMaxTokens(arch), undefined, `${arch} should not get an artificial cap`);
+    }
+  });
+
+  it("reasoningDirectiveForSession lets a plan step's thinking override the session-wide reasoningEffort", async () => {
+    const { toolsProvider, reasoningDirectiveFor, reasoningDirectiveForSession, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      getPluginConfig: () => ({ get: (key: string) => (key === "tools.reasoningEffort" || key === "reasoningEffort") ? "high" : undefined }),
+    };
+    // Force the "no live LM Studio model" fallback (arch: "") so this test is deterministic whether
+    // or not a real LM Studio instance happens to be reachable at API_BASE while tests run.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new Error("no network in test"); }) as any;
+    try {
+      await resolveSessionStateFromHistory(ctl, true);
+      const tools = await toolsProvider(ctl);
+      const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+      const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+
+      // No plan yet: falls back to the session-wide config ("high").
+      const beforePlan = await reasoningDirectiveForSession(ctl);
+      assert.equal(beforePlan, reasoningDirectiveFor("high", ""));
+
+      // A step marked "off" should win over the session's "high" while it's the current (pending) step.
+      await createPlan.implementation({
+        goal: "test goal",
+        steps: [{ description: "a mechanical step", thinking: "off" }, "an ordinary step"],
+        autoStart: false,
+      });
+      const duringOffStep = await reasoningDirectiveForSession(ctl);
+      assert.equal(duringOffStep, reasoningDirectiveFor("off", ""));
+
+      // Marking it in_progress (still the current step) keeps the override in effect.
+      await updatePlanStep.implementation({ index: 0, status: "in_progress" });
+      const stillOverridden = await reasoningDirectiveForSession(ctl);
+      assert.equal(stillOverridden, reasoningDirectiveFor("off", ""));
+
+      // Once step 0 is done, the current step becomes step 1, which has no override — falls back to config.
+      await updatePlanStep.implementation({ index: 0, status: "done" });
+      const afterStepDone = await reasoningDirectiveForSession(ctl);
+      assert.equal(afterStepDone, reasoningDirectiveFor("high", ""));
+
+      // update_plan_step can also set/change a step's override directly.
+      await updatePlanStep.implementation({ index: 1, status: "in_progress", thinking: "low" });
+      const viaUpdateStep = await reasoningDirectiveForSession(ctl);
+      assert.equal(viaUpdateStep, reasoningDirectiveFor("low", ""));
+    } finally {
+      globalThis.fetch = originalFetch;
+      // Leaves a persisted plan on disk (config.json's runtime-state.json is shared across this whole
+      // file's tests). bootstrapSessionState's "no history at all" path now correctly carries over a
+      // persisted plan (fixed a live bug), so a leftover plan here would otherwise leak into later
+      // tests that expect a genuinely clean/no-plan slate.
+      const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+      if (existsSync(rsPath)) rmSync(rsPath);
+    }
   });
 
   it("captures vibeLM's own emitted directive into managedContextBlocks at emission time, bounded to the most recent one", async () => {
@@ -486,7 +562,11 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(rs.plan.goal, /Build a CLI/);
     assert.deepEqual(rs.plan.steps, [], "auto-goal seeds an empty step list so amend's pending-step guard stays satisfied");
 
-    // A short/command message must not seed a goal.
+    // A short/command message must not seed a goal. Clear the persisted plan from the phase above
+    // first: resolveSessionStateFromHistory's "no history at all" reset now correctly carries over a
+    // persisted plan instead of wiping it (fixed a live bug), so this phase needs an explicit clean
+    // slate rather than relying on that reset to discard the previous phase's plan.
+    if (existsSync(rsPath)) rmSync(rsPath);
     await resolveSessionStateFromHistory(ctl, true);
     await preprocessMessage("yes", ctl);
     const rs2 = JSON.parse(readFileSync(rsPath, "utf-8"));
@@ -539,6 +619,35 @@ describe("vibeLM Cascade Integration", () => {
     const afterTurn2 = JSON.parse(readFileSync(rsPath, "utf-8"));
 
     assert.equal(afterTurn2.sessionId, afterTurn1.sessionId, "sessionId must persist across turns in the same conversation, not regenerate every turn");
+  });
+
+  it("bootstrapSessionState carries over a persisted plan even when NO history is readable at all (live-testing regression: a mid-conversation lms-dev hot reload/process restart wipes module state, and the very next bootstrap call can come from a controller with no pullHistory — e.g. a vibe_bridge tick — before any real preprocessMessage call re-establishes history; the fingerprint-mismatch branch already carried the plan over in that case, but the 'no history at all' branch silently dropped it, discarding an in-progress plan the user was actively relying on)", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const preprocessCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a widget" }),
+    };
+    await resolveSessionStateFromHistory(preprocessCtl, true);
+    await preprocessMessage("Build a widget with a plan", preprocessCtl);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    await createPlan.implementation({ goal: "widget plan", steps: ["step one", "step two"], autoStart: false });
+    const beforeReload = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.ok(beforeReload.plan?.steps?.length === 2, "plan should be persisted before the simulated reload");
+
+    // Simulate a hot reload / process restart: fresh module-level state, and the very next call is a
+    // controller with no pullHistory at all (a vibe_bridge tick, or the real ToolsProviderController).
+    const noHistoryCtl: any = { getWorkingDirectory: () => TEST_DIR };
+    const resumed = await resolveSessionStateFromHistory(noHistoryCtl, true);
+
+    assert.ok(resumed.plan, "the persisted plan must survive a bootstrap with no readable history at all, not be silently dropped");
+    assert.equal(resumed.plan?.goal, "widget plan");
+    assert.equal(resumed.plan?.steps?.length, 2);
+    assert.equal(resumed.resumedFromPersistedState, true, "carrying over a persisted plan counts as a resume, not a fresh session");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
   });
 
   it("delete_file uses the filePath param name, consistent with read_file/write_file (caught live: model used filePath from those tools, delete_file rejected it)", async () => {

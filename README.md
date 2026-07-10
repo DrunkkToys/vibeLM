@@ -46,6 +46,7 @@ create_plan({
   goal: "Set up a nightly backup of /data",
   steps: [
     "Check what's installed: which cron crontab",
+    { description: "Design the backup retention policy", thinking: "high" },
     "Write backup script to /data/backup.sh",
     "Register the crontab entry",
     "Verify with crontab -l",
@@ -61,6 +62,7 @@ get_plan()
 - `amend` refuses to close out the session while the plan still has untouched (`pending`) steps — it points the model back at its own tools instead of letting it hand off a plan it never executed. Steps already attempted and marked `in_progress` or `blocked` do not block `amend`, so a model that got genuinely stuck can still report back.
 - `create_plan` accepts `autoStart` (default `true`): if `vibe_bridge` is enabled, creating a plan starts it automatically so unattended ticks keep making progress on the plan's next pending step — this is the "long-running execution" path for multi-step work.
 - Each `vibe_bridge` tick that runs while a plan is active gets the next pending step named explicitly in its prompt, and has `update_plan_step`/`get_plan` available so it can mark progress. `bash_terminal` is still excluded from unattended ticks (see Security below), so shell-dependent plan steps need an interactive turn to execute.
+- Each step can carry its own `thinking` override (`off`/`low`/`medium`/`high`, same values as `tools.reasoningEffort`) as either `{ description, thinking }` in `create_plan` or a `thinking` argument to `update_plan_step`. While a step is current — the first `in_progress` step, or failing that the first `pending` one — its override wins over the session-wide `tools.reasoningEffort` setting, so a plan can mark mechanical steps `off` and a genuinely tricky step `high` instead of applying one uniform level to every step.
 
 ## Autonomous Sessions (vibe_bridge)
 
@@ -113,6 +115,7 @@ Each keep-alive tick can call a curated set of tools (explore/list/read/write/ap
 - vibeLM sizes its prompt budget from the model's **loaded context length** — the value you actually configure when loading the model in LM Studio (read from `loaded_context_length` in the REST API), not the model's larger max ceiling. This is what makes auto-compaction fire in time: e.g. a model loaded at 40K compacts around 12K and warns around 20K, instead of never triggering because it assumed a 256K window.
 - `Max Effective Context (tokens)` is an optional hard cap on top of that. Default `0` uses the loaded window as-is. Set it only if your machine can't sustain even the configured length (e.g. a large vision model whose KV cache exhausts unified memory — note KV-cache quantization is not available for VLMs); vibeLM will then compact against this lower ceiling.
 - `Reasoning Effort` calibrates how much the model "thinks" before answering: `off` suppresses extended reasoning (leanest sessions, avoids reasoning-loop hangs), `low`/`medium`/`high` each produce a distinct, increasingly explicit directive to reason more thoroughly. Qwen models honor the `/no_think`/`/think` soft switch (with a graduated qualifier for the three "on" tiers, since the chat template itself only has a binary toggle); other architectures receive an equivalent graduated natural-language directive. The directive is applied to both interactive turns and unattended `vibe_bridge` ticks.
+  - Live-tested against real loaded models: this works reliably for Qwen (`reasoning_tokens: 1` under `/no_think`), but some newer architectures — Gemma-4-thinking, the Phi-4-reasoning family, Nemotron-H — keep reasoning through a separate `reasoning_content` channel regardless of the directive, NVIDIA's own `"detailed thinking off"` convention, or even LM Studio's native `reasoning` REST setting (which outright rejects `"off"` for phi-4-mini-reasoning: `"Supported settings: 'on'"`). For these, `off` won't reduce latency — but `vibe_bridge` still gives them a generous `maxTokens` floor (6000) so a long reasoning phase can't crowd out the tick's actual answer.
 - The `tools` section also exposes on/off toggles for the individual tools, so you can disable capabilities you do not want the orchestrator to use.
 - `amend` is gated so the orchestrator does not stop too early.
 - The plugin tries to stay under the model's prompt budget and auto-compacts when sessions get large.

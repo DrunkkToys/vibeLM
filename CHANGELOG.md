@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Plan steps can now override the session's `reasoningEffort` setting individually.** `create_plan`
+  accepts either a plain string or `{ description, thinking }` per step (`thinking` is
+  `"off"|"low"|"medium"|"high"`), and `update_plan_step` can set/change it later. When resolving the
+  thinking directive for a bridge tick, the current step's override (the first `in_progress` step, or
+  failing that the first `pending` one) wins over the session-wide config. This lets one plan mark
+  mechanical steps "off" and a tricky step "high" instead of applying one uniform reasoning level to
+  every step — the per-model-family directive mapping (`reasoningDirectiveFor`) already handled Qwen's
+  binary `/think`/`/no_think` switch, gpt-oss's native Harmony tiers, and a generic natural-language
+  fallback for everything else, so this only needed a new *source* for which effort to apply, not new
+  per-family logic.
+
+- **`vibe_bridge` ticks now give a generous `maxTokens` floor (6000) to architectures whose reasoning
+  can't actually be turned off**, instead of leaving it uncapped or subject to whatever ambient
+  per-model limit LM Studio applies. Live-tested against real loaded models across gpt-oss-20b,
+  qwen3-4b, google/gemma-4-e4b, microsoft/phi-4-mini-reasoning, and nvidia/nemotron-3-nano-omni:
+  qwen3's native `/no_think` switch works correctly (`reasoning_tokens: 1`), but gemma-4 and
+  Nemotron-H kept producing full `reasoning_content` regardless of vibeLM's directive *or* NVIDIA's
+  own documented `"detailed thinking off"`/`<thought off>` conventions, and LM Studio's own native
+  `reasoning` REST setting (`/api/v1/chat`) outright rejected `"off"` for phi-4-mini-reasoning with
+  `"Supported settings: 'on'"` — i.e. LM Studio itself confirms there is no off-switch for that model.
+  Under a tight token budget this reasoning can consume the entire allowance before the model reaches
+  its answer — reproduced live on phi-4-mini-reasoning, which returned empty `content` with
+  `finish_reason: "length"` after burning 396 of 400 tokens on reasoning alone. `resolveBridgeTickMaxTokens(arch)`
+  now detects this class of architecture (`gemma.?4|phi.?[34]|nemotron`) and gives it explicit headroom
+  so a verbose reasoning phase can't silently starve the tick of room for its actual answer/tool call.
+
 ### Fixed
+- **A mid-conversation `lms dev` hot reload (or plugin process restart) could silently drop an
+  in-progress plan instead of resuming it.** `bootstrapSessionState()` had two paths for "the raw
+  conversation history can't be matched against what was persisted": one for "history exists but its
+  fingerprint doesn't match" (already correctly carried the last-known `plan`/`managedContextBlocks`
+  forward) and one for "no history could be read at all" (hard-reset to a blank session, no carryover).
+  The second path fires whenever the very first bootstrap call after a reload comes from a controller
+  with no `pullHistory()` — which is exactly what happens when `vibe_bridge`'s background tick runs
+  before any real `preprocessMessage()` call re-establishes history. Caught live: editing `toolsProvider.ts`
+  while a real `vibe_bridge`-driven session was mid-plan triggered esbuild's watch rebuild, and the next
+  tick came up with a brand-new `sessionId` and an empty plan — even though the plan was still sitting in
+  `runtime-state.json` on disk the whole time. The no-history path now carries over the persisted plan
+  and `managedContextBlocks` the same way the fingerprint-mismatch path already did.
+
 - **Every real conversation turn silently started a brand-new session, resetting `turnCounter` to 0 and
   making auto-compaction, session-scoped fact-dedup, and the context-spine resume mechanism unreachable
   in production.** `toolsProvider()` forced a session-state re-bootstrap on every call using its own
