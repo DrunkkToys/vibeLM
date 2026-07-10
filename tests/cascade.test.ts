@@ -334,4 +334,40 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(tripIndex, 4, "guard should trip on the 5th consecutive same-program probe");
     assert.match(loopError as string, /change strategy|amend/i, "the steering message must point the model to a new approach");
   });
+
+  it("distils tool results into deduped facts instead of dumping raw result blobs", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    assert.ok(bash?.implementation, "bash_terminal must be present");
+
+    // Four distinct failing `ls` probes (stays under the 5-call loop guard) + one successful command.
+    for (const path of ["/vibelm-nope-a", "/vibelm-nope-b", "/vibelm-nope-c", "/vibelm-nope-d"]) {
+      await bash.implementation({ command: `ls ${path}` }, {});
+    }
+    await bash.implementation({ command: "echo vibelm-ok" }, {});
+
+    // The wrapper syncs the session it actually used to runtime-state on every turn; read it back so we
+    // filter the log by the correct session id (toolsProvider re-bootstraps its own session).
+    const sid = JSON.parse(readFileSync(resolve(CONFIG_DIR, "runtime-state.json"), "utf-8")).sessionId;
+
+    const logPath = resolve(CONFIG_DIR, "session-log.jsonl");
+    const mems = readFileSync(logPath, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((e: any) => e.type === "mem" && e.sessionId === sid);
+
+    const lsFails = mems.filter((m: any) => (m.tags || []).includes("fact:bash_terminal:ls:fail"));
+    assert.equal(lsFails.length, 1, "four equivalent failing probes must collapse to a single deduped fact");
+    assert.match(lsFails[0].content, /^bash_terminal `ls .*` → failed/, "the fact must be a distilled one-liner");
+    assert.ok(!lsFails[0].content.includes('{"ok"'), "the fact must not be a raw result blob");
+
+    const echoOk = mems.filter((m: any) => (m.tags || []).includes("fact:bash_terminal:echo:ok"));
+    assert.equal(echoOk.length, 1, "a successful command records its own outcome fact");
+    assert.match(echoOk[0].content, /→ ok/, "success is distilled as an ok outcome");
+  });
 });

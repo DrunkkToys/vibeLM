@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Memory now stores distilled, deduplicated facts instead of raw tool-result dumps.** Every non-read
+  tool call used to append the full (truncated) result blob to memory and a contentless
+  `called X — result ok=true` checkpoint, so a probing loop produced dozens of near-identical entries
+  that made `search_memory` return noise and told the model nothing it could act on (observed live: 32
+  blob memories + 27 empty checkpoints in one session). Results are now distilled into a compact
+  one-line fact keyed by a coarse signature (shell program + outcome), and equivalent facts are
+  deduped within a recent window — so 24 failing `ls <path>` probes collapse to a single
+  `bash_terminal \`ls …\` → failed: …` fact, and checkpoints carry that same distilled line. The
+  verbatim result is still kept on the turn entry, so recent-context fidelity is unchanged.
+
 ### Fixed
 - **Loop guard missed semantic loops, so the agent could burn a whole session going nowhere.** The
   guard only caught a model that repeated an *identical* call verbatim; it keyed on the exact

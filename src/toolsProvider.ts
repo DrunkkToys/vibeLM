@@ -1065,6 +1065,50 @@ function stringifyToolResult(result: unknown): string {
   }
 }
 
+const FACT_DETAIL_CHARS = 160;
+const FACT_ARG_CHARS = 120;
+// How many recent log entries to scan when deduping a distilled fact. ~3 entries are written per turn
+// (turn + memory + occasional checkpoint), so this covers roughly the last ~20 turns — enough for a
+// consecutive probing loop to collapse to a single fact.
+const FACT_DEDUP_SCAN = 60;
+
+// Classify a tool result into a coarse outcome plus a short human-readable detail. Shell tools report
+// success/failure through the command's exitCode (a failed command still returns ok:true at the tool
+// layer), so they're inspected specially; everything else keys off the tool's own ok flag.
+function classifyToolOutcome(name: string, result: unknown): { outcome: "ok" | "fail" | "info"; detail: string } {
+  const data = unwrapToolResult(result);
+  if (SHELL_TOOLS.has(name) && data && typeof data === "object" && typeof (data as any).exitCode === "number") {
+    const d = data as { exitCode: number; stdout?: string; stderr?: string; error?: string };
+    if (d.exitCode === 0) return { outcome: "ok", detail: truncateText((d.stdout || "").trim(), FACT_DETAIL_CHARS) };
+    return { outcome: "fail", detail: truncateText((d.stderr || d.error || `exit ${d.exitCode}`).trim(), FACT_DETAIL_CHARS) };
+  }
+  if (result && typeof result === "object" && "ok" in result) {
+    if ((result as any).ok === false) {
+      return { outcome: "fail", detail: truncateText(String((result as any).error || "").trim(), FACT_DETAIL_CHARS) };
+    }
+    return { outcome: "ok", detail: "" };
+  }
+  return { outcome: "info", detail: "" };
+}
+
+// Turn a tool call + result into a compact, deduplicable fact instead of dumping the raw (truncated)
+// result blob into memory. `key` groups equivalent calls — for shell tools it's the program name and
+// outcome, so 24 failing `ls <different path>` probes all share `bash_terminal:ls:fail` and collapse
+// to one memory instead of 24 near-identical blobs.
+function distillToolFact(name: string, args: Record<string, unknown>, result: unknown): { key: string; fact: string } {
+  const { outcome, detail } = classifyToolOutcome(name, result);
+  const key = `${coarseToolSignature(name, args)}:${outcome}`;
+  const argHint = SHELL_TOOLS.has(name) && typeof args.command === "string"
+    ? truncateText(args.command.trim(), FACT_ARG_CHARS)
+    : typeof args.path === "string" ? args.path
+    : typeof args.file === "string" ? args.file
+    : typeof args.query === "string" ? truncateText(args.query.trim(), FACT_ARG_CHARS)
+    : "";
+  const verb = outcome === "ok" ? "ok" : outcome === "fail" ? "failed" : "done";
+  const fact = `${name}${argHint ? ` \`${argHint}\`` : ""} → ${verb}${detail ? `: ${detail}` : ""}`;
+  return { key, fact };
+}
+
 type CompactCodeSnippet = {
   source: string;
   path?: string;
@@ -1604,14 +1648,24 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
       };
       log.startTurn(turnEntry);
+      // Distil the call into a compact, deduplicable fact rather than dumping the raw result blob.
+      // Equivalent calls (same shell program + outcome) share a `fact:` key, so a probing loop
+      // collapses to one memory instead of dozens of near-identical entries that only add retrieval
+      // noise. Computed once and reused for the checkpoint summary below.
+      const distilled = distillToolFact(name, args, result);
       if (!readOnlyTools.includes(name) && !["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
-        const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`], currentSessionId(state), workspace || "", "workspace");
-        log.saveMemory(tags, `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
+        const factTag = `fact:${distilled.key}`;
+        const recentMems = log.readRecentMemories(FACT_DEDUP_SCAN, currentSessionId(state));
+        const alreadyKnown = recentMems.some((m) => Array.isArray(m.tags) && m.tags.includes(factTag));
+        if (!alreadyKnown) {
+          const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`, factTag], currentSessionId(state), workspace || "", "workspace");
+          log.saveMemory(tags, distilled.fact, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
+        }
       }
 
       if (shouldSaveCheckpoint(state)) {
         log.saveCheckpoint(
-          `Turn ${state.turnCounter}: called ${name} — result ok=${result?.ok}`,
+          `Turn ${state.turnCounter}: ${distilled.fact}`,
           ["checkpoint", `turn:${state.turnCounter}`],
           state.turnCounter,
           currentSessionId(state),
