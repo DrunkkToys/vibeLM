@@ -4,8 +4,8 @@
 .codex-logs/
 .codex/
 .codex*
-.claude/
-.claude*
+.claude/*
+!.claude/skills/
 .opencode/
 .opencode*
 node_modules
