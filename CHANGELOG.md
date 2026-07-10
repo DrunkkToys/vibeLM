@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deduped within a recent window — so 24 failing `ls <path>` probes collapse to a single
   `bash_terminal \`ls …\` → failed: …` fact, and checkpoints carry that same distilled line. The
   verbatim result is still kept on the turn entry, so recent-context fidelity is unchanged.
+  Deduplication is coarse only for failures/info (the noise a probing storm produces); successful
+  calls are keyed on their exact signature so distinct results (e.g. `cat a.txt` vs `cat b.txt`) are
+  each retained rather than collapsed. That success key is a **hash** of the signature, never the raw
+  args, so secret arguments such as `ssh_exec`'s password can't leak into the persisted `fact:`
+  memory tag.
 
 ### Fixed
 - **Loop guard missed semantic loops, so the agent could burn a whole session going nowhere.** The

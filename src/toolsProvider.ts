@@ -1095,9 +1095,22 @@ function classifyToolOutcome(name: string, result: unknown): { outcome: "ok" | "
 // result blob into memory. `key` groups equivalent calls — for shell tools it's the program name and
 // outcome, so 24 failing `ls <different path>` probes all share `bash_terminal:ls:fail` and collapse
 // to one memory instead of 24 near-identical blobs.
-function distillToolFact(name: string, args: Record<string, unknown>, result: unknown): { key: string; fact: string } {
+export function distillToolFact(name: string, args: Record<string, unknown>, result: unknown): { key: string; fact: string } {
   const { outcome, detail } = classifyToolOutcome(name, result);
-  const key = `${coarseToolSignature(name, args)}:${outcome}`;
+  // A successful call usually carries distinct information worth keeping on its own (e.g. `cat a.txt`
+  // vs `cat b.txt` return different content), so key those on the exact signature — only true
+  // duplicates collapse. Failures and info are the noise we want to fold together: a probing storm
+  // (24 failing `ls <different path>`) shares one coarse `program:fail` key and dedupes to a single
+  // fact. Keying successes coarsely too would silently drop every distinct successful result but the
+  // first — a real data-loss bug caught in live testing.
+  //
+  // The success key is a HASH of the exact signature, never the raw signature: args can contain
+  // secrets (e.g. ssh_exec's `password`), and this key is persisted as a `fact:` memory tag, so
+  // embedding the raw args would leak credentials into stored/replayed context.
+  const dedupeBasis = outcome === "ok"
+    ? `${name}:#${createHash("sha256").update(toolSignature(name, args)).digest("hex").slice(0, 12)}`
+    : coarseToolSignature(name, args);
+  const key = `${dedupeBasis}:${outcome}`;
   const argHint = SHELL_TOOLS.has(name) && typeof args.command === "string"
     ? truncateText(args.command.trim(), FACT_ARG_CHARS)
     : typeof args.path === "string" ? args.path

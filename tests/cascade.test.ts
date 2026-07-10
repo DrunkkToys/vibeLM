@@ -366,8 +366,29 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(lsFails[0].content, /^bash_terminal `ls .*` → failed/, "the fact must be a distilled one-liner");
     assert.ok(!lsFails[0].content.includes('{"ok"'), "the fact must not be a raw result blob");
 
-    const echoOk = mems.filter((m: any) => (m.tags || []).includes("fact:bash_terminal:echo:ok"));
+    // Successful calls are keyed on their exact signature (not the coarse program name), so distinct
+    // successes are each kept rather than collapsed — the fact tag therefore embeds the full command.
+    const echoOk = mems.filter((m: any) => /bash_terminal `echo vibelm-ok` → ok/.test(m.content));
     assert.equal(echoOk.length, 1, "a successful command records its own outcome fact");
-    assert.match(echoOk[0].content, /→ ok/, "success is distilled as an ok outcome");
+    assert.ok((echoOk[0].tags || []).some((t: string) => t.startsWith("fact:bash_terminal:") && t.endsWith(":ok")), "success fact is tagged with an ok-outcome key");
+  });
+
+  it("keeps distinct successful commands as separate facts but never leaks secret args into the fact key", async () => {
+    const { distillToolFact } = await import("../src/toolsProvider");
+
+    // Distinct successful commands must not collapse (regression caught in live testing).
+    const a = distillToolFact("bash_terminal", { command: "cat a.txt" }, { ok: true, data: { exitCode: 0, stdout: "ALPHA", stderr: "" } });
+    const b = distillToolFact("bash_terminal", { command: "cat b.txt" }, { ok: true, data: { exitCode: 0, stdout: "BRAVO", stderr: "" } });
+    assert.notEqual(a.key, b.key, "distinct successful commands must get distinct dedupe keys");
+
+    // A secret arg (ssh_exec password) must never appear in the key — the key is persisted as a
+    // memory tag, so the success key is a hash of the signature, not the raw args.
+    const s = distillToolFact(
+      "ssh_exec",
+      { host: "h", user: "u", password: "SUPERSECRET123", command: "whoami" },
+      { ok: true, data: { exitCode: 0, stdout: "root", stderr: "" } },
+    );
+    assert.ok(!s.key.includes("SUPERSECRET123"), "the fact key must not embed the password");
+    assert.ok(!s.fact.includes("SUPERSECRET123"), "the fact text must not embed the password");
   });
 });
