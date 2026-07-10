@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Importance-tiered context budgeting (Layer 3).** Replaces the blunt fixed limits with tiers keyed
+  on importance:
+  - **Tool-result retention** is no longer a flat 500-char cap for every tool. Information-bearing
+    reads/searches keep up to 1500 chars, failures keep 300 (they're already distilled into a fact),
+    everything else keeps 500 — so a 3 KB file read now survives on the turn log instead of losing 83%
+    of itself the same way a one-line failed probe did.
+  - **The pinned head (context spine) is assembled tier-by-tier under a char budget** (20% of the
+    context window, so it scales with the model) instead of a fixed fact count: goal + plan are pinned
+    first, then established facts fill whatever budget remains.
+  - **The session goal is auto-populated into the persisted `plan` field** from the first substantive
+    request, so the pinned head has a goal to anchor to even when the model never calls `create_plan`.
+    `parsePersistedPlan` now accepts a goal-only plan (previously it silently dropped any plan with
+    zero steps, which would have discarded the auto-goal on the next read).
+  - **The working-window FIFO is now head+tail retention** — it pins the first turn (the session
+    anchor) plus the most recent turns and cuts the middle, instead of rolling the oldest (the goal)
+    off first.
+
 - **Cut-the-middle context retention via a pinned "context spine".** Previously, when the LM Studio
   host rolled raw history it dropped the *oldest* turns first — the goal and everything the agent had
   established — and vibeLM only re-asserted its last directive, so early context was effectively lost

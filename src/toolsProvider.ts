@@ -25,6 +25,18 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 const PROMPT_BUDGET_RATIO = 0.50;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
+// Importance tiers for how much of a tool result is kept verbatim on the turn log. Flat truncation
+// treated a 2 KB file read the same as a one-line failed probe; tiering keeps more of what carries
+// information (reads/searches) and less of the noise we already distil into a fact (failures).
+const TOOL_RESULT_CHARS_HIGH = 1500;
+const TOOL_RESULT_CHARS_LOW = 300;
+const HIGH_VALUE_RESULT_TOOLS = new Set([
+  "read_file", "search_files", "list_files", "explore_workspace", "web_search",
+  "get_config", "get_plan", "list_memories", "search_memory",
+]);
+// Fraction of the context window reserved for the pinned head (goal/plan + established facts). The
+// spine is assembled tier-by-tier to fit this budget instead of a fixed fact count.
+const HEAD_BUDGET_RATIO = 0.20;
 const COMPACT_CONTEXT_TRIGGER_TURNS = 5;
 const COMPACT_CONTEXT_TRIGGER_RATIO = 0.30;
 const COMPACT_CONTEXT_MIN_GAP_TURNS = 3;
@@ -614,7 +626,7 @@ function fingerprintHistoryText(historyText: string): string {
 function parsePersistedPlan(value: unknown): Plan | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<Plan>;
-  if (typeof candidate.goal !== "string" || !Array.isArray(candidate.steps)) return null;
+  if (typeof candidate.goal !== "string" || candidate.goal.trim().length === 0 || !Array.isArray(candidate.steps)) return null;
   const steps: PlanStep[] = (candidate.steps as unknown[])
     .filter((s): s is Partial<PlanStep> => !!s && typeof s === "object")
     .map((s, i) => ({
@@ -626,7 +638,9 @@ function parsePersistedPlan(value: unknown): Plan | null {
       note: typeof s.note === "string" ? s.note : undefined,
     }))
     .filter((s) => s.description.length > 0);
-  if (steps.length === 0) return null;
+  // A goal-only plan (no steps yet) is valid: the auto-seeded session goal must survive persistence so
+  // the pinned head can anchor to it even before the model calls create_plan. Only a missing/empty
+  // goal makes a plan meaningless.
   return {
     goal: candidate.goal,
     steps,
@@ -1056,12 +1070,21 @@ function unwrapToolResult(result: any): any {
   return result;
 }
 
-function stringifyToolResult(result: unknown): string {
+// Importance-tiered budget for how many chars of a result to keep verbatim. Information-bearing reads
+// and searches get the high tier; failures get the low tier (already distilled into a fact); everything
+// else gets the default. Replaces the old flat MAX_TOOL_RESULT_CHARS applied to every tool alike.
+export function resultCharBudget(name: string | undefined, result: unknown): number {
+  if (name && HIGH_VALUE_RESULT_TOOLS.has(name)) return TOOL_RESULT_CHARS_HIGH;
+  if (classifyToolOutcome(name ?? "", result).outcome === "fail") return TOOL_RESULT_CHARS_LOW;
+  return MAX_TOOL_RESULT_CHARS;
+}
+
+function stringifyToolResult(result: unknown, name?: string): string {
+  const cap = resultCharBudget(name, result);
   try {
-    const text = JSON.stringify(result);
-    return truncateText(text, MAX_TOOL_RESULT_CHARS);
+    return truncateText(JSON.stringify(result), cap);
   } catch {
-    return truncateText(String(result), MAX_TOOL_RESULT_CHARS);
+    return truncateText(String(result), cap);
   }
 }
 
@@ -1649,7 +1672,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       }
 
       const log = getSessionLog();
-      const serializedResult = stringifyToolResult(result);
+      const serializedResult = stringifyToolResult(result, name);
       const workspace = currentWorkspacePath(ctx) || undefined;
       const turnEntry: TurnEntry = {
         type: "turn",
@@ -2821,6 +2844,16 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     }
   }
 
+  // Populate the persisted plan's goal from the first substantive request so the pinned head always
+  // has a goal to anchor to, even when the model never calls create_plan. A real create_plan later
+  // overwrites this with concrete steps; here we only seed goal + empty steps (so amend's pending-step
+  // guard stays satisfied). Skipped for commands/continuations, which aren't goals.
+  if (!activeSessionState.plan && isGoalLikeMessage(t)) {
+    const now = new Date().toISOString();
+    activeSessionState.plan = { goal: truncateText(t, 300), steps: [], createdAt: now, updatedAt: now };
+    writeRuntimeStateSync(activeSessionState);
+  }
+
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
   if (wsMatch) {
     const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
@@ -2919,17 +2952,49 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
 // re-injected after a roll. The middle is deliberately NOT reproduced — only its distilled facts
 // survive — and the recent tail is whatever the host still holds. Returns null when there's no head
 // worth pinning yet.
-const SPINE_MAX_FACTS = 8;
-export function buildContextSpine(session: SessionLog, state: SessionState): string | null {
-  const parts: string[] = [];
+// Whether a user message reads like a task goal worth pinning (vs. a command, continuation, or query
+// handled by its own preprocessor branch). Deliberately conservative — a false negative just means no
+// auto-goal, whereas a false positive would pin noise as the session's goal.
+function isGoalLikeMessage(t: string): boolean {
+  if (t.length < 15) return false;
+  if (CONTINUATION_PATTERN.test(t)) return false;
+  if (/^(?:set|pick|change|switch|go\s+to)\s+workspace\b/i.test(t) || /^workspace\b/i.test(t)) return false;
+  if (/^(?:search|find|google|look\s+up|lookup|bing)\b/i.test(t)) return false;
+  if (/^(?:calc|calculate|compute)\b/i.test(t) || /\d\s*[-+*/]\s*\d/.test(t)) return false;
+  return true;
+}
+
+// Hard ceiling on pinned facts even if the char budget would allow more — keeps the head scannable.
+const SPINE_MAX_FACTS = 15;
+export function headBudgetChars(contextWindow: number): number {
+  return estimateCharsFromTokens(Math.max(256, Math.floor(contextWindow * HEAD_BUDGET_RATIO)));
+}
+// Assemble the pinned head tier-by-tier under a char budget, highest priority first:
+//   Tier 1 (pinned):  goal + plan step statuses — always included.
+//   Tier 2 (fill):    established facts, newest-first, as many as the remaining budget allows.
+// This replaces the fixed fact count with importance-tiered budgeting: the goal/plan is never dropped,
+// and facts fill whatever head budget the context window affords.
+export function buildContextSpine(session: SessionLog, state: SessionState, maxChars: number = 6000): string | null {
+  const header = `${MANAGED_CONTEXT_MARKER}\n[Context spine — pinned so it survives history rolls; do not restate, just build on it]`;
+  const tiers: string[] = [];
+  let used = header.length;
+
+  // Tier 1: goal + plan. Pinned — added even if it consumes most of the budget.
   if (state.plan) {
-    parts.push(`[Goal] ${truncateText(state.plan.goal, 300)}`);
+    const goalBlock = `[Goal] ${truncateText(state.plan.goal, 300)}`;
+    tiers.push(goalBlock);
+    used += goalBlock.length + 1;
     const steps = state.plan.steps
       .map((s) => `  ${s.index}. [${s.status}] ${truncateText(s.description, 120)}`)
       .join("\n");
-    if (steps) parts.push(`[Plan]\n${steps}`);
+    if (steps) {
+      const planBlock = `[Plan]\n${steps}`;
+      tiers.push(planBlock);
+      used += planBlock.length + 1;
+    }
   }
-  // Top established facts — what the agent has learned, which would otherwise roll off the head.
+
+  // Tier 2: established facts — what the agent has learned, which would otherwise roll off the head.
   const isFact = (m: MemoryEntry) => Array.isArray(m.tags) && m.tags.some((t) => t.startsWith("fact:"));
   let facts = session.readRecentMemories(FACT_DEDUP_SCAN, currentSessionId(state)).filter(isFact);
   if (facts.length === 0) {
@@ -2939,10 +3004,17 @@ export function buildContextSpine(session: SessionLog, state: SessionState): str
     // after a roll those are still this session's, just recorded under the previous id.
     facts = session.readRecentMemories(FACT_DEDUP_SCAN).filter(isFact);
   }
-  const factLines = facts.slice(-SPINE_MAX_FACTS).map((m) => `  - ${truncateText(m.content, FACT_DETAIL_CHARS)}`);
-  if (factLines.length) parts.push(`[Established facts]\n${factLines.join("\n")}`);
-  if (parts.length === 0) return null;
-  return `${MANAGED_CONTEXT_MARKER}\n[Context spine — pinned so it survives history rolls; do not restate, just build on it]\n${parts.join("\n")}`;
+  const factLines: string[] = [];
+  for (let i = facts.length - 1; i >= 0 && factLines.length < SPINE_MAX_FACTS; i--) {
+    const line = `  - ${truncateText(facts[i].content, FACT_DETAIL_CHARS)}`;
+    if (used + line.length + 1 > maxChars) break;
+    factLines.unshift(line);
+    used += line.length + 1;
+  }
+  if (factLines.length) tiers.push(`[Established facts]\n${factLines.join("\n")}`);
+
+  if (tiers.length === 0) return null;
+  return `${header}\n${tiers.join("\n")}`;
 }
 
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
@@ -2953,7 +3025,7 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   // Rebuild the pinned head BEFORE consuming state below. It's built whenever we resumed from
   // persisted state (a detected roll/restart) — the exact moment the host has dropped the head.
   const spine = activeSessionState.resumedFromPersistedState
-    ? buildContextSpine(getSessionLog(), activeSessionState)
+    ? buildContextSpine(getSessionLog(), activeSessionState, headBudgetChars(await getContextWindow(ctl as any)))
     : null;
   if (rehydrationBlocks || spine) {
     // Consume immediately so it only fires once, and so preprocessMessageCore's own

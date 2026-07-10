@@ -425,4 +425,74 @@ describe("vibeLM Cascade Integration", () => {
     const emptyLog = new SessionLog(resolve(CONFIG_DIR, `spine-empty-${Date.now()}.jsonl`));
     assert.equal(buildContextSpine(emptyLog, { sessionId: "empty", plan: null } as any), null, "no head to pin → null");
   });
+
+  it("importance-tiered tool-result caps: reads keep more, failures keep less", async () => {
+    const { resultCharBudget } = await import("../src/toolsProvider");
+    assert.equal(resultCharBudget("read_file", { ok: true, data: "x".repeat(9000) }), 1500, "reads get the high tier");
+    assert.equal(resultCharBudget("search_files", { ok: true, data: [] }), 1500, "searches get the high tier");
+    assert.equal(resultCharBudget("bash_terminal", { ok: true, data: { exitCode: 1, stderr: "nope" } }), 300, "failures get the low tier");
+    assert.equal(resultCharBudget("generate_uuid", { ok: true, data: "abc" }), 500, "everything else gets the default tier");
+  });
+
+  it("buildContextSpine budgets tiers: goal pinned, facts fill remaining budget", async () => {
+    const { buildContextSpine, headBudgetChars } = await import("../src/toolsProvider");
+    const { SessionLog } = await import("../src/sessionLog");
+    const log = new SessionLog(resolve(CONFIG_DIR, `budget-${Date.now()}.jsonl`));
+    const sid = "budget-sess";
+    for (let i = 0; i < 12; i++) {
+      log.saveMemory([`fact:x:${i}:ok`, `session:${sid}`], `established fact number ${i} with some descriptive content`, i, sid, "/ws", "workspace");
+    }
+    const state: any = { sessionId: sid, plan: { goal: "SHIP-THE-THING", steps: [{ index: 1, description: "do it", status: "pending" }], createdAt: "", updatedAt: "" } };
+
+    // Tight budget: goal/plan is pinned (Tier 1), facts (Tier 2) don't fit.
+    const tight = buildContextSpine(log, state, 40) as string;
+    assert.match(tight, /SHIP-THE-THING/, "goal is pinned even under a tiny budget");
+    assert.ok(!/Established facts/.test(tight), "facts are dropped when the budget can't fit them");
+
+    // Roomy budget: facts fill the remaining space.
+    const roomy = buildContextSpine(log, state, 6000) as string;
+    assert.match(roomy, /Established facts/, "facts fill the head when budget allows");
+
+    // Head budget scales with the context window.
+    assert.ok(headBudgetChars(32768) > headBudgetChars(8192), "bigger context → bigger head budget");
+  });
+
+  it("auto-populates plan.goal from the first substantive request, but not from commands", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const ctl = makeCtl();
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Build a CLI that parses CSV files and outputs JSON", ctl);
+    const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.ok(rs.plan, "plan should be auto-populated from a substantive goal");
+    assert.match(rs.plan.goal, /Build a CLI/);
+    assert.deepEqual(rs.plan.steps, [], "auto-goal seeds an empty step list so amend's pending-step guard stays satisfied");
+
+    // A short/command message must not seed a goal.
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("yes", ctl);
+    const rs2 = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(rs2.plan, null, "continuations/commands do not become the session goal");
+  });
+
+  it("a goal-only auto-plan survives the persisted round-trip and is restored on resume after a roll", async () => {
+    const { resolveSessionStateFromHistory, preprocessMessage } = await import("../src/toolsProvider");
+    let history = "conversation head one";
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      getPluginConfig: () => ({ get: (k: string) => (k.endsWith("maxOrchestratorTurns") ? 0 : undefined) }),
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Implement a CSV to JSON converter with unit tests", ctl);
+
+    // Roll the raw history so the fingerprint mismatches — the resume path re-reads the persisted plan
+    // through parsePersistedPlan, which previously discarded any plan with zero steps (the auto-goal).
+    history = "totally different head after a roll";
+    const resumed: any = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(resumed.resumedFromPersistedState, true, "a roll is detected as a resume");
+    assert.ok(resumed.plan, "the goal-only plan must survive the persisted round-trip");
+    assert.match(resumed.plan.goal, /CSV to JSON/, "the restored goal is intact");
+  });
 });

@@ -149,8 +149,17 @@ export class SessionLog {
     this.turnCounter = entry.turn;
     this.workingWindow.push(entry);
     this.jsonl.append(entry as unknown as JsonlEntry);
+    // Head+tail retention instead of a pure-tail FIFO: when the window overflows, keep the FIRST turn
+    // (the session anchor — the request/goal that a plain .shift() would drop first) plus the most
+    // recent maxWindow-1 turns. The middle is what gets cut. maxWindow<=1 degenerates to tail-only.
     if (this.workingWindow.length > this.maxWindow) {
-      this.workingWindow.shift();
+      if (this.maxWindow <= 1) {
+        this.workingWindow = this.workingWindow.slice(-this.maxWindow);
+      } else {
+        const head = this.workingWindow.slice(0, 1);
+        const tail = this.workingWindow.slice(-(this.maxWindow - 1));
+        this.workingWindow = [...head, ...tail];
+      }
     }
   }
 
