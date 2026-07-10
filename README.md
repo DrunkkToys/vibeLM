@@ -38,13 +38,10 @@ It doesn't pretend local models behave like hosted frontier systems — it makes
 
 ## Autonomous Sessions (vibe_bridge)
 
-`vibe_bridge` keeps the session alive without user input by periodically injecting a prompt into the chat.
+`vibe_bridge` keeps the session alive without user input by periodically injecting a prompt into the chat. Enabling the `tools.vibe_bridge` toggle in plugin settings auto-starts it with the configured defaults below — no chat message needed. The tool is still available for starting it with different one-off settings, checking status, or stopping it early.
 
 ```bash
-# Start with defaults (configured in plugin settings)
-vibe_bridge({ action: "start" })
-
-# Start with custom settings
+# Start with custom settings (overrides the auto-started defaults for this run)
 vibe_bridge({
   action: "start",
   prompt: "Continue implementing the feature",
@@ -65,7 +62,7 @@ In LM Studio plugin settings (`tools.*`):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `tools.vibe_bridge` | boolean | `false` | Enable the tool |
+| `tools.vibe_bridge` | boolean | `false` | Enable the tool and auto-start it with the settings below |
 | `tools.vibe_bridge_prompt` | string | `"Check progress to reach your goal, if you are failing adjust trajectory."` | Default injection prompt |
 | `tools.vibe_bridge_interval` | number | `600` | Seconds between injections |
 | `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
