@@ -513,6 +513,34 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(resumed.plan.goal, /CSV to JSON/, "the restored goal is intact");
   });
 
+  it("toolsProvider() must not discard session identity every turn (live-testing regression: the real ToolsProviderController has no pullHistory, so a forced bootstrap there always manufactured a brand-new session, resetting turnCounter to 0 on every single turn and making auto-compaction/fact-dedup/spine-resume unreachable in production)", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    // preprocessMessage's controller has pullHistory (matches the real PromptPreprocessorController).
+    let history = "Turn 1: build a widget";
+    const preprocessCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    // toolsProvider's controller has no pullHistory — matches the real ToolsProviderController, which
+    // is an empty class per the SDK's own type definitions.
+    const toolsProviderCtl = makeCtl();
+
+    await resolveSessionStateFromHistory(preprocessCtl, true);
+    await preprocessMessage("Build a widget with a plan", preprocessCtl);
+    await toolsProvider(toolsProviderCtl);
+    const afterTurn1 = JSON.parse(readFileSync(rsPath, "utf-8"));
+
+    // A second, ordinary turn: history grows naturally (not a host-side roll).
+    history += "\nTurn 2: continue the widget work";
+    await preprocessMessage("Now add a test for it", preprocessCtl);
+    await toolsProvider(toolsProviderCtl);
+    const afterTurn2 = JSON.parse(readFileSync(rsPath, "utf-8"));
+
+    assert.equal(afterTurn2.sessionId, afterTurn1.sessionId, "sessionId must persist across turns in the same conversation, not regenerate every turn");
+  });
+
   it("delete_file uses the filePath param name, consistent with read_file/write_file (caught live: model used filePath from those tools, delete_file rejected it)", async () => {
     const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
     const ctl = makeCtl({ maxOrchestratorTurns: 0, toolToggles: { delete_file: true } });

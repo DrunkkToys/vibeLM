@@ -58,8 +58,13 @@ describe("plan execution", () => {
     makeConfig();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (!existsSync(TEST_DIR)) mkdirSync(TEST_DIR, { recursive: true });
+    // Each test expects a clean plan/session slate. toolsProvider() itself no longer force-resets
+    // state on every call (that was the live-testing bug fixed in src/toolsProvider.ts — it discarded
+    // real session continuity every turn in production), so tests must reset explicitly instead.
+    const { resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    await resolveSessionStateFromHistory(makeCtl(), true);
   });
 
   afterEach(async () => {

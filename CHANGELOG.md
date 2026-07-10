@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Every real conversation turn silently started a brand-new session, resetting `turnCounter` to 0 and
+  making auto-compaction, session-scoped fact-dedup, and the context-spine resume mechanism unreachable
+  in production.** `toolsProvider()` forced a session-state re-bootstrap on every call using its own
+  `ToolsProviderController`, which — unlike the `PromptPreprocessorController` — has no `pullHistory()`
+  method (confirmed against the SDK's own type definitions). The forced bootstrap's history read always
+  silently failed, so it always concluded "history unreadable, must be a fresh/rolled session" and
+  manufactured a new random `sessionId`, discarding whatever `preprocessMessage()` had correctly
+  established moments earlier in the same turn. Caught live driving a real multi-turn LM Studio
+  conversation: `runtime-state.json`'s `sessionId` changed on every single turn and `turnCounter` never
+  advanced past 0, even though the working-window/spine/compaction machinery all assume `sessionId`
+  identifies one whole conversation, not one exchange. `toolsProvider()` no longer forces the bootstrap;
+  it reuses the state `preprocessMessage()` already established for the turn.
+
+### Known follow-up (not yet resolved)
+- Live re-testing after the fix above still showed `sessionId` changing across some turns even without a
+  process reload. Suspected contributing factors, not yet isolated: `vibe_bridge`'s background tick
+  shares the same module-level session state via its own separate `model.act()` call (built from a
+  minimal handover summary, not the real conversation history), and/or having two plugin instances
+  (a `lms dev` instance and a stale production install) simultaneously enabled in LM Studio, each with
+  independent in-memory state. Needs a clean, uncounfounded live session (fresh chat, `vibe_bridge`
+  disabled from the start, single plugin instance) to isolate further.
+
 ## [0.2.4] - 2026-07-10
 
 ### Fixed

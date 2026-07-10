@@ -1754,7 +1754,14 @@ export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashComman
 
 export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
   _bridgeClient = client ?? null;
-  const sessionState = await bootstrapSessionState(ctl, true);
+  // No force here: ToolsProviderController has no pullHistory() (unlike PromptPreprocessorController),
+  // so a forced bootstrap can never read real history and always falls back to a fresh session — wiping
+  // sessionId/turnCounter on every single call. toolsProvider() runs once per turn, so that discarded
+  // the session state preprocessMessage() had just correctly established moments earlier, every turn
+  // (caught live: sessionId regenerated and turnCounter stayed 0 across an entire multi-turn chat).
+  // The un-forced call reuses that state; the one legitimate resume-from-restart check still happens
+  // via whichever of preprocessMessage/toolsProvider runs first after a process restart.
+  const sessionState = await bootstrapSessionState(ctl);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
   activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
