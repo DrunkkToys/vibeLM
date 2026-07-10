@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Loop guard missed semantic loops, so the agent could burn a whole session going nowhere.** The
+  guard only caught a model that repeated an *identical* call verbatim; it keyed on the exact
+  arguments, so a model probing the same shell program with a different argument every turn slipped
+  through (observed live: 24 consecutive `ls <different node/npm path>` calls, each a distinct
+  signature, none tripping the guard). A coarse guard now keys shell tools (`bash_terminal`,
+  `ssh_exec`) on the program name only, so `ls A`, `ls B`, `ls C`… collapse into one family and trip
+  after a few tries, with a steering message telling the model to change strategy or `amend`.
+  Non-shell tools keep their exact signature, so reading distinct files is never mistaken for a loop.
+
 ## [0.2.3] - 2026-07-10
 
 ### Added

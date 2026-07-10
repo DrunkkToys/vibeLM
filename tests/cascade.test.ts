@@ -276,4 +276,62 @@ describe("vibeLM Cascade Integration", () => {
     const persisted2 = JSON.parse(readFileSync(runtimeStatePath, "utf-8"));
     assert.equal(persisted2.managedContextBlocks.length, 1, "captured directive stays bounded to the most recent one, no unbounded growth");
   });
+
+  it("coarseToolSignature collapses shell programs by name but keeps non-shell calls exact", async () => {
+    const { coarseToolSignature } = await import("../src/toolsProvider");
+    // Same program, different args → same coarse family.
+    assert.equal(
+      coarseToolSignature("bash_terminal", { command: "ls /usr/local/bin/node" }),
+      coarseToolSignature("bash_terminal", { command: "ls /usr/bin/node" }),
+      "distinct-arg calls to the same program must share a coarse signature",
+    );
+    // Common no-op prefixes are skipped so `sudo ls` and `ls` share a family.
+    assert.equal(
+      coarseToolSignature("bash_terminal", { command: "sudo ls /a" }),
+      coarseToolSignature("bash_terminal", { command: "ls /b" }),
+    );
+    // Different program → different family.
+    assert.notEqual(
+      coarseToolSignature("bash_terminal", { command: "ls /a" }),
+      coarseToolSignature("bash_terminal", { command: "cat /a" }),
+    );
+    // Non-shell tools keep their exact signature — different args stay distinct, no over-firing.
+    assert.notEqual(
+      coarseToolSignature("read_file", { path: "/a" }),
+      coarseToolSignature("read_file", { path: "/b" }),
+    );
+  });
+
+  it("semantic loop guard trips on repeated shell probing with different args (the node-hunt failure)", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 }); // disable the turn cap so the loop guard is what fires
+    await resolveSessionStateFromHistory(ctl, true);   // fresh state: empty toolCallHistory
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    assert.ok(bash?.implementation, "bash_terminal must be present");
+
+    // Replays the observed live failure: probing for node/npm one path per turn. Every call has a
+    // distinct exact signature, so only the coarse (program-name) guard can catch it.
+    const probes = [
+      "ls /usr/local/opt/node",
+      "ls /usr/local/Cellar/node",
+      "ls /usr/local/bin/node",
+      "ls /usr/bin/node",
+      "ls /bin/node",
+      "ls /opt/node",
+    ];
+    let loopError: string | null = null;
+    let tripIndex = -1;
+    for (let i = 0; i < probes.length; i++) {
+      const res: any = await bash.implementation({ command: probes[i] }, {});
+      if (res && res.ok === false && /loop detected/i.test(res.error || "")) {
+        loopError = res.error;
+        tripIndex = i;
+        break;
+      }
+    }
+    assert.ok(loopError, "distinct-arg shell probing must eventually trip the loop guard");
+    assert.equal(tripIndex, 4, "guard should trip on the 5th consecutive same-program probe");
+    assert.match(loopError as string, /change strategy|amend/i, "the steering message must point the model to a new approach");
+  });
 });

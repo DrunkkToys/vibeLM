@@ -46,6 +46,14 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = "off";
 const DEFAULT_MAX_THINKING_STEPS = 8;
 const VIBE_BRIDGE_TICK_TIMEOUT_MS = 180_000;
 const LOOP_WINDOW = 5;
+// Semantic (coarse) loop guard. The exact-signature guard only catches a model that repeats an
+// identical call verbatim; it misses a model that probes the same shell program with a different
+// argument every turn (observed live: 24 consecutive `ls <different node/npm path>` calls, each with
+// a distinct signature, so the exact guard never fired). The coarse guard keys shell tools on the
+// program name only, so `ls A`, `ls B`, `ls C`… collapse to one signature and trip after a few tries.
+const COARSE_LOOP_WINDOW = 6;
+const COARSE_LOOP_THRESHOLD = 5;
+const SHELL_TOOLS = new Set(["bash_terminal", "ssh_exec"]);
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
 const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
@@ -513,7 +521,7 @@ type Plan = { goal: string; steps: PlanStep[]; createdAt: string; updatedAt: str
 type SessionState = {
   sessionId: string;
   turnCounter: number;
-  toolCallHistory: Array<{ name: string; signature: string; ts: number }>;
+  toolCallHistory: Array<{ name: string; signature: string; coarse: string; ts: number }>;
   lastCompactionTurn: number;
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
@@ -878,25 +886,57 @@ function toolSignature(name: string, args: Record<string, unknown>): string {
   return `${name}:${stableStringify(args)}`;
 }
 
-function detectRepeatedToolSignature(state: SessionState, name: string, signature: string): string | null {
-  state.toolCallHistory.push({ name, signature, ts: Date.now() });
-  if (state.toolCallHistory.length > LOOP_WINDOW) {
-    state.toolCallHistory = state.toolCallHistory.slice(-LOOP_WINDOW);
+// A deliberately lossy signature: for shell tools it keys on the program name only (the first token of
+// the command), so probing the same program with different arguments every turn collapses to a single
+// signature the semantic loop guard can count. For every other tool it falls back to the exact
+// signature, so non-shell behaviour — where different args usually mean genuinely different work
+// (reading distinct files, etc.) — is left untouched and no new false positives are introduced.
+export function coarseToolSignature(name: string, args: Record<string, unknown>): string {
+  if (SHELL_TOOLS.has(name)) {
+    const command = typeof args.command === "string" ? args.command : "";
+    const tokens = command.trim().split(/\s+/).filter(Boolean);
+    // Skip common no-op prefixes so `sudo ls` and `ls` share a family.
+    let i = 0;
+    while (i < tokens.length && (tokens[i] === "sudo" || tokens[i] === "env" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) i++;
+    const program = tokens[i] || "";
+    return `${name}:${program}`;
   }
-  if (state.toolCallHistory.length >= 4) {
-    const last4 = state.toolCallHistory.slice(-4).map((t) => t.signature);
+  return `${name}:${stableStringify(args)}`;
+}
+
+function detectRepeatedToolSignature(state: SessionState, name: string, signature: string, coarse: string): string | null {
+  state.toolCallHistory.push({ name, signature, coarse, ts: Date.now() });
+  const keep = Math.max(LOOP_WINDOW, COARSE_LOOP_WINDOW);
+  if (state.toolCallHistory.length > keep) {
+    state.toolCallHistory = state.toolCallHistory.slice(-keep);
+  }
+  // Exact-signature guard: identical call repeated verbatim.
+  const exactWindow = state.toolCallHistory.slice(-LOOP_WINDOW);
+  if (exactWindow.length >= 4) {
+    const last4 = exactWindow.slice(-4).map((t) => t.signature);
     if (last4.every((sig) => sig === last4[0])) {
-      return state.toolCallHistory[state.toolCallHistory.length - 1].name;
+      return exactWindow[exactWindow.length - 1].name;
     }
   }
-  const window = state.toolCallHistory.slice(-6);
   const counts: Record<string, number> = {};
-  for (const t of window) {
+  for (const t of exactWindow) {
     counts[t.signature] = (counts[t.signature] || 0) + 1;
   }
   for (const [n, c] of Object.entries(counts)) {
     if (c >= 4) {
-      const match = window.find((entry) => entry.signature === n);
+      const match = exactWindow.find((entry) => entry.signature === n);
+      return match?.name || null;
+    }
+  }
+  // Semantic guard: same shell program probed repeatedly with different args.
+  const coarseWindow = state.toolCallHistory.slice(-COARSE_LOOP_WINDOW);
+  const coarseCounts: Record<string, number> = {};
+  for (const t of coarseWindow) {
+    coarseCounts[t.coarse] = (coarseCounts[t.coarse] || 0) + 1;
+  }
+  for (const [cs, c] of Object.entries(coarseCounts)) {
+    if (c >= COARSE_LOOP_THRESHOLD) {
+      const match = coarseWindow.find((entry) => entry.coarse === cs);
       return match?.name || null;
     }
   }
@@ -1534,11 +1574,11 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         };
       }
 
-      const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args));
+      const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args), coarseToolSignature(name, args));
       if (looped) {
         return {
           ok: false,
-          error: `Loop detected: tool "${looped}" called ${LOOP_WINDOW}+ times consecutively. Try a different approach or call amend to produce your answer.`,
+          error: `Loop detected: tool "${looped}" has been called repeatedly without making progress (same call or same command probed with different arguments). Stop retrying the same approach — the earlier results already tell you what you need. Change strategy, or call amend to produce your answer with what you have.`,
         };
       }
 
