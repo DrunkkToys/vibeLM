@@ -335,13 +335,17 @@ describe("SessionLog", () => {
     assert.equal(window[0].role, "user");
   });
 
-  it("getWorkingWindow respects maxWindow", () => {
+  it("getWorkingWindow respects maxWindow with head+tail retention", () => {
     const smallLog = new SessionLog(join(logDir, "small.jsonl"), 3);
     for (let i = 0; i < 5; i++) {
       smallLog.startTurn({ type: "turn", ts: new Date().toISOString(), turn: i, role: "user", content: `turn ${i}` });
     }
-    assert.equal(smallLog.getWorkingWindow().length, 3);
-    assert.equal(smallLog.getWorkingWindow()[0].content, "turn 2");
+    const window = smallLog.getWorkingWindow();
+    assert.equal(window.length, 3);
+    // Head+tail: the first turn (session anchor) is pinned, plus the most recent maxWindow-1 turns.
+    assert.equal(window[0].content, "turn 0", "the anchor turn is preserved, not rolled off");
+    assert.equal(window[1].content, "turn 3");
+    assert.equal(window[2].content, "turn 4");
     smallLog.clear();
   });
 

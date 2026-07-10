@@ -276,4 +276,255 @@ describe("vibeLM Cascade Integration", () => {
     const persisted2 = JSON.parse(readFileSync(runtimeStatePath, "utf-8"));
     assert.equal(persisted2.managedContextBlocks.length, 1, "captured directive stays bounded to the most recent one, no unbounded growth");
   });
+
+  it("coarseToolSignature collapses shell programs by name but keeps non-shell calls exact", async () => {
+    const { coarseToolSignature } = await import("../src/toolsProvider");
+    // Same program, different args → same coarse family.
+    assert.equal(
+      coarseToolSignature("bash_terminal", { command: "ls /usr/local/bin/node" }),
+      coarseToolSignature("bash_terminal", { command: "ls /usr/bin/node" }),
+      "distinct-arg calls to the same program must share a coarse signature",
+    );
+    // Common no-op prefixes are skipped so `sudo ls` and `ls` share a family.
+    assert.equal(
+      coarseToolSignature("bash_terminal", { command: "sudo ls /a" }),
+      coarseToolSignature("bash_terminal", { command: "ls /b" }),
+    );
+    // Different program → different family.
+    assert.notEqual(
+      coarseToolSignature("bash_terminal", { command: "ls /a" }),
+      coarseToolSignature("bash_terminal", { command: "cat /a" }),
+    );
+    // Non-shell tools keep their exact signature — different args stay distinct, no over-firing.
+    assert.notEqual(
+      coarseToolSignature("read_file", { path: "/a" }),
+      coarseToolSignature("read_file", { path: "/b" }),
+    );
+  });
+
+  it("semantic loop guard trips on repeated shell probing with different args (the node-hunt failure)", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 }); // disable the turn cap so the loop guard is what fires
+    await resolveSessionStateFromHistory(ctl, true);   // fresh state: empty toolCallHistory
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    assert.ok(bash?.implementation, "bash_terminal must be present");
+
+    // Replays the observed live failure: probing for node/npm one path per turn. Every call has a
+    // distinct exact signature, so only the coarse (program-name) guard can catch it.
+    const probes = [
+      "ls /usr/local/opt/node",
+      "ls /usr/local/Cellar/node",
+      "ls /usr/local/bin/node",
+      "ls /usr/bin/node",
+      "ls /bin/node",
+      "ls /opt/node",
+    ];
+    let loopError: string | null = null;
+    let tripIndex = -1;
+    for (let i = 0; i < probes.length; i++) {
+      const res: any = await bash.implementation({ command: probes[i] }, {});
+      if (res && res.ok === false && /loop detected/i.test(res.error || "")) {
+        loopError = res.error;
+        tripIndex = i;
+        break;
+      }
+    }
+    assert.ok(loopError, "distinct-arg shell probing must eventually trip the loop guard");
+    assert.equal(tripIndex, 4, "guard should trip on the 5th consecutive same-program probe");
+    assert.match(loopError as string, /change strategy|amend/i, "the steering message must point the model to a new approach");
+  });
+
+  it("distils tool results into deduped facts instead of dumping raw result blobs", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    assert.ok(bash?.implementation, "bash_terminal must be present");
+
+    // Four distinct failing `ls` probes (stays under the 5-call loop guard) + one successful command.
+    for (const path of ["/vibelm-nope-a", "/vibelm-nope-b", "/vibelm-nope-c", "/vibelm-nope-d"]) {
+      await bash.implementation({ command: `ls ${path}` }, {});
+    }
+    await bash.implementation({ command: "echo vibelm-ok" }, {});
+
+    // The wrapper syncs the session it actually used to runtime-state on every turn; read it back so we
+    // filter the log by the correct session id (toolsProvider re-bootstraps its own session).
+    const sid = JSON.parse(readFileSync(resolve(CONFIG_DIR, "runtime-state.json"), "utf-8")).sessionId;
+
+    const logPath = resolve(CONFIG_DIR, "session-log.jsonl");
+    const mems = readFileSync(logPath, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((e: any) => e.type === "mem" && e.sessionId === sid);
+
+    const lsFails = mems.filter((m: any) => (m.tags || []).includes("fact:bash_terminal:ls:fail"));
+    assert.equal(lsFails.length, 1, "four equivalent failing probes must collapse to a single deduped fact");
+    assert.match(lsFails[0].content, /^bash_terminal `ls .*` → failed/, "the fact must be a distilled one-liner");
+    assert.ok(!lsFails[0].content.includes('{"ok"'), "the fact must not be a raw result blob");
+
+    // Successful calls are keyed on their exact signature (not the coarse program name), so distinct
+    // successes are each kept rather than collapsed — the fact tag therefore embeds the full command.
+    const echoOk = mems.filter((m: any) => /bash_terminal `echo vibelm-ok` → ok/.test(m.content));
+    assert.equal(echoOk.length, 1, "a successful command records its own outcome fact");
+    assert.ok((echoOk[0].tags || []).some((t: string) => t.startsWith("fact:bash_terminal:") && t.endsWith(":ok")), "success fact is tagged with an ok-outcome key");
+  });
+
+  it("keeps distinct successful commands as separate facts but never leaks secret args into the fact key", async () => {
+    const { distillToolFact } = await import("../src/toolsProvider");
+
+    // Distinct successful commands must not collapse (regression caught in live testing).
+    const a = distillToolFact("bash_terminal", { command: "cat a.txt" }, { ok: true, data: { exitCode: 0, stdout: "ALPHA", stderr: "" } });
+    const b = distillToolFact("bash_terminal", { command: "cat b.txt" }, { ok: true, data: { exitCode: 0, stdout: "BRAVO", stderr: "" } });
+    assert.notEqual(a.key, b.key, "distinct successful commands must get distinct dedupe keys");
+
+    // A secret arg (ssh_exec password) must never appear in the key — the key is persisted as a
+    // memory tag, so the success key is a hash of the signature, not the raw args.
+    const s = distillToolFact(
+      "ssh_exec",
+      { host: "h", user: "u", password: "SUPERSECRET123", command: "whoami" },
+      { ok: true, data: { exitCode: 0, stdout: "root", stderr: "" } },
+    );
+    assert.ok(!s.key.includes("SUPERSECRET123"), "the fact key must not embed the password");
+    assert.ok(!s.fact.includes("SUPERSECRET123"), "the fact text must not embed the password");
+  });
+
+  it("buildContextSpine pins goal + plan + facts as the head (cut-the-middle retention)", async () => {
+    const { buildContextSpine } = await import("../src/toolsProvider");
+    const { SessionLog } = await import("../src/sessionLog");
+    const logPath = resolve(CONFIG_DIR, `spine-${Date.now()}.jsonl`);
+    const log = new SessionLog(logPath);
+    const sid = "spine-sess";
+    log.saveMemory(["fact:bash_terminal:ls:fail", `session:${sid}`], "bash_terminal `ls /x` → failed: not found", 1, sid, "/ws", "workspace");
+    log.saveMemory(["fact:bash_terminal:#abc:ok", `session:${sid}`], "bash_terminal `cat a.txt` → ok: ALPHA-DATA", 2, sid, "/ws", "workspace");
+
+    const state: any = {
+      sessionId: sid,
+      plan: {
+        goal: "Build the widget",
+        steps: [
+          { index: 1, description: "scaffold project", status: "done" },
+          { index: 2, description: "wire it up", status: "pending" },
+        ],
+        createdAt: "", updatedAt: "",
+      },
+    };
+
+    const spine = buildContextSpine(log, state);
+    assert.ok(spine, "spine must be built when a plan and facts exist");
+    assert.match(spine as string, /Context spine/, "spine is a managed-context head block");
+    assert.match(spine as string, /\[Goal\] Build the widget/, "goal is pinned in the head");
+    assert.match(spine as string, /2\. \[pending\] wire it up/, "plan step statuses are pinned");
+    assert.match(spine as string, /\[Established facts\]/, "distilled facts are pinned");
+    assert.match(spine as string, /ALPHA-DATA/, "the learned fact survives the roll");
+
+    // No plan, no facts → nothing worth pinning → null (never inject an empty head).
+    const emptyLog = new SessionLog(resolve(CONFIG_DIR, `spine-empty-${Date.now()}.jsonl`));
+    assert.equal(buildContextSpine(emptyLog, { sessionId: "empty", plan: null } as any), null, "no head to pin → null");
+  });
+
+  it("bash_terminal runs through an interactive login shell, so PATH additions from rc files (nvm, Homebrew, etc.) are visible", async () => {
+    // Regression for a live-testing finding: a bare exec() inherits LM Studio.app's own env, which is
+    // never an interactive login shell (GUI apps are launched via Launch Services, not a terminal), so
+    // nvm/Homebrew/asdf — which extend PATH by sourcing .zshrc/.zprofile — were invisible to
+    // bash_terminal even though the tools were genuinely installed. `$-` contains "i" only when the
+    // shell that ran the command was interactive; this is what makes rc-file-sourced PATH edits (like
+    // nvm's) actually take effect, portably on both zsh (macOS) and bash (Linux CI).
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const bash = tools.find((t: any) => t.name === "bash_terminal");
+    const result: any = await bash.implementation({ command: "echo FLAGS=$-" }, {});
+    assert.ok(result.ok, "the command must execute successfully");
+    assert.match(result.data.stdout, /FLAGS=\S*i\S*/, "the shell must run in interactive mode so rc-file PATH edits are sourced");
+  });
+
+  it("importance-tiered tool-result caps: reads keep more, failures keep less", async () => {
+    const { resultCharBudget } = await import("../src/toolsProvider");
+    assert.equal(resultCharBudget("read_file", { ok: true, data: "x".repeat(9000) }), 1500, "reads get the high tier");
+    assert.equal(resultCharBudget("search_files", { ok: true, data: [] }), 1500, "searches get the high tier");
+    assert.equal(resultCharBudget("bash_terminal", { ok: true, data: { exitCode: 1, stderr: "nope" } }), 300, "failures get the low tier");
+    assert.equal(resultCharBudget("generate_uuid", { ok: true, data: "abc" }), 500, "everything else gets the default tier");
+  });
+
+  it("buildContextSpine budgets tiers: goal pinned, facts fill remaining budget", async () => {
+    const { buildContextSpine, headBudgetChars } = await import("../src/toolsProvider");
+    const { SessionLog } = await import("../src/sessionLog");
+    const log = new SessionLog(resolve(CONFIG_DIR, `budget-${Date.now()}.jsonl`));
+    const sid = "budget-sess";
+    for (let i = 0; i < 12; i++) {
+      log.saveMemory([`fact:x:${i}:ok`, `session:${sid}`], `established fact number ${i} with some descriptive content`, i, sid, "/ws", "workspace");
+    }
+    const state: any = { sessionId: sid, plan: { goal: "SHIP-THE-THING", steps: [{ index: 1, description: "do it", status: "pending" }], createdAt: "", updatedAt: "" } };
+
+    // Tight budget: goal/plan is pinned (Tier 1), facts (Tier 2) don't fit.
+    const tight = buildContextSpine(log, state, 40) as string;
+    assert.match(tight, /SHIP-THE-THING/, "goal is pinned even under a tiny budget");
+    assert.ok(!/Established facts/.test(tight), "facts are dropped when the budget can't fit them");
+
+    // Roomy budget: facts fill the remaining space.
+    const roomy = buildContextSpine(log, state, 6000) as string;
+    assert.match(roomy, /Established facts/, "facts fill the head when budget allows");
+
+    // Head budget scales with the context window.
+    assert.ok(headBudgetChars(32768) > headBudgetChars(8192), "bigger context → bigger head budget");
+  });
+
+  it("auto-populates plan.goal from the first substantive request, but not from commands", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const ctl = makeCtl();
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Build a CLI that parses CSV files and outputs JSON", ctl);
+    const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.ok(rs.plan, "plan should be auto-populated from a substantive goal");
+    assert.match(rs.plan.goal, /Build a CLI/);
+    assert.deepEqual(rs.plan.steps, [], "auto-goal seeds an empty step list so amend's pending-step guard stays satisfied");
+
+    // A short/command message must not seed a goal.
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("yes", ctl);
+    const rs2 = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(rs2.plan, null, "continuations/commands do not become the session goal");
+  });
+
+  it("a goal-only auto-plan survives the persisted round-trip and is restored on resume after a roll", async () => {
+    const { resolveSessionStateFromHistory, preprocessMessage } = await import("../src/toolsProvider");
+    let history = "conversation head one";
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      getPluginConfig: () => ({ get: (k: string) => (k.endsWith("maxOrchestratorTurns") ? 0 : undefined) }),
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Implement a CSV to JSON converter with unit tests", ctl);
+
+    // Roll the raw history so the fingerprint mismatches — the resume path re-reads the persisted plan
+    // through parsePersistedPlan, which previously discarded any plan with zero steps (the auto-goal).
+    history = "totally different head after a roll";
+    const resumed: any = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(resumed.resumedFromPersistedState, true, "a roll is detected as a resume");
+    assert.ok(resumed.plan, "the goal-only plan must survive the persisted round-trip");
+    assert.match(resumed.plan.goal, /CSV to JSON/, "the restored goal is intact");
+  });
+
+  it("delete_file uses the filePath param name, consistent with read_file/write_file (caught live: model used filePath from those tools, delete_file rejected it)", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0, toolToggles: { delete_file: true } });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const deleteFile = tools.find((t: any) => t.name === "delete_file");
+    assert.ok(deleteFile?.implementation, "delete_file must be present");
+
+    const target = resolve(TEST_DIR, "delete-me.txt");
+    writeFileSync(target, "temp");
+    const result: any = await deleteFile.implementation({ filePath: "delete-me.txt" });
+    assert.ok(result.ok, "delete_file must accept filePath, matching read_file/write_file's param name");
+    assert.ok(!existsSync(target), "the file must actually be deleted");
+  });
 });

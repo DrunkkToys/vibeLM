@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`bash_terminal` reported genuinely installed tools (node, npm, anything managed by nvm/Homebrew/
+  asdf/volta) as "not found."** Commands ran via a bare `exec()` inheriting LM Studio.app's own
+  environment — launched via Launch Services (Dock/Finder), never an interactive login shell — so
+  `PATH` never picked up anything a version manager adds by sourcing `.zshrc`/`.zprofile`. Live testing
+  caught the agent confidently telling the user to reinstall Node.js that was already installed via
+  nvm. Commands now run through `${SHELL} -ilc` (interactive + login), sourcing the same profile a
+  real Terminal session would — generically, without hardcoding any tool's install path.
+- **`delete_file`'s parameter was named `path` while `read_file`/`write_file` use `filePath`.** Live
+  testing caught the model calling `delete_file({ filePath: ... })` — consistent with every other file
+  tool in the same conversation — and getting rejected by the schema. Renamed to `filePath` for
+  consistency; the tool's own inconsistency was silently degrading tool-call reliability with no
+  logged bug up to now.
+
+### Added
+- **Importance-tiered context budgeting (Layer 3).** Replaces the blunt fixed limits with tiers keyed
+  on importance:
+  - **Tool-result retention** is no longer a flat 500-char cap for every tool. Information-bearing
+    reads/searches keep up to 1500 chars, failures keep 300 (they're already distilled into a fact),
+    everything else keeps 500 — so a 3 KB file read now survives on the turn log instead of losing 83%
+    of itself the same way a one-line failed probe did.
+  - **The pinned head (context spine) is assembled tier-by-tier under a char budget** (20% of the
+    context window, so it scales with the model) instead of a fixed fact count: goal + plan are pinned
+    first, then established facts fill whatever budget remains.
+  - **The session goal is auto-populated into the persisted `plan` field** from the first substantive
+    request, so the pinned head has a goal to anchor to even when the model never calls `create_plan`.
+    `parsePersistedPlan` now accepts a goal-only plan (previously it silently dropped any plan with
+    zero steps, which would have discarded the auto-goal on the next read).
+  - **The working-window FIFO is now head+tail retention** — it pins the first turn (the session
+    anchor) plus the most recent turns and cuts the middle, instead of rolling the oldest (the goal)
+    off first.
+
+- **Cut-the-middle context retention via a pinned "context spine".** Previously, when the LM Studio
+  host rolled raw history it dropped the *oldest* turns first — the goal and everything the agent had
+  established — and vibeLM only re-asserted its last directive, so early context was effectively lost
+  (a rolling/tail strategy). vibeLM now rebuilds a pinned **head** from durable state — the plan
+  (goal + step statuses) plus the top distilled facts — and re-injects it on resume after a detected
+  roll. The head survives, the recent tail is whatever the host still holds, and the middle is
+  deliberately not reproduced (only its distilled facts carry forward). Facts fall back to the most
+  recent across sessions when a roll has regenerated the session id, so the "what we've learned"
+  block isn't empty exactly when it's needed most.
+
+### Changed
+- **Memory now stores distilled, deduplicated facts instead of raw tool-result dumps.** Every non-read
+  tool call used to append the full (truncated) result blob to memory and a contentless
+  `called X — result ok=true` checkpoint, so a probing loop produced dozens of near-identical entries
+  that made `search_memory` return noise and told the model nothing it could act on (observed live: 32
+  blob memories + 27 empty checkpoints in one session). Results are now distilled into a compact
+  one-line fact keyed by a coarse signature (shell program + outcome), and equivalent facts are
+  deduped within a recent window — so 24 failing `ls <path>` probes collapse to a single
+  `bash_terminal \`ls …\` → failed: …` fact, and checkpoints carry that same distilled line. The
+  verbatim result is still kept on the turn entry, so recent-context fidelity is unchanged.
+  Deduplication is coarse only for failures/info (the noise a probing storm produces); successful
+  calls are keyed on their exact signature so distinct results (e.g. `cat a.txt` vs `cat b.txt`) are
+  each retained rather than collapsed. That success key is a **hash** of the signature, never the raw
+  args, so secret arguments such as `ssh_exec`'s password can't leak into the persisted `fact:`
+  memory tag.
+
+### Fixed
+- **Loop guard missed semantic loops, so the agent could burn a whole session going nowhere.** The
+  guard only caught a model that repeated an *identical* call verbatim; it keyed on the exact
+  arguments, so a model probing the same shell program with a different argument every turn slipped
+  through (observed live: 24 consecutive `ls <different node/npm path>` calls, each a distinct
+  signature, none tripping the guard). A coarse guard now keys shell tools (`bash_terminal`,
+  `ssh_exec`) on the program name only, so `ls A`, `ls B`, `ls C`… collapse into one family and trip
+  after a few tries, with a steering message telling the model to change strategy or `amend`.
+  Non-shell tools keep their exact signature, so reading distinct files is never mistaken for a loop.
+
 ## [0.2.3] - 2026-07-10
 
 ### Added

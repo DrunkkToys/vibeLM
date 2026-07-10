@@ -25,6 +25,18 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 const PROMPT_BUDGET_RATIO = 0.50;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
+// Importance tiers for how much of a tool result is kept verbatim on the turn log. Flat truncation
+// treated a 2 KB file read the same as a one-line failed probe; tiering keeps more of what carries
+// information (reads/searches) and less of the noise we already distil into a fact (failures).
+const TOOL_RESULT_CHARS_HIGH = 1500;
+const TOOL_RESULT_CHARS_LOW = 300;
+const HIGH_VALUE_RESULT_TOOLS = new Set([
+  "read_file", "search_files", "list_files", "explore_workspace", "web_search",
+  "get_config", "get_plan", "list_memories", "search_memory",
+]);
+// Fraction of the context window reserved for the pinned head (goal/plan + established facts). The
+// spine is assembled tier-by-tier to fit this budget instead of a fixed fact count.
+const HEAD_BUDGET_RATIO = 0.20;
 const COMPACT_CONTEXT_TRIGGER_TURNS = 5;
 const COMPACT_CONTEXT_TRIGGER_RATIO = 0.30;
 const COMPACT_CONTEXT_MIN_GAP_TURNS = 3;
@@ -46,6 +58,14 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = "off";
 const DEFAULT_MAX_THINKING_STEPS = 8;
 const VIBE_BRIDGE_TICK_TIMEOUT_MS = 180_000;
 const LOOP_WINDOW = 5;
+// Semantic (coarse) loop guard. The exact-signature guard only catches a model that repeats an
+// identical call verbatim; it misses a model that probes the same shell program with a different
+// argument every turn (observed live: 24 consecutive `ls <different node/npm path>` calls, each with
+// a distinct signature, so the exact guard never fired). The coarse guard keys shell tools on the
+// program name only, so `ls A`, `ls B`, `ls C`… collapse to one signature and trip after a few tries.
+const COARSE_LOOP_WINDOW = 6;
+const COARSE_LOOP_THRESHOLD = 5;
+const SHELL_TOOLS = new Set(["bash_terminal", "ssh_exec"]);
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
 const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
@@ -513,7 +533,7 @@ type Plan = { goal: string; steps: PlanStep[]; createdAt: string; updatedAt: str
 type SessionState = {
   sessionId: string;
   turnCounter: number;
-  toolCallHistory: Array<{ name: string; signature: string; ts: number }>;
+  toolCallHistory: Array<{ name: string; signature: string; coarse: string; ts: number }>;
   lastCompactionTurn: number;
   historyFingerprint: string;
   resumedFromPersistedState: boolean;
@@ -606,7 +626,7 @@ function fingerprintHistoryText(historyText: string): string {
 function parsePersistedPlan(value: unknown): Plan | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<Plan>;
-  if (typeof candidate.goal !== "string" || !Array.isArray(candidate.steps)) return null;
+  if (typeof candidate.goal !== "string" || candidate.goal.trim().length === 0 || !Array.isArray(candidate.steps)) return null;
   const steps: PlanStep[] = (candidate.steps as unknown[])
     .filter((s): s is Partial<PlanStep> => !!s && typeof s === "object")
     .map((s, i) => ({
@@ -618,7 +638,9 @@ function parsePersistedPlan(value: unknown): Plan | null {
       note: typeof s.note === "string" ? s.note : undefined,
     }))
     .filter((s) => s.description.length > 0);
-  if (steps.length === 0) return null;
+  // A goal-only plan (no steps yet) is valid: the auto-seeded session goal must survive persistence so
+  // the pinned head can anchor to it even before the model calls create_plan. Only a missing/empty
+  // goal makes a plan meaningless.
   return {
     goal: candidate.goal,
     steps,
@@ -878,25 +900,57 @@ function toolSignature(name: string, args: Record<string, unknown>): string {
   return `${name}:${stableStringify(args)}`;
 }
 
-function detectRepeatedToolSignature(state: SessionState, name: string, signature: string): string | null {
-  state.toolCallHistory.push({ name, signature, ts: Date.now() });
-  if (state.toolCallHistory.length > LOOP_WINDOW) {
-    state.toolCallHistory = state.toolCallHistory.slice(-LOOP_WINDOW);
+// A deliberately lossy signature: for shell tools it keys on the program name only (the first token of
+// the command), so probing the same program with different arguments every turn collapses to a single
+// signature the semantic loop guard can count. For every other tool it falls back to the exact
+// signature, so non-shell behaviour — where different args usually mean genuinely different work
+// (reading distinct files, etc.) — is left untouched and no new false positives are introduced.
+export function coarseToolSignature(name: string, args: Record<string, unknown>): string {
+  if (SHELL_TOOLS.has(name)) {
+    const command = typeof args.command === "string" ? args.command : "";
+    const tokens = command.trim().split(/\s+/).filter(Boolean);
+    // Skip common no-op prefixes so `sudo ls` and `ls` share a family.
+    let i = 0;
+    while (i < tokens.length && (tokens[i] === "sudo" || tokens[i] === "env" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) i++;
+    const program = tokens[i] || "";
+    return `${name}:${program}`;
   }
-  if (state.toolCallHistory.length >= 4) {
-    const last4 = state.toolCallHistory.slice(-4).map((t) => t.signature);
+  return `${name}:${stableStringify(args)}`;
+}
+
+function detectRepeatedToolSignature(state: SessionState, name: string, signature: string, coarse: string): string | null {
+  state.toolCallHistory.push({ name, signature, coarse, ts: Date.now() });
+  const keep = Math.max(LOOP_WINDOW, COARSE_LOOP_WINDOW);
+  if (state.toolCallHistory.length > keep) {
+    state.toolCallHistory = state.toolCallHistory.slice(-keep);
+  }
+  // Exact-signature guard: identical call repeated verbatim.
+  const exactWindow = state.toolCallHistory.slice(-LOOP_WINDOW);
+  if (exactWindow.length >= 4) {
+    const last4 = exactWindow.slice(-4).map((t) => t.signature);
     if (last4.every((sig) => sig === last4[0])) {
-      return state.toolCallHistory[state.toolCallHistory.length - 1].name;
+      return exactWindow[exactWindow.length - 1].name;
     }
   }
-  const window = state.toolCallHistory.slice(-6);
   const counts: Record<string, number> = {};
-  for (const t of window) {
+  for (const t of exactWindow) {
     counts[t.signature] = (counts[t.signature] || 0) + 1;
   }
   for (const [n, c] of Object.entries(counts)) {
     if (c >= 4) {
-      const match = window.find((entry) => entry.signature === n);
+      const match = exactWindow.find((entry) => entry.signature === n);
+      return match?.name || null;
+    }
+  }
+  // Semantic guard: same shell program probed repeatedly with different args.
+  const coarseWindow = state.toolCallHistory.slice(-COARSE_LOOP_WINDOW);
+  const coarseCounts: Record<string, number> = {};
+  for (const t of coarseWindow) {
+    coarseCounts[t.coarse] = (coarseCounts[t.coarse] || 0) + 1;
+  }
+  for (const [cs, c] of Object.entries(coarseCounts)) {
+    if (c >= COARSE_LOOP_THRESHOLD) {
+      const match = coarseWindow.find((entry) => entry.coarse === cs);
       return match?.name || null;
     }
   }
@@ -1016,13 +1070,79 @@ function unwrapToolResult(result: any): any {
   return result;
 }
 
-function stringifyToolResult(result: unknown): string {
+// Importance-tiered budget for how many chars of a result to keep verbatim. Information-bearing reads
+// and searches get the high tier; failures get the low tier (already distilled into a fact); everything
+// else gets the default. Replaces the old flat MAX_TOOL_RESULT_CHARS applied to every tool alike.
+export function resultCharBudget(name: string | undefined, result: unknown): number {
+  if (name && HIGH_VALUE_RESULT_TOOLS.has(name)) return TOOL_RESULT_CHARS_HIGH;
+  if (classifyToolOutcome(name ?? "", result).outcome === "fail") return TOOL_RESULT_CHARS_LOW;
+  return MAX_TOOL_RESULT_CHARS;
+}
+
+function stringifyToolResult(result: unknown, name?: string): string {
+  const cap = resultCharBudget(name, result);
   try {
-    const text = JSON.stringify(result);
-    return truncateText(text, MAX_TOOL_RESULT_CHARS);
+    return truncateText(JSON.stringify(result), cap);
   } catch {
-    return truncateText(String(result), MAX_TOOL_RESULT_CHARS);
+    return truncateText(String(result), cap);
   }
+}
+
+const FACT_DETAIL_CHARS = 160;
+const FACT_ARG_CHARS = 120;
+// How many recent log entries to scan when deduping a distilled fact. ~3 entries are written per turn
+// (turn + memory + occasional checkpoint), so this covers roughly the last ~20 turns — enough for a
+// consecutive probing loop to collapse to a single fact.
+const FACT_DEDUP_SCAN = 60;
+
+// Classify a tool result into a coarse outcome plus a short human-readable detail. Shell tools report
+// success/failure through the command's exitCode (a failed command still returns ok:true at the tool
+// layer), so they're inspected specially; everything else keys off the tool's own ok flag.
+function classifyToolOutcome(name: string, result: unknown): { outcome: "ok" | "fail" | "info"; detail: string } {
+  const data = unwrapToolResult(result);
+  if (SHELL_TOOLS.has(name) && data && typeof data === "object" && typeof (data as any).exitCode === "number") {
+    const d = data as { exitCode: number; stdout?: string; stderr?: string; error?: string };
+    if (d.exitCode === 0) return { outcome: "ok", detail: truncateText((d.stdout || "").trim(), FACT_DETAIL_CHARS) };
+    return { outcome: "fail", detail: truncateText((d.stderr || d.error || `exit ${d.exitCode}`).trim(), FACT_DETAIL_CHARS) };
+  }
+  if (result && typeof result === "object" && "ok" in result) {
+    if ((result as any).ok === false) {
+      return { outcome: "fail", detail: truncateText(String((result as any).error || "").trim(), FACT_DETAIL_CHARS) };
+    }
+    return { outcome: "ok", detail: "" };
+  }
+  return { outcome: "info", detail: "" };
+}
+
+// Turn a tool call + result into a compact, deduplicable fact instead of dumping the raw (truncated)
+// result blob into memory. `key` groups equivalent calls — for shell tools it's the program name and
+// outcome, so 24 failing `ls <different path>` probes all share `bash_terminal:ls:fail` and collapse
+// to one memory instead of 24 near-identical blobs.
+export function distillToolFact(name: string, args: Record<string, unknown>, result: unknown): { key: string; fact: string } {
+  const { outcome, detail } = classifyToolOutcome(name, result);
+  // A successful call usually carries distinct information worth keeping on its own (e.g. `cat a.txt`
+  // vs `cat b.txt` return different content), so key those on the exact signature — only true
+  // duplicates collapse. Failures and info are the noise we want to fold together: a probing storm
+  // (24 failing `ls <different path>`) shares one coarse `program:fail` key and dedupes to a single
+  // fact. Keying successes coarsely too would silently drop every distinct successful result but the
+  // first — a real data-loss bug caught in live testing.
+  //
+  // The success key is a HASH of the exact signature, never the raw signature: args can contain
+  // secrets (e.g. ssh_exec's `password`), and this key is persisted as a `fact:` memory tag, so
+  // embedding the raw args would leak credentials into stored/replayed context.
+  const dedupeBasis = outcome === "ok"
+    ? `${name}:#${createHash("sha256").update(toolSignature(name, args)).digest("hex").slice(0, 12)}`
+    : coarseToolSignature(name, args);
+  const key = `${dedupeBasis}:${outcome}`;
+  const argHint = SHELL_TOOLS.has(name) && typeof args.command === "string"
+    ? truncateText(args.command.trim(), FACT_ARG_CHARS)
+    : typeof args.path === "string" ? args.path
+    : typeof args.file === "string" ? args.file
+    : typeof args.query === "string" ? truncateText(args.query.trim(), FACT_ARG_CHARS)
+    : "";
+  const verb = outcome === "ok" ? "ok" : outcome === "fail" ? "failed" : "done";
+  const fact = `${name}${argHint ? ` \`${argHint}\`` : ""} → ${verb}${detail ? `: ${detail}` : ""}`;
+  return { key, fact };
 }
 
 type CompactCodeSnippet = {
@@ -1534,11 +1654,11 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         };
       }
 
-      const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args));
+      const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args), coarseToolSignature(name, args));
       if (looped) {
         return {
           ok: false,
-          error: `Loop detected: tool "${looped}" called ${LOOP_WINDOW}+ times consecutively. Try a different approach or call amend to produce your answer.`,
+          error: `Loop detected: tool "${looped}" has been called repeatedly without making progress (same call or same command probed with different arguments). Stop retrying the same approach — the earlier results already tell you what you need. Change strategy, or call amend to produce your answer with what you have.`,
         };
       }
 
@@ -1552,7 +1672,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       }
 
       const log = getSessionLog();
-      const serializedResult = stringifyToolResult(result);
+      const serializedResult = stringifyToolResult(result, name);
       const workspace = currentWorkspacePath(ctx) || undefined;
       const turnEntry: TurnEntry = {
         type: "turn",
@@ -1564,14 +1684,24 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
       };
       log.startTurn(turnEntry);
+      // Distil the call into a compact, deduplicable fact rather than dumping the raw result blob.
+      // Equivalent calls (same shell program + outcome) share a `fact:` key, so a probing loop
+      // collapses to one memory instead of dozens of near-identical entries that only add retrieval
+      // noise. Computed once and reused for the checkpoint summary below.
+      const distilled = distillToolFact(name, args, result);
       if (!readOnlyTools.includes(name) && !["save_memory","compact_context","search_memory","list_memories","clear_memories","delete_memory","update_memory"].includes(name)) {
-        const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`], currentSessionId(state), workspace || "", "workspace");
-        log.saveMemory(tags, `${name} → ${serializedResult}`, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
+        const factTag = `fact:${distilled.key}`;
+        const recentMems = log.readRecentMemories(FACT_DEDUP_SCAN, currentSessionId(state));
+        const alreadyKnown = recentMems.some((m) => Array.isArray(m.tags) && m.tags.includes(factTag));
+        if (!alreadyKnown) {
+          const tags = buildMemoryTags([`turn:${state.turnCounter}`, `tool:${name}`, factTag], currentSessionId(state), workspace || "", "workspace");
+          log.saveMemory(tags, distilled.fact, state.turnCounter, currentSessionId(state), workspace || undefined, "workspace");
+        }
       }
 
       if (shouldSaveCheckpoint(state)) {
         log.saveCheckpoint(
-          `Turn ${state.turnCounter}: called ${name} — result ok=${result?.ok}`,
+          `Turn ${state.turnCounter}: ${distilled.fact}`,
           ["checkpoint", `turn:${state.turnCounter}`],
           state.turnCounter,
           currentSessionId(state),
@@ -2087,15 +2217,15 @@ NOTE: This is a text-based search, not a regex search. The pattern is matched ca
     name: "delete_file",
     description: text`Deletes a file or empty directory. Path is relative to workspace.
 USE WHEN: you need to remove a file or empty directory.
-EXAMPLE: delete_file({ path: "temp/output.txt" })
+EXAMPLE: delete_file({ filePath: "temp/output.txt" })
 NOTE: Will NOT delete non-empty directories. Use bash_terminal 'rm -rf' for that.`,
     parameters: {
-      path: z.string().min(1).describe("Path relative to workspace"),
+      filePath: z.string().min(1).describe("File path relative to workspace"),
     },
-    implementation: async ({ path }) => {
+    implementation: async ({ filePath }) => {
       try {
         const ws = requireWorkspace(ctl);
-        const resolved = sandboxPath(ws, path);
+        const resolved = sandboxPath(ws, filePath);
         if (!existsSync(resolved)) return fail(`Not found: ${resolved}`);
         const st = statSync(resolved);
         if (st.isDirectory()) {
@@ -2122,9 +2252,17 @@ NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 
       const blockedReason = checkBashCommandSafety(command);
       if (blockedReason) return fail(blockedReason);
       try {
-        const { exec } = await import("child_process");
+        const { execFile } = await import("child_process");
+        // LM Studio.app is launched via Launch Services (Dock/Finder), not an interactive login
+        // shell, so process.env.PATH never picks up nvm/Homebrew/asdf/volta — anything a version
+        // manager adds by sourcing .zshrc/.zprofile. A bare exec() with process.env therefore reports
+        // real, installed tools as "not found". Running through `${shell} -ilc` (interactive + login +
+        // command-string) sources the same profile a real Terminal session would, generically, without
+        // hardcoding any single tool's install path. `command` stays a single argv element passed to
+        // -c, so the shell parses it exactly as before — pipes/redirects/&& all keep working unchanged.
+        const shell = process.env.SHELL || (process.platform === "darwin" ? "/bin/zsh" : "/bin/bash");
         return await new Promise((res) => {
-          exec(command, { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          execFile(shell, ["-ilc", command], { cwd: requireWorkspace(ctl), env: { ...process.env }, timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
             res(ok({ exitCode: err?.code ?? 0, stdout: stdout || "", stderr: stderr || "", killed: !!err?.killed, signal: err?.signal ?? null }));
           });
         });
@@ -2714,6 +2852,16 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     }
   }
 
+  // Populate the persisted plan's goal from the first substantive request so the pinned head always
+  // has a goal to anchor to, even when the model never calls create_plan. A real create_plan later
+  // overwrites this with concrete steps; here we only seed goal + empty steps (so amend's pending-step
+  // guard stays satisfied). Skipped for commands/continuations, which aren't goals.
+  if (!activeSessionState.plan && isGoalLikeMessage(t)) {
+    const now = new Date().toISOString();
+    activeSessionState.plan = { goal: truncateText(t, 300), steps: [], createdAt: now, updatedAt: now };
+    writeRuntimeStateSync(activeSessionState);
+  }
+
   const wsMatch = t.match(/^(?:set|pick|change|switch|go\s+to)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+(.+))?$/i);
   if (wsMatch) {
     const requestedPath = wsMatch[1]?.trim().replace(/^["'`]|["'`]$/g, "") || "";
@@ -2726,9 +2874,12 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       const cfg = readConfigSync();
       cfg.workspacePath = resolved;
       writeConfigSync(cfg);
-      return recordProcessedPrompt(historyText, `[Tool executed: set_workspace]`);
+      // Must be unambiguous: the preprocessor already performed the change and stripped the path from
+      // the message, so a terse "[Tool executed: set_workspace]" left small models re-calling the tool
+      // (now without a path) and asking the user for it again. State the outcome and forbid the retry.
+      return recordProcessedPrompt(historyText, `[The workspace is already set to ${resolved}. This is done — do NOT call the set_workspace tool. Reply to the user with a one-line confirmation, e.g. "Workspace set to ${resolved}.", then wait for their next instruction.]`);
     }
-    return recordProcessedPrompt(historyText, `[Tool error: set_workspace → path not found: ${resolved}]`);
+    return recordProcessedPrompt(historyText, `[The workspace was NOT changed: the path "${resolved}" does not exist. Do NOT call set_workspace. Tell the user the path was not found and ask them for a valid absolute path to an existing folder.]`);
   }
 
   const exploreMatch = t.match(/^(?:explore|inspect|scan|survey)\s+workspace(?:\s+(.+))?$/i) || t.match(/^workspace(?:\s+explore|inspect|scan|survey)(?:\s+(.+))?$/i);
@@ -2806,12 +2957,88 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   return null;
 }
 
+// The pinned "head" of a cut-the-middle retention strategy. When the host rolls raw history it drops
+// the oldest turns first — i.e. the goal and everything the agent has already established. This
+// reassembles that head from durable state (the plan) plus the distilled facts (Layer 2), so it can be
+// re-injected after a roll. The middle is deliberately NOT reproduced — only its distilled facts
+// survive — and the recent tail is whatever the host still holds. Returns null when there's no head
+// worth pinning yet.
+// Whether a user message reads like a task goal worth pinning (vs. a command, continuation, or query
+// handled by its own preprocessor branch). Deliberately conservative — a false negative just means no
+// auto-goal, whereas a false positive would pin noise as the session's goal.
+function isGoalLikeMessage(t: string): boolean {
+  if (t.length < 15) return false;
+  if (CONTINUATION_PATTERN.test(t)) return false;
+  if (/^(?:set|pick|change|switch|go\s+to)\s+workspace\b/i.test(t) || /^workspace\b/i.test(t)) return false;
+  if (/^(?:search|find|google|look\s+up|lookup|bing)\b/i.test(t)) return false;
+  if (/^(?:calc|calculate|compute)\b/i.test(t) || /\d\s*[-+*/]\s*\d/.test(t)) return false;
+  return true;
+}
+
+// Hard ceiling on pinned facts even if the char budget would allow more — keeps the head scannable.
+const SPINE_MAX_FACTS = 15;
+export function headBudgetChars(contextWindow: number): number {
+  return estimateCharsFromTokens(Math.max(256, Math.floor(contextWindow * HEAD_BUDGET_RATIO)));
+}
+// Assemble the pinned head tier-by-tier under a char budget, highest priority first:
+//   Tier 1 (pinned):  goal + plan step statuses — always included.
+//   Tier 2 (fill):    established facts, newest-first, as many as the remaining budget allows.
+// This replaces the fixed fact count with importance-tiered budgeting: the goal/plan is never dropped,
+// and facts fill whatever head budget the context window affords.
+export function buildContextSpine(session: SessionLog, state: SessionState, maxChars: number = 6000): string | null {
+  const header = `${MANAGED_CONTEXT_MARKER}\n[Context spine — pinned so it survives history rolls; do not restate, just build on it]`;
+  const tiers: string[] = [];
+  let used = header.length;
+
+  // Tier 1: goal + plan. Pinned — added even if it consumes most of the budget.
+  if (state.plan) {
+    const goalBlock = `[Goal] ${truncateText(state.plan.goal, 300)}`;
+    tiers.push(goalBlock);
+    used += goalBlock.length + 1;
+    const steps = state.plan.steps
+      .map((s) => `  ${s.index}. [${s.status}] ${truncateText(s.description, 120)}`)
+      .join("\n");
+    if (steps) {
+      const planBlock = `[Plan]\n${steps}`;
+      tiers.push(planBlock);
+      used += planBlock.length + 1;
+    }
+  }
+
+  // Tier 2: established facts — what the agent has learned, which would otherwise roll off the head.
+  const isFact = (m: MemoryEntry) => Array.isArray(m.tags) && m.tags.some((t) => t.startsWith("fact:"));
+  let facts = session.readRecentMemories(FACT_DEDUP_SCAN, currentSessionId(state)).filter(isFact);
+  if (facts.length === 0) {
+    // After a history roll, bootstrapSessionState regenerates the session id (it distrusts session
+    // identity once raw history no longer fingerprints the same), so session-scoped retrieval misses
+    // the very facts we need to pin. Fall back to the most recent facts regardless of session — right
+    // after a roll those are still this session's, just recorded under the previous id.
+    facts = session.readRecentMemories(FACT_DEDUP_SCAN).filter(isFact);
+  }
+  const factLines: string[] = [];
+  for (let i = facts.length - 1; i >= 0 && factLines.length < SPINE_MAX_FACTS; i--) {
+    const line = `  - ${truncateText(facts[i].content, FACT_DETAIL_CHARS)}`;
+    if (used + line.length + 1 > maxChars) break;
+    factLines.unshift(line);
+    used += line.length + 1;
+  }
+  if (factLines.length) tiers.push(`[Established facts]\n${factLines.join("\n")}`);
+
+  if (tiers.length === 0) return null;
+  return `${header}\n${tiers.join("\n")}`;
+}
+
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   await bootstrapSessionState(ctl as any);
   const rehydrationBlocks = (activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0)
     ? activeSessionState.managedContextBlocks.slice()
     : null;
-  if (rehydrationBlocks) {
+  // Rebuild the pinned head BEFORE consuming state below. It's built whenever we resumed from
+  // persisted state (a detected roll/restart) — the exact moment the host has dropped the head.
+  const spine = activeSessionState.resumedFromPersistedState
+    ? buildContextSpine(getSessionLog(), activeSessionState, headBudgetChars(await getContextWindow(ctl as any)))
+    : null;
+  if (rehydrationBlocks || spine) {
     // Consume immediately so it only fires once, and so preprocessMessageCore's own
     // managedContextPresent/hasStoredBlocks checks don't see stale state.
     activeSessionState.managedContextBlocks = [];
@@ -2819,7 +3046,10 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
     writeRuntimeStateSync(activeSessionState);
   }
   const result = await preprocessMessageCore(text, ctl);
-  if (!rehydrationBlocks) return result;
-  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${rehydrationBlocks.join("\n\n")}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
+  // The spine can fire even when there are no stored directive blocks (e.g. a plan exists but no
+  // directive was captured), so inject it whenever it's non-null.
+  if (!rehydrationBlocks && !spine) return result;
+  const preserved = [spine, ...(rehydrationBlocks ?? [])].filter(Boolean).join("\n\n");
+  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${preserved}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
   return result ? `${rehydrated}\n\n${result}` : rehydrated;
 }
