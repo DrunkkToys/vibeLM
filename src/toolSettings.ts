@@ -180,6 +180,24 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
     subtitle: "Self-recalling autonomous loop for keep-alive sessions.",
     defaultEnabled: false,
   },
+  {
+    name: "create_plan",
+    displayName: "Create Plan",
+    subtitle: "Enable creating a multi-step execution plan for the session.",
+    defaultEnabled: true,
+  },
+  {
+    name: "update_plan_step",
+    displayName: "Update Plan Step",
+    subtitle: "Enable marking plan steps in progress, done, or blocked.",
+    defaultEnabled: true,
+  },
+  {
+    name: "get_plan",
+    displayName: "Get Plan",
+    subtitle: "Enable reading the current plan and step statuses.",
+    defaultEnabled: true,
+  },
 ];
 
 export const DEFAULT_ENABLED_TOOL_NAMES = TOOL_TOGGLES.filter((tool) => tool.defaultEnabled).map((tool) => tool.name);

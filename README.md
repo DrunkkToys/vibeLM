@@ -34,7 +34,33 @@ It doesn't pretend local models behave like hosted frontier systems — it makes
 | **Utilities** | `generate_uuid`, `generate_password`, `encode_base64`, `decode_base64` |
 | **Infrastructure** | `ssh_exec`, `check_service` |
 | **Response control** | `amend` |
+| **Planning** | `create_plan`, `update_plan_step`, `get_plan` — structured multi-step execution, enforced before `amend` can close out |
 | **Autonomy** | `vibe_bridge` — self-recalling autonomous loop for keep-alive sessions |
+
+## Plan Execution
+
+`create_plan` registers a structured, ordered list of steps toward a goal instead of leaving the model to narrate a plan in prose and stop. The model is expected to execute each step itself with its other tools (`bash_terminal`, file tools, etc.), calling `update_plan_step` as it goes:
+
+```bash
+create_plan({
+  goal: "Set up a nightly backup of /data",
+  steps: [
+    "Check what's installed: which cron crontab",
+    "Write backup script to /data/backup.sh",
+    "Register the crontab entry",
+    "Verify with crontab -l",
+  ],
+})
+
+update_plan_step({ index: 0, status: "done" })
+update_plan_step({ index: 2, status: "blocked", note: "crontab requires sudo, need user confirmation" })
+
+get_plan()
+```
+
+- `amend` refuses to close out the session while the plan still has untouched (`pending`) steps — it points the model back at its own tools instead of letting it hand off a plan it never executed. Steps already attempted and marked `in_progress` or `blocked` do not block `amend`, so a model that got genuinely stuck can still report back.
+- `create_plan` accepts `autoStart` (default `true`): if `vibe_bridge` is enabled, creating a plan starts it automatically so unattended ticks keep making progress on the plan's next pending step — this is the "long-running execution" path for multi-step work.
+- Each `vibe_bridge` tick that runs while a plan is active gets the next pending step named explicitly in its prompt, and has `update_plan_step`/`get_plan` available so it can mark progress. `bash_terminal` is still excluded from unattended ticks (see Security below), so shell-dependent plan steps need an interactive turn to execute.
 
 ## Autonomous Sessions (vibe_bridge)
 
@@ -63,7 +89,7 @@ In LM Studio plugin settings (`tools.*`):
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `tools.maxEffectiveContextTokens` | number | `0` | Optional hard cap on the budgeting window. `0` = use the model's actual loaded context length (read automatically). Raise it only if your machine can't sustain even the configured length. |
-| `tools.reasoningEffort` | select | `off` | Calibrates model thinking: `off`/`low`/`medium`/`high`. gpt-oss uses native Harmony tiers, Qwen uses `/no_think`·`/think`, others get a natural-language nudge. |
+| `tools.reasoningEffort` | select | `off` | Calibrates model thinking: `off`/`low`/`medium`/`high`, each level a distinct directive. gpt-oss uses native Harmony tiers (`off` floors to `low`, Harmony has no lower tier), Qwen uses the `/no_think`·`/think` switch with a graduated brief/moderate/thorough qualifier appended, others get a graduated natural-language nudge. |
 | `tools.compactionTriggerPercent` | number | `30` | How full the context gets (% of the loaded window) before vibeLM auto-compacts older history into memory (10–90). Higher keeps more live context; lower compacts earlier. |
 | `tools.maxThinkingSteps` | number | `8` | Max prediction rounds per unattended `vibe_bridge` tick, so a model stuck reasoning without calling a tool can't run unbounded (1–50). |
 | `tools.vibe_bridge` | boolean | `false` | Enable the tool and auto-start it with the settings below |
@@ -86,7 +112,7 @@ Each keep-alive tick can call a curated set of tools (explore/list/read/write/ap
 - `Rolling Window Trigger Limit (prompt tokens)` controls the maximum prompt size before vibeLM switches to rolling-window behavior. Set it to `0` to auto-derive the trigger from the selected model's context window minus a safety margin.
 - vibeLM sizes its prompt budget from the model's **loaded context length** — the value you actually configure when loading the model in LM Studio (read from `loaded_context_length` in the REST API), not the model's larger max ceiling. This is what makes auto-compaction fire in time: e.g. a model loaded at 40K compacts around 12K and warns around 20K, instead of never triggering because it assumed a 256K window.
 - `Max Effective Context (tokens)` is an optional hard cap on top of that. Default `0` uses the loaded window as-is. Set it only if your machine can't sustain even the configured length (e.g. a large vision model whose KV cache exhausts unified memory — note KV-cache quantization is not available for VLMs); vibeLM will then compact against this lower ceiling.
-- `Reasoning Effort` calibrates how much the model "thinks" before answering: `off` suppresses extended reasoning (leanest sessions, avoids reasoning-loop hangs), `low` keeps it brief, `high` leaves the model's default untouched. Qwen models honor `/no_think` and `/think` soft switches; other architectures receive an equivalent natural-language directive. The directive is applied to both interactive turns and unattended `vibe_bridge` ticks.
+- `Reasoning Effort` calibrates how much the model "thinks" before answering: `off` suppresses extended reasoning (leanest sessions, avoids reasoning-loop hangs), `low`/`medium`/`high` each produce a distinct, increasingly explicit directive to reason more thoroughly. Qwen models honor the `/no_think`/`/think` soft switch (with a graduated qualifier for the three "on" tiers, since the chat template itself only has a binary toggle); other architectures receive an equivalent graduated natural-language directive. The directive is applied to both interactive turns and unattended `vibe_bridge` ticks.
 - The `tools` section also exposes on/off toggles for the individual tools, so you can disable capabilities you do not want the orchestrator to use.
 - `amend` is gated so the orchestrator does not stop too early.
 - The plugin tries to stay under the model's prompt budget and auto-compacts when sessions get large.

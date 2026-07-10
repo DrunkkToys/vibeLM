@@ -460,6 +460,56 @@ describe("session resume helper", () => {
     assert.equal(resumed.sessionId, "session-live", "matching fingerprint should reuse the stored session id");
     assert.equal(resumed.turnCounter, 12, "matching fingerprint should preserve the stored turn counter");
   });
+
+  it("recovers a rolled-history session's managed-context directive on the very next turn, regardless of wording", async () => {
+    const { resolveSessionStateFromHistory, preprocessMessage } = await import("../src/toolsProvider");
+    const historyText = [
+      "system: starter context",
+      "user: do the 3-step task",
+      "assistant: working on it",
+    ].join("\n");
+    const savedDirective = `[vibeLM:managed-context]\n[Task mode: follow all 3 listed steps in order. Use one tool call at a time. Call amend when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
+
+    // Simulate a context roll: the host's raw history no longer fingerprints the same as what we
+    // last persisted, but we did persist a managed-context directive before the roll happened.
+    writeFileSync(
+      RUNTIME_STATE_PATH,
+      JSON.stringify({
+        version: 1,
+        sessionId: "session-rolled",
+        turnCounter: 5,
+        lastCompactionTurn: 0,
+        historyFingerprint: "fingerprint-from-before-the-roll",
+        resumedFromPersistedState: false,
+        updatedAt: new Date().toISOString(),
+        managedContextBlocks: [savedDirective],
+      }, null, 2),
+      "utf-8",
+    );
+
+    const ctl = {
+      pullHistory: async () => ({
+        getSystemPrompt: () => historyText,
+        toString: () => historyText,
+      }),
+    } as any;
+
+    const resumed = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(resumed.resumedFromPersistedState, true, "a fingerprint mismatch with saved managedContextBlocks should still be treated as recoverable");
+    assert.deepEqual(resumed.managedContextBlocks, [savedDirective], "the pre-roll directive should carry over");
+
+    // The very next turn, regardless of what the user actually says, should get the directive
+    // re-asserted — no dependency on CONTINUATION_PATTERN wording.
+    const result = await preprocessMessage("what's the weather like today", ctl);
+    assert.ok(result, "rehydration should produce a non-null processed prompt");
+    assert.ok(result!.includes("[Task mode: follow all 3 listed steps in order"), "recovered directive text should be re-asserted to the model");
+
+    // It should only fire once — a second call right after should not still be rehydrating.
+    const second = await preprocessMessage("thanks", ctl);
+    if (second) {
+      assert.ok(!second.includes("Session resumed from saved state"), "rehydration should not repeat on the following turn");
+    }
+  });
 });
 
 describe("workspace memory helper", () => {
