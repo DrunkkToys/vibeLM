@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-10
+
 ### Added
 - **Plan execution** — `create_plan`, `update_plan_step`, and `get_plan` give the model a structured,
   ordered step list instead of letting it narrate a plan in prose and stop. `amend` now refuses to
