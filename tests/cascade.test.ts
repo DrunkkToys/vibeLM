@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -224,20 +224,56 @@ describe("vibeLM Cascade Integration", () => {
 
   it("reasoningDirectiveFor maps effort + arch to each family's native thinking control", async () => {
     const { reasoningDirectiveFor } = await import("../src/toolsProvider");
-    // gpt-oss: native Harmony tiers, deterministic; off/low both hit its floor
+    // gpt-oss: native Harmony tiers, deterministic; off/low both hit its floor (Harmony has no "off" tier)
     assert.equal(reasoningDirectiveFor("off", "gpt-oss"), "Reasoning: low");
     assert.equal(reasoningDirectiveFor("low", "gpt_oss"), "Reasoning: low");
     assert.equal(reasoningDirectiveFor("medium", "gptoss"), "Reasoning: medium");
     assert.equal(reasoningDirectiveFor("high", "gpt-oss"), "Reasoning: high");
-    // Qwen soft switches: off suppresses, any active tier enables thinking
+    // Qwen: binary /think–/no_think toggle is the only native lever, but low/medium/high must still
+    // be textually distinct so the setting isn't a no-op across the three "on" tiers.
     assert.equal(reasoningDirectiveFor("off", "qwen3"), "/no_think");
-    assert.equal(reasoningDirectiveFor("low", "qwen35"), "/think");
-    assert.equal(reasoningDirectiveFor("medium", "qwen3_5"), "/think");
-    assert.equal(reasoningDirectiveFor("high", "qwen3"), "/think");
-    // Models without an explicit control: natural-language nudge for off/low, no-op for medium/high
-    assert.match(reasoningDirectiveFor("off", "gemma4"), /do not produce extended/i);
-    assert.match(reasoningDirectiveFor("low", "glm4v"), /brief/i);
-    assert.equal(reasoningDirectiveFor("medium", "gemma4"), "");
-    assert.equal(reasoningDirectiveFor("high", "llama"), "");
+    const qwenLow = reasoningDirectiveFor("low", "qwen35");
+    const qwenMedium = reasoningDirectiveFor("medium", "qwen3_5");
+    const qwenHigh = reasoningDirectiveFor("high", "qwen3");
+    assert.match(qwenLow, /^\/think/);
+    assert.match(qwenMedium, /^\/think/);
+    assert.match(qwenHigh, /^\/think/);
+    assert.notEqual(qwenLow, qwenMedium);
+    assert.notEqual(qwenMedium, qwenHigh);
+    assert.notEqual(qwenLow, qwenHigh);
+    // Models without an explicit control (Llama/Mistral/Gemma/DeepSeek/GLM/Phi/etc.): every level
+    // must produce a distinct, non-empty natural-language directive — no silent no-ops.
+    const genericOff = reasoningDirectiveFor("off", "gemma4");
+    const genericLow = reasoningDirectiveFor("low", "glm4v");
+    const genericMedium = reasoningDirectiveFor("medium", "gemma4");
+    const genericHigh = reasoningDirectiveFor("high", "llama");
+    for (const directive of [genericOff, genericLow, genericMedium, genericHigh]) {
+      assert.ok(directive.length > 0, "reasoning directive must not be empty");
+    }
+    assert.match(genericOff, /do not produce extended/i);
+    assert.match(genericLow, /brief/i);
+    assert.notEqual(genericMedium, "");
+    assert.notEqual(genericHigh, "");
+    assert.notEqual(genericMedium, genericHigh);
+    assert.notEqual(genericLow, genericMedium);
+  });
+
+  it("captures vibeLM's own emitted directive into managedContextBlocks at emission time, bounded to the most recent one", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl();
+    await resolveSessionStateFromHistory(ctl, true);
+
+    const first = await preprocessMessage("1. do a\n2. do b\n3. do c", ctl);
+    assert.ok(first?.includes("[vibeLM:managed-context]"), "a multi-step message should trigger a task-mode directive");
+
+    const runtimeStatePath = resolve(CONFIG_DIR, "runtime-state.json");
+    const persisted1 = JSON.parse(readFileSync(runtimeStatePath, "utf-8"));
+    assert.equal(persisted1.managedContextBlocks.length, 1, "exactly one directive should be captured");
+    assert.match(persisted1.managedContextBlocks[0], /Task mode/);
+
+    const second = await preprocessMessage("1. do x\n2. do y", ctl);
+    assert.ok(second?.includes("[vibeLM:managed-context]"));
+    const persisted2 = JSON.parse(readFileSync(runtimeStatePath, "utf-8"));
+    assert.equal(persisted2.managedContextBlocks.length, 1, "captured directive stays bounded to the most recent one, no unbounded growth");
   });
 });

@@ -49,7 +49,7 @@ const LOOP_WINDOW = 5;
 const CHECKPOINT_INTERVAL_MAX = 10;
 const CHECKPOINT_INTERVAL_EARLY = 4;
 const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
-const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory"];
+const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory", "get_plan"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 // Denylist, not allowlist: bash_terminal is a general-purpose dev tool (git, npm, build scripts,
 // etc.), so an allowlist would block too much legitimate use. This blocks clearly destructive or
@@ -366,27 +366,36 @@ async function getLoadedModelArch(): Promise<string> {
 }
 
 // Pure mapping from (effort, arch) to a thinking-control directive appended to the outgoing prompt.
-// Each family gets its native control where one exists:
-//  - gpt-oss: Harmony "Reasoning: low/medium/high" — deterministic, with explicit tiers (its floor is
-//    "low", so both off and low map there).
-//  - Qwen: the /no_think and /think soft switches.
-//  - everything else: a natural-language nudge. medium/high are no-ops there because a nudge can't
-//    reliably force *more* reasoning than the model's default.
+// Each family gets its native control where one exists, and every level (off/low/medium/high) must
+// produce a distinct, non-empty directive — a collapsed/empty mapping is a silent no-op setting:
+//  - gpt-oss: Harmony "Reasoning: low/medium/high" — deterministic tiers. Harmony has no "off" tier,
+//    so off intentionally collapses to its floor, "low" (not a bug — there's nothing lower to map to).
+//  - Qwen: chat template only exposes a binary /think–/no_think switch, no native 3-tier control.
+//    Keep that switch as the real lever and append a graduated natural-language qualifier so
+//    low/medium/high are at least textually distinct in the prompt.
+//  - everything else (Llama/Mistral/Gemma/DeepSeek/GLM/Phi/etc.): graduated natural-language nudges.
 export function reasoningDirectiveFor(effort: ReasoningEffort, arch: string): string {
   if (/gpt.?oss/i.test(arch)) {
     switch (effort) {
-      case "high": return "Reasoning: high";
+      case "off": return "Reasoning: low";
+      case "low": return "Reasoning: low";
       case "medium": return "Reasoning: medium";
-      default: return "Reasoning: low";
+      case "high": return "Reasoning: high";
     }
   }
   if (/qwen/i.test(arch)) {
-    return effort === "off" ? "/no_think" : "/think";
+    switch (effort) {
+      case "off": return "/no_think";
+      case "low": return "/think Keep your reasoning brief — a few short steps at most.";
+      case "medium": return "/think Reason through this at a moderate depth before answering.";
+      case "high": return "/think Reason thoroughly and check your work before answering; take as many steps as needed.";
+    }
   }
   switch (effort) {
     case "off": return "Answer directly and concisely; do not produce extended step-by-step reasoning.";
-    case "low": return "Keep any reasoning brief.";
-    default: return "";
+    case "low": return "Keep any reasoning brief — a sentence or two at most before answering.";
+    case "medium": return "Think through the problem in a few clear steps before answering; balance thoroughness with brevity.";
+    case "high": return "Reason carefully and thoroughly step by step, consider edge cases and alternatives, and double-check your conclusion before answering.";
   }
 }
 
@@ -497,6 +506,10 @@ function getSessionLog(): SessionLog {
   return globalSessionLog;
 }
 
+type PlanStepStatus = "pending" | "in_progress" | "done" | "blocked";
+type PlanStep = { index: number; description: string; status: PlanStepStatus; note?: string };
+type Plan = { goal: string; steps: PlanStep[]; createdAt: string; updatedAt: string };
+
 type SessionState = {
   sessionId: string;
   turnCounter: number;
@@ -507,6 +520,7 @@ type SessionState = {
   managedContextBlocks: string[];
   lastHandoffSummary: string;
   lastHandoffTurn: number;
+  plan: Plan | null;
 };
 
 function createSessionState(): SessionState {
@@ -520,6 +534,7 @@ function createSessionState(): SessionState {
     managedContextBlocks: [],
     lastHandoffSummary: "",
     lastHandoffTurn: 0,
+    plan: null,
   };
 }
 
@@ -553,6 +568,7 @@ type PersistedSessionState = {
   managedContextBlocks?: string[];
   lastHandoffSummary?: string;
   lastHandoffTurn?: number;
+  plan?: Plan | null;
 };
 
 function escapeRegExp(value: string): string {
@@ -587,6 +603,30 @@ function fingerprintHistoryText(historyText: string): string {
   return createHash("sha256").update(stripManagedContextBlocks(historyText), "utf-8").digest("hex");
 }
 
+function parsePersistedPlan(value: unknown): Plan | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<Plan>;
+  if (typeof candidate.goal !== "string" || !Array.isArray(candidate.steps)) return null;
+  const steps: PlanStep[] = (candidate.steps as unknown[])
+    .filter((s): s is Partial<PlanStep> => !!s && typeof s === "object")
+    .map((s, i) => ({
+      index: Number.isFinite(s.index) ? Math.max(0, Math.floor(s.index as number)) : i,
+      description: typeof s.description === "string" ? s.description : "",
+      status: (["pending", "in_progress", "done", "blocked"] as const).includes(s.status as PlanStepStatus)
+        ? (s.status as PlanStepStatus)
+        : "pending",
+      note: typeof s.note === "string" ? s.note : undefined,
+    }))
+    .filter((s) => s.description.length > 0);
+  if (steps.length === 0) return null;
+  return {
+    goal: candidate.goal,
+    steps,
+    createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date(0).toISOString(),
+    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : new Date(0).toISOString(),
+  };
+}
+
 function readRuntimeStateSync(): PersistedSessionState | null {
   try {
     if (!existsSync(RUNTIME_STATE_PATH)) return null;
@@ -605,6 +645,7 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
       lastHandoffSummary: typeof parsed.lastHandoffSummary === "string" ? parsed.lastHandoffSummary : "",
       lastHandoffTurn: typeof parsed.lastHandoffTurn === "number" ? parsed.lastHandoffTurn : 0,
+      plan: parsePersistedPlan(parsed.plan),
     };
   } catch {
     return null;
@@ -624,6 +665,7 @@ function writeRuntimeStateSync(state: SessionState): void {
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
       managedContextBlocks: state.managedContextBlocks,
+      plan: state.plan,
       lastHandoffSummary: state.lastHandoffSummary,
       lastHandoffTurn: state.lastHandoffTurn,
     };
@@ -673,10 +715,20 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             managedContextBlocks: persisted.managedContextBlocks ?? [],
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
             lastHandoffTurn: persisted.lastHandoffTurn ?? 0,
+            plan: persisted.plan ?? null,
           };
         } else {
           activeSessionState = createSessionState();
           activeSessionState.historyFingerprint = historyFingerprint;
+          if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
+            // The raw history no longer matches what we last saw — either the process restarted
+            // mid-conversation or the host rolled/truncated history. Session identity/counters can't
+            // be trusted to still line up, but the last-known directive/plan is still worth
+            // re-asserting rather than silently starting over with nothing.
+            activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
+            activeSessionState.plan = persisted.plan ?? null;
+            activeSessionState.resumedFromPersistedState = true;
+          }
         }
       }
 
@@ -699,6 +751,12 @@ function syncRuntimeState(historyText?: string | null, state: SessionState = act
 }
 
 function recordProcessedPrompt(historyText: string, processed: string, state: SessionState = activeSessionState): string {
+  // Capture vibeLM's own emitted directive at the point it's sent, so it can be re-asserted if the
+  // host rolls/truncates raw history before the model ever echoes it back. Bounded to the most
+  // recent directive — no unbounded growth.
+  if (processed.includes(MANAGED_CONTEXT_MARKER)) {
+    state.managedContextBlocks = [processed];
+  }
   syncRuntimeState([historyText, processed].filter(Boolean).join("\n"), state);
   return processed;
 }
@@ -857,6 +915,27 @@ function shouldSaveCheckpoint(state: SessionState): boolean {
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+const HARMONY_CHANNEL_PREFIX = /<\|channel\|>[\s\S]*?<\|message\|>/gi;
+const HARMONY_CONTROL_TOKEN = /<\|[a-z_]+\|>/gi;
+const THINK_BLOCK = /<think>[\s\S]*?<\/think>/gi;
+const STRAY_THINK_TAG = /<\/?think>/gi;
+
+// Strips model-side leakage (gpt-oss/Harmony channel tokens, GLM/Qwen <think> blocks) out of raw
+// model-generated text before vibeLM persists or replays it into a future prompt. This does not,
+// and cannot, fix the leak in LM Studio's own chat-bubble rendering (out of this plugin's reach) —
+// it only stops vibeLM's own stored/reused data (tick handover, memory, handoff summaries) from
+// getting polluted by it.
+export function stripModelArtifacts(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(THINK_BLOCK, "")
+    .replace(HARMONY_CHANNEL_PREFIX, "")
+    .replace(HARMONY_CONTROL_TOKEN, "")
+    .replace(STRAY_THINK_TAG, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function splitLines(text: string): string[] {
@@ -1737,12 +1816,26 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
           error: "This response looks like a passive handoff. Return concrete progress, blockers, or the final answer instead.",
         };
       }
-      activeSessionState.lastHandoffSummary = text;
+      if (!atTurnCap) {
+        const plan = activeSessionState.plan;
+        const untouched = plan?.steps.filter((s) => s.status === "pending") ?? [];
+        if (untouched.length > 0) {
+          return {
+            ok: false,
+            error: `Plan "${plan!.goal}" still has ${untouched.length} untouched step(s), starting with "${untouched[0].description}". Execute it with your available tools (bash_terminal, file tools, etc.) and call update_plan_step, or call update_plan_step with status "blocked" and a note explaining why before calling amend.`,
+          };
+        }
+      }
+      // Sanitize before persisting/reusing — raw model output can carry leaked Harmony/<think> tags
+      // (see stripModelArtifacts) that would otherwise get replayed into a future prompt via
+      // managedContextBlocks or lastHandoffSummary.
+      const sanitizedText = stripModelArtifacts(text);
+      activeSessionState.lastHandoffSummary = sanitizedText;
       activeSessionState.lastHandoffTurn = activeSessionState.turnCounter;
       const managedBlock = new RegExp(`${escapeRegExp(MANAGED_CONTEXT_MARKER)}[\\s\\S]*?(?=\\n{2,}|$)`, "g");
       const blocks: string[] = [];
       let match: RegExpExecArray | null;
-      while ((match = managedBlock.exec(text)) !== null) {
+      while ((match = managedBlock.exec(sanitizedText)) !== null) {
         blocks.push(match[0]);
       }
       if (blocks.length > 0) {
@@ -1751,10 +1844,69 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
       writeRuntimeStateSync(activeSessionState);
       return {
         ok: true,
-        data: { text },
+        data: { text: sanitizedText },
       };
     },
   });
+
+  const createPlanTool = wrapTool(tool({
+    name: "create_plan",
+    description: text`Creates or replaces the session's execution plan — an ordered list of concrete steps toward a goal.
+USE WHEN: a request needs more than one action to complete. Create the plan, THEN execute each step yourself with your other tools (bash_terminal, file tools, etc.) — do not just describe the plan to the user and stop. Before claiming a capability (node, npm, docker, cron, etc.) is missing, check it yourself with bash_terminal rather than assuming a bare environment.
+EXAMPLE: create_plan({ goal: "Set up a nightly backup of /data", steps: ["Check what's installed: which cron crontab", "Write backup script to /data/backup.sh", "Register the crontab entry", "Verify with crontab -l"] })`,
+    parameters: {
+      goal: z.string().min(1).max(2000),
+      steps: z.array(z.string().min(1).max(1000)).min(1).max(30),
+      autoStart: z.boolean().optional().describe("Auto-start vibe_bridge (if enabled) so the plan keeps executing across ticks unattended. Defaults to true."),
+    },
+    implementation: async ({ goal, steps, autoStart }) => {
+      const now = new Date().toISOString();
+      activeSessionState.plan = {
+        goal,
+        createdAt: now,
+        updatedAt: now,
+        steps: steps.map((description, index) => ({ index, description, status: "pending" as const })),
+      };
+      writeRuntimeStateSync(activeSessionState);
+      const shouldAutoStart = autoStart !== false;
+      let bridgeStarted = false;
+      if (shouldAutoStart && !_bridgeActive && resolveEnabledToolNames(ctl).includes("vibe_bridge")) {
+        startBridge({ prompt: `Continue executing the plan: "${goal}".` });
+        bridgeStarted = true;
+      }
+      return ok({ plan: activeSessionState.plan, bridgeStarted });
+    },
+  }), "create_plan");
+
+  const updatePlanStepTool = wrapTool(tool({
+    name: "update_plan_step",
+    description: text`Updates the status of one step in the current plan.
+USE WHEN: you finish, start, or get blocked on a plan step. Call this immediately after acting on a step — don't batch updates.
+EXAMPLE: update_plan_step({ index: 0, status: "done" })`,
+    parameters: {
+      index: z.number().int().min(0),
+      status: z.enum(["pending", "in_progress", "done", "blocked"]),
+      note: z.string().max(1000).optional().describe("Context for the status change, required in practice when marking a step blocked"),
+    },
+    implementation: async ({ index, status, note }) => {
+      const plan = activeSessionState.plan;
+      if (!plan) return fail("No active plan. Call create_plan first.");
+      const step = plan.steps[index];
+      if (!step) return fail(`No step at index ${index}; plan has ${plan.steps.length} steps.`);
+      step.status = status;
+      if (note) step.note = note;
+      plan.updatedAt = new Date().toISOString();
+      writeRuntimeStateSync(activeSessionState);
+      return ok({ plan });
+    },
+  }), "update_plan_step");
+
+  const getPlanTool = wrapTool(tool({
+    name: "get_plan",
+    description: "Returns the current plan and each step's status, or null if no plan is active.",
+    parameters: {},
+    implementation: async () => ok({ plan: activeSessionState.plan }),
+  }), "get_plan");
 
   const listFilesTool = wrapTool(tool({
     name: "list_files",
@@ -1959,7 +2111,7 @@ NOTE: Will NOT delete non-empty directories. Use bash_terminal 'rm -rf' for that
   const bashTerminalTool = wrapTool(tool({
     name: "bash_terminal",
     description: text`Runs a bash command in the workspace directory. Each call creates a fresh process.
-USE WHEN: you need to run shell commands, scripts, or access binary files.
+USE WHEN: you need to run shell commands, scripts, or access binary files. Before telling the user a capability (node, npm, docker, cron, tmux, etc.) is missing, check it yourself here, e.g. bash_terminal({ command: "which node npm" }) — do not assume a bare environment.
 EXAMPLE: bash_terminal({ command: "ls -la", timeout: 10000 })
 NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 120s. Output is capped at 10MB.`,
     parameters: {
@@ -2011,7 +2163,7 @@ NOTE: Every saved memory is automatically tagged with the current workspace and 
       const workspace = requireWorkspace(ctl);
       getSessionLog().saveMemory(
         buildMemoryTags(tags, currentSessionId(sessionState), workspace, scope),
-        content,
+        stripModelArtifacts(content),
         undefined,
         currentSessionId(sessionState),
         workspace,
@@ -2332,7 +2484,7 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
           const buffer = _bridgeHandover.join("\n\n");
           const summarizePrompt = `Summarize this conversation in 2-3 concise sentences, focusing on what the user was working on and any open questions:\n\n${buffer}`;
           const result = await model.complete(summarizePrompt, { maxTokens: 200 });
-          handover = result.content.trim();
+          handover = stripModelArtifacts(result.content.trim());
         }
 
         // Step 2: Build chat with handover + bridge prompt
@@ -2343,22 +2495,32 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
             content: `Context from the current session:\n${handover}`,
           });
         }
+        // If a plan is active, point the tick at the next unfinished step so unattended ticks make
+        // real progress instead of drifting — this is what makes create_plan's autoStart useful.
+        const plan = activeSessionState.plan;
+        const nextStep = plan?.steps.find((s) => s.status === "pending" || s.status === "in_progress");
+        const planDirective = plan && nextStep
+          ? `${MANAGED_CONTEXT_MARKER}\n[Plan "${plan.goal}" — step ${nextStep.index + 1}/${plan.steps.length}: ${nextStep.description}\nExecute it now with your available tools. Call update_plan_step({ index: ${nextStep.index}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`
+          : "";
         // Apply the configured reasoning-effort directive to the tick prompt. Besides honoring the
         // user's setting, suppressing reasoning here curbs the unbounded "Wait... Actually..." loops
         // that the round/timeout caps above were added to bound.
         const tickDirective = await reasoningDirectiveForSession(ctl);
         chatMessages.push({
           role: "user",
-          content: tickDirective ? `${_bridgePrompt}\n\n${tickDirective}` : _bridgePrompt,
+          content: [planDirective, tickDirective ? `${_bridgePrompt}\n\n${tickDirective}` : _bridgePrompt].filter(Boolean).join("\n\n"),
         });
 
         const chat = Chat.from(chatMessages);
         // bash_terminal is intentionally excluded from unattended ticks until it has a command
         // allowlist — see NOTES.md. vibe_bridge/amend are excluded to avoid nested bridge starts
         // and orchestrator-specific finalize semantics that don't apply to this standalone act() call.
+        // create_plan is excluded too (plans are created interactively); update_plan_step/get_plan
+        // are included so a tick can actually mark progress on the plan it's executing.
         const bridgeTickTools = [
           exploreWorkspaceTool, listFilesTool, readFileTool, writeFileTool, appendFileTool,
           searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
+          updatePlanStepTool, getPlanTool,
         ];
         await model.act(chat, bridgeTickTools, {
           maxPredictionRounds: resolveMaxThinkingSteps(ctl),
@@ -2493,6 +2655,9 @@ The default prompt can be configured in tool settings.`,
     encode_base64: encodeBase64Tool,
     decode_base64: decodeBase64Tool,
     amend: amendTool,
+    create_plan: createPlanTool,
+    update_plan_step: updatePlanStepTool,
+    get_plan: getPlanTool,
     vibe_bridge: vibeBridgeTool,
   };
 
@@ -2528,7 +2693,7 @@ The default prompt can be configured in tool settings.`,
   return allTools;
 }
 
-export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
+async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   await bootstrapSessionState(ctl as any);
   const contextWindow = await getContextWindow(ctl as any);
@@ -2632,16 +2797,29 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   if (plainReport.overflow) {
     return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
   }
-  // Continuation in managed-context session: prevent LLM from re-executing stale instructions
+  // Continuation in managed-context session: prevent LLM from re-executing stale instructions.
+  // (Rehydration of persisted managedContextBlocks after a context roll happens unconditionally,
+  // one layer up in the preprocessMessage wrapper below — it no longer depends on CONTINUATION_PATTERN.)
   if (managedContextPresent && CONTINUATION_PATTERN.test(t)) {
-    if (hasStoredBlocks) {
-      const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${activeSessionState.managedContextBlocks.join("\n\n")}\n\n[Continue from the last completed step. Do NOT restart. Read the history and proceed with the next uncompleted step.]`;
-      activeSessionState.managedContextBlocks = [];
-      activeSessionState.resumedFromPersistedState = false;
-      writeRuntimeStateSync(activeSessionState);
-      return recordProcessedPrompt(historyText, rehydrated);
-    }
     return recordProcessedPrompt(historyText, compactContinueInstruction());
   }
   return null;
+}
+
+export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
+  await bootstrapSessionState(ctl as any);
+  const rehydrationBlocks = (activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0)
+    ? activeSessionState.managedContextBlocks.slice()
+    : null;
+  if (rehydrationBlocks) {
+    // Consume immediately so it only fires once, and so preprocessMessageCore's own
+    // managedContextPresent/hasStoredBlocks checks don't see stale state.
+    activeSessionState.managedContextBlocks = [];
+    activeSessionState.resumedFromPersistedState = false;
+    writeRuntimeStateSync(activeSessionState);
+  }
+  const result = await preprocessMessageCore(text, ctl);
+  if (!rehydrationBlocks) return result;
+  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${rehydrationBlocks.join("\n\n")}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
+  return result ? `${rehydrated}\n\n${result}` : rehydrated;
 }

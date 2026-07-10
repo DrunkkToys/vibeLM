@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Plan execution** — `create_plan`, `update_plan_step`, and `get_plan` give the model a structured,
+  ordered step list instead of letting it narrate a plan in prose and stop. `amend` now refuses to
+  close out a session while the plan has untouched (`pending`) steps. `create_plan` can auto-start
+  `vibe_bridge` so unattended ticks keep making progress on the plan's next pending step.
+
+### Fixed
+- **`reasoningEffort` was a silent no-op for most users.** `medium`/`high` produced an empty directive
+  for every architecture except gpt-oss (Llama/Mistral/Gemma/DeepSeek/GLM/Phi/etc. all got nothing),
+  and Qwen's `low`/`medium`/`high` all resolved to the identical `/think` — the setting only ever did
+  anything for `off` vs. "on". Every level now produces a distinct directive per model family.
+- **Context-roll recovery almost never worked.** vibeLM's `managedContextBlocks` recovery state (meant
+  to re-assert its own instructions after the host truncates/rolls raw history) was only ever
+  populated by scraping the model's own final answer for a marker it had no reason to echo back, and
+  even when populated it only rehydrated if the next user message happened to match a
+  continuation-style regex. It's now captured at the point vibeLM itself emits a directive, and
+  rehydrates unconditionally on the very next turn after a detected roll, regardless of wording.
+- **Leaked model-side tags (gpt-oss Harmony `<|channel|>...`, GLM/Qwen `<think>...</think>`) could
+  pollute vibeLM's own stored/reused data** — the `vibe_bridge` tick handover summary, `amend`
+  handoffs, and `save_memory` content. Added `stripModelArtifacts` and applied it at those call sites.
+  (The chat-bubble leak itself is LM Studio's own Harmony-parser bug and out of this plugin's reach —
+  it has no hook into the assistant-response render path.)
+
 ## [0.2.2] - 2026-07-10
 
 ### Added
