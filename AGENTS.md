@@ -12,9 +12,16 @@
 8. **Create PR** — `gh pr create` with description
 9. **Commit** — `git add . && git commit -m "feat: description"`
 10. **Push** — `git push origin feature/description`
-11. **Make sure CI is green** — check GitHub Actions
-12. **Merge** — merge PR after CI passes
-13. **Create skills** — document the pipeline for training
+11. **Make sure CI is green** — `test.yml` runs on Node 20 & 22
+12. **Merge** — after CI passes. `main` needs 1 review; on this solo repo use an admin merge (`gh pr merge <#> --merge --admin`). Agents: `--admin` is blocked by the safety classifier — surface the command for the human.
+13. **Release** — publishing happens by pushing a `vX.Y.Z` tag, which triggers `release.yml` (GitHub Release + npm). Not by merging.
+
+## Skills
+
+Reusable workflows are captured under `.claude/skills/` — use them instead of re-deriving the steps:
+
+- **add-setting** — add a `tools.*` plugin config setting end to end (config field → resolver → wire → cascade test → README + CHANGELOG).
+- **release** — full release pipeline: preflight → bump → CHANGELOG/README → PR → CI → merge → tag → npm/GitHub publish (LM Studio Hub step self-skips on hosted runners).
 
 ## Test Types
 

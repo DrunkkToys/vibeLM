@@ -29,7 +29,17 @@ docs: update README
 ```
 
 ### After Pushing
-- Check CI status on GitHub
+- Check CI status on GitHub (`test.yml`, Node 20 & 22)
 - Wait for green
-- Merge PR
+- Merge PR — `main` needs 1 review; solo repo uses an admin merge (`gh pr merge <#> --merge --admin`). If your `--admin` is blocked by the safety classifier, surface the command for the human.
 - Pull latest: `git pull origin main`
+
+### Releasing
+- Publishing happens by pushing a `vX.Y.Z` tag (not by merging). The tag triggers `release.yml` → GitHub Release + npm publish.
+- LM Studio Hub publish self-skips on hosted runners (no `lms` CLI); do it manually with `lms push` if needed.
+
+## Skills
+
+Reusable workflows live in `.claude/skills/` — use them instead of re-deriving:
+- **add-setting** — add a `tools.*` plugin config setting end to end.
+- **release** — the full release pipeline described above.
