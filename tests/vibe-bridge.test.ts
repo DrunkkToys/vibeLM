@@ -205,4 +205,48 @@ describe("vibe_bridge Cascade", () => {
     assert.equal(capturedOpts.maxPredictionRounds, 8, "tick should cap prediction rounds so a stuck non-tool-calling loop can't run unbounded");
     assert.ok(capturedOpts.signal instanceof AbortSignal, "tick should pass an AbortSignal so a stuck tick can't block subsequent ticks");
   });
+
+  it("should auto-start when enabled in plugin settings, without an explicit start call", async () => {
+    const idleClient = {
+      llm: {
+        listLoaded: async () => [],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl(), idleClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    // No "start" action called here — enabling the tool via config should be enough.
+    const status = await bridge.implementation({ action: "status" });
+    assert.equal(status.data.active, true, "bridge should auto-start when tools.vibe_bridge is enabled");
+    assert.equal(status.data.interval, 120, "should use the configured default interval");
+    assert.equal(status.data.maxDuration, 3600, "should use the configured default maxDuration");
+
+    await bridge.implementation({ action: "stop" });
+  });
+
+  it("should not double-start (and reset state) when toolsProvider is invoked again while already active", async () => {
+    const idleClient = {
+      llm: {
+        listLoaded: async () => [],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    let tools = await toolsProvider(makeCtl(), idleClient);
+    let bridge = tools.find((t: any) => t.name === "vibe_bridge");
+    const first = await bridge.implementation({ action: "status" });
+    assert.equal(first.data.active, true);
+    const firstIteration = first.data.iteration;
+
+    // Simulate a second session/request reusing the same running plugin process.
+    tools = await toolsProvider(makeCtl(), idleClient);
+    bridge = tools.find((t: any) => t.name === "vibe_bridge");
+    const second = await bridge.implementation({ action: "status" });
+    assert.equal(second.data.active, true, "should still be active, not restarted from scratch");
+    assert.equal(second.data.iteration, firstIteration, "already-active bridge should be left alone, not reset");
+
+    await bridge.implementation({ action: "stop" });
+  });
 });

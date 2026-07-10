@@ -2278,32 +2278,44 @@ The default prompt can be configured in tool settings.`,
         ctx?.status?.("Bridge stopped");
         return ok({ stopped: true, iteration: _bridgeIteration });
       }
-      const resolvedPrompt = prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
-        || DEFAULT_VIBE_BRIDGE_PROMPT);
-      const resolvedInterval = interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
-        ?? DEFAULT_VIBE_BRIDGE_INTERVAL);
-      const resolvedMaxDuration = maxDuration ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_maxDuration", "vibe_bridge_maxDuration"])
-        ?? DEFAULT_VIBE_BRIDGE_MAX_DURATION);
-      if (_bridgeTimer) clearTimeout(_bridgeTimer);
-      _bridgeActive = true;
-      _bridgePrompt = resolvedPrompt;
-      _bridgeInterval = resolvedInterval;
-      _bridgeIteration = 0;
-      _bridgeConsecutiveFailures = 0;
-      _bridgeMaxIterations = maxIterations ?? 0;
-      _bridgeMaxDuration = resolvedMaxDuration;
-      _bridgeStartedAt = Date.now();
-      _scheduleNextBridgeIteration();
-      ctx?.status?.(`Bridge started: ${_bridgeInterval}s interval, max ${_bridgeMaxDuration ? `${_bridgeMaxDuration}s` : "∞"}`);
+      const started = startBridge({ prompt, interval, maxDuration, maxIterations });
+      ctx?.status?.(`Bridge started: ${started.interval}s interval, max ${started.maxDuration ? `${started.maxDuration}s` : "∞"}`);
       return ok({
         active: true,
-        prompt: _bridgePrompt.slice(0, 100),
-        interval: _bridgeInterval,
-        maxDuration: _bridgeMaxDuration,
-        maxIterations: _bridgeMaxIterations || "unlimited",
+        prompt: started.prompt.slice(0, 100),
+        interval: started.interval,
+        maxDuration: started.maxDuration,
+        maxIterations: started.maxIterations || "unlimited",
       });
     },
   }), "vibe_bridge");
+
+  // Shared by the vibe_bridge tool's "start" action and the auto-start-on-toggle path below —
+  // both need identical resolve-defaults-then-arm-the-timer behavior.
+  function startBridge(opts: { prompt?: string; interval?: number; maxDuration?: number; maxIterations?: number }) {
+    const resolvedPrompt = opts.prompt || String(readPluginConfigValue(ctl, ["tools.vibe_bridge_prompt", "vibe_bridge_prompt"])
+      || DEFAULT_VIBE_BRIDGE_PROMPT);
+    const resolvedInterval = opts.interval ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_interval", "vibe_bridge_interval"])
+      ?? DEFAULT_VIBE_BRIDGE_INTERVAL);
+    const resolvedMaxDuration = opts.maxDuration ?? Number(readPluginConfigValue(ctl, ["tools.vibe_bridge_maxDuration", "vibe_bridge_maxDuration"])
+      ?? DEFAULT_VIBE_BRIDGE_MAX_DURATION);
+    if (_bridgeTimer) clearTimeout(_bridgeTimer);
+    _bridgeActive = true;
+    _bridgePrompt = resolvedPrompt;
+    _bridgeInterval = resolvedInterval;
+    _bridgeIteration = 0;
+    _bridgeConsecutiveFailures = 0;
+    _bridgeMaxIterations = opts.maxIterations ?? 0;
+    _bridgeMaxDuration = resolvedMaxDuration;
+    _bridgeStartedAt = Date.now();
+    _scheduleNextBridgeIteration();
+    return {
+      prompt: _bridgePrompt,
+      interval: _bridgeInterval,
+      maxDuration: _bridgeMaxDuration,
+      maxIterations: _bridgeMaxIterations,
+    };
+  }
 
   const ALL_TOOL_MAP: Record<string, any> = {
     set_workspace: setWorkspaceTool,
@@ -2355,6 +2367,16 @@ The default prompt can be configured in tool settings.`,
       allTools.splice(amendIdx, 1);
       allTools.push(amendTool);
     }
+  }
+
+  // The "Vibe Bridge" toggle in plugin settings is meant to directly control the keep-alive loop,
+  // not just expose a tool the model has to remember to call. If it's on and nothing is running
+  // yet, arm it here using configured defaults (same resolve path as the tool's "start" action) —
+  // it still inherits the round/timeout caps on each tick, so this can't repeat the unbounded-hang
+  // failure mode even though it now starts unattended.
+  if (enabledNames.includes("vibe_bridge") && !_bridgeActive && _bridgeClient) {
+    console.log("[vibe_bridge] Auto-starting: enabled in plugin settings.");
+    startBridge({});
   }
 
   return allTools;

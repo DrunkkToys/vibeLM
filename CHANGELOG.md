@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-07-09
 
+### Changed
+- `vibe_bridge` now auto-starts as soon as the "Vibe Bridge" toggle is enabled in plugin settings,
+  using the configured default prompt/interval/maxDuration — no chat message needed to explicitly
+  call `vibe_bridge({action:"start"})` first. An already-running bridge is left alone if the tool
+  provider is invoked again (e.g. a new session on an already-running plugin process).
+
 ### Fixed
 - `vibe_bridge`'s keep-alive tick called `model.act(chat, bridgeTickTools)` as a standalone call
   outside the main orchestrator, so it never inherited `maxOrchestratorTurns` and had no round or
