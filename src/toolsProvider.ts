@@ -71,6 +71,12 @@ const CHECKPOINT_INTERVAL_EARLY = 4;
 const CONTINUATION_PATTERN = /(?:keep\s+(?:going|working|doing)|continue|go\s+(?:on|ahead)|proceed|carry\s+on|resume|move\s+on|what(?:'s|\sis)\s+next|next\s+step|finish\s+(?:it|the\s+task|the\s+rest)|complete\s+(?:it|the\s+task)|do\s+the\s+rest|pick\s+up\s+where|as\s+you\s+were|same\s+(?:as\s+before|thing)|and\s+then|go\s+ahead|yeah|yes|ok|okay|sure|right)/i;
 const readOnlyTools = ["list_files", "read_file", "search_files", "get_current_datetime", "get_config", "list_memories", "search_memory", "get_plan"];
 const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
+// Thresholds for telling a real mid-conversation restart/roll apart from a genuinely new/different
+// chat on a historyFingerprint mismatch (see bootstrapSessionState). Only treat it as a new
+// conversation — and skip carrying over the old plan — when the *previous* history was substantial
+// (not just a short placeholder/first turn) AND the new history is dramatically shorter than it.
+const MIN_SUBSTANTIAL_HISTORY_CHARS = 500;
+const NEW_CONVERSATION_LENGTH_RATIO = 0.3;
 // Denylist, not allowlist: bash_terminal is a general-purpose dev tool (git, npm, build scripts,
 // etc.), so an allowlist would block too much legitimate use. This blocks clearly destructive or
 // privilege-escalating patterns rather than trying to enumerate every safe command.
@@ -571,6 +577,7 @@ type SessionState = {
   toolCallHistory: Array<{ name: string; signature: string; coarse: string; ts: number }>;
   lastCompactionTurn: number;
   historyFingerprint: string;
+  historyTextLength: number;
   resumedFromPersistedState: boolean;
   managedContextBlocks: string[];
   lastHandoffSummary: string;
@@ -585,6 +592,7 @@ function createSessionState(): SessionState {
     toolCallHistory: [],
     lastCompactionTurn: 0,
     historyFingerprint: "",
+    historyTextLength: 0,
     resumedFromPersistedState: false,
     managedContextBlocks: [],
     lastHandoffSummary: "",
@@ -618,6 +626,7 @@ type PersistedSessionState = {
   turnCounter: number;
   lastCompactionTurn: number;
   historyFingerprint: string;
+  historyTextLength?: number;
   resumedFromPersistedState: boolean;
   updatedAt: string;
   managedContextBlocks?: string[];
@@ -698,6 +707,7 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       turnCounter: Number.isFinite(parsed.turnCounter) ? Math.max(0, Math.floor(parsed.turnCounter ?? 0)) : 0,
       lastCompactionTurn: Number.isFinite(parsed.lastCompactionTurn) ? Math.max(0, Math.floor(parsed.lastCompactionTurn ?? 0)) : 0,
       historyFingerprint: parsed.historyFingerprint,
+      historyTextLength: Number.isFinite(parsed.historyTextLength) ? Math.max(0, Math.floor(parsed.historyTextLength ?? 0)) : 0,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
       managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
@@ -720,6 +730,7 @@ function writeRuntimeStateSync(state: SessionState): void {
       turnCounter: state.turnCounter,
       lastCompactionTurn: state.lastCompactionTurn,
       historyFingerprint: state.historyFingerprint,
+      historyTextLength: state.historyTextLength,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
       managedContextBlocks: state.managedContextBlocks,
@@ -781,6 +792,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             toolCallHistory: [],
             lastCompactionTurn: persisted.lastCompactionTurn,
             historyFingerprint,
+            historyTextLength: historyText.length,
             resumedFromPersistedState: true,
             managedContextBlocks: persisted.managedContextBlocks ?? [],
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
@@ -790,7 +802,19 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
         } else {
           activeSessionState = createSessionState();
           activeSessionState.historyFingerprint = historyFingerprint;
-          if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
+          activeSessionState.historyTextLength = historyText.length;
+          // A fingerprint mismatch is ambiguous: it's either (a) the process restarted mid-conversation
+          // or the host rolled/truncated history — same conversation, still worth re-asserting the plan
+          // — or (b) this is a genuinely new/different chat that happens to reuse the same persisted
+          // state file. Only the raw history text length distinguishes them: a restart/roll of an
+          // ongoing conversation still carries a comparable (or larger) amount of text, while a brand
+          // new chat starts from just the system prompt + first message. Caught live: a fresh chat
+          // asking for an unrelated weather CLI resurrected a many-turn REST-API-backend plan from a
+          // previous, unrelated session because this branch carried it over unconditionally.
+          const oldLength = persisted?.historyTextLength ?? 0;
+          const looksLikeGenuinelyNewConversation = oldLength > MIN_SUBSTANTIAL_HISTORY_CHARS
+            && historyText.length < oldLength * NEW_CONVERSATION_LENGTH_RATIO;
+          if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
             // The raw history no longer matches what we last saw — either the process restarted
             // mid-conversation or the host rolled/truncated history. Session identity/counters can't
             // be trusted to still line up, but the last-known directive/plan is still worth
@@ -816,6 +840,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
 function syncRuntimeState(historyText?: string | null, state: SessionState = activeSessionState): void {
   if (typeof historyText === "string" && historyText.trim().length > 0) {
     state.historyFingerprint = fingerprintHistoryText(historyText);
+    state.historyTextLength = historyText.length;
   }
   writeRuntimeStateSync(state);
 }
@@ -3021,6 +3046,29 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   // one layer up in the preprocessMessage wrapper below — it no longer depends on CONTINUATION_PATTERN.)
   if (managedContextPresent && CONTINUATION_PATTERN.test(t)) {
     return recordProcessedPrompt(historyText, compactContinueInstruction());
+  }
+  // Once every existing plan step reads "done", nothing previously turned a genuinely new follow-up
+  // instruction into tracked work: amend's pending-step guard only blocks premature completion when
+  // there ARE pending steps, and nothing ever added one for a new ask. Caught live (reproduced
+  // identically across two unrelated models): after a plan completed, a plain follow-up instruction
+  // ("cache it for an hour") was silently ignored — the model just replied with a recap of the
+  // already-done work and never called a tool, because nothing compelled it to. Auto-append a new
+  // step and direct the model at it, extending the same forcing function to new asks.
+  if (
+    activeSessionState.plan &&
+    activeSessionState.plan.steps.length > 0 &&
+    activeSessionState.plan.steps.every((s) => s.status === "done") &&
+    isGoalLikeMessage(t)
+  ) {
+    const plan = activeSessionState.plan;
+    const newIndex = plan.steps.length;
+    plan.steps.push({ index: newIndex, description: truncateText(t, 300), status: "pending" });
+    plan.updatedAt = new Date().toISOString();
+    writeRuntimeStateSync(activeSessionState);
+    return recordProcessedPrompt(
+      historyText,
+      `[Plan "${plan.goal}" — new step ${newIndex + 1}/${plan.steps.length} added from this message: ${truncateText(t, 300)}\nExecute it now with your available tools. Call update_plan_step({ index: ${newIndex}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`,
+    );
   }
   return null;
 }
