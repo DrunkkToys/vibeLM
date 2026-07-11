@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-11
+
+### Fixed
+- **Plan state no longer bleeds across chats.** `bootstrapSessionState` now detects when a new
+  conversation is dramatically shorter than the previously persisted history length and discards the
+  stale plan instead of carrying it forward. Previously, a brand-new chat could inherit an unrelated
+  plan from `runtime-state.json`.
+- **New instructions no longer silently die after a fully-completed plan.** When every step in a
+  plan reads "done" and the user sends a new goal, `preprocessMessageCore` now auto-appends a new
+  pending step so the model actually executes it instead of replying in plain text and stopping.
+
 ## [0.2.5] - 2026-07-11
 
 ### Added
