@@ -1,6 +1,6 @@
 {
   "name": "vibe-lm",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "A comprehensive set of agentic tools for LM Studio: file operations, web fetching/search, memory, SSH, and an autonomous vibe_bridge keep-alive loop.",
   "main": "dist/index.js",
   "scripts": {
@@ -9,7 +9,9 @@
     "build": "tsc",
     "build:prod": "./build.sh",
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:watch": "node --import tsx --test --watch tests/*.test.ts"
+    "test:watch": "node --import tsx --test --watch tests/*.test.ts",
+    "bench": "node benchmark/run.mjs",
+    "bench:report": "node benchmark/report.mjs"
   },
   "author": "drunkktoys",
   "license": "MIT",
