@@ -538,7 +538,11 @@ function requireWorkspace(ctl: any): string {
 }
 
 function sandboxPath(workspace: string, requestedPath: string): string {
-  const resolved = resolve(workspace, requestedPath);
+  const expandedPath =
+    requestedPath === "~" || requestedPath.startsWith("~/")
+      ? resolve(homedir(), requestedPath.slice(2))
+      : requestedPath;
+  const resolved = resolve(workspace, expandedPath);
   const rel = relative(workspace, resolved);
   if (rel.startsWith("..") || resolve(rel) === rel) {
     throw new Error(`Path "${requestedPath}" is outside the workspace "${workspace}"`);
