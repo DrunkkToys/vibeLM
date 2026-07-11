@@ -650,6 +650,94 @@ describe("vibeLM Cascade Integration", () => {
     if (existsSync(rsPath)) rmSync(rsPath);
   });
 
+  it("bootstrapSessionState does NOT carry over a persisted plan into a genuinely new/different chat (live-testing regression: a brand-new chat asking for an unrelated weather CLI resurrected a many-turn, unrelated 'build a REST API backend' plan from a previous session and started writing files for it, because the fingerprint-mismatch branch carried the old plan over unconditionally — it could not tell a real restart/roll of the SAME conversation apart from a genuinely NEW one)", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    // Establish a substantial, many-turn old conversation with a real plan.
+    let oldHistory = "Turn 1: build a production REST API backend with Express and TypeScript\n".repeat(30);
+    const oldCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => oldHistory }),
+    };
+    await resolveSessionStateFromHistory(oldCtl, true);
+    await preprocessMessage("Build a production REST API backend with Express and TypeScript", oldCtl);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    await createPlan.implementation({ goal: "REST API backend", steps: ["scaffold project", "add routes", "add tests"], autoStart: false });
+    const beforeNewChat = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.ok(beforeNewChat.plan?.steps?.length === 3, "old plan should be persisted before the new chat starts");
+
+    // A brand-new, unrelated chat: short history, completely different topic, and — critically — it
+    // does NOT match the old fingerprint (this is the same code path a real restart/roll takes).
+    const newChatCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "yo can you set me up a quick weather cli" }),
+    };
+    const resumed = await resolveSessionStateFromHistory(newChatCtl, true);
+
+    assert.equal(resumed.plan, null, "a genuinely new/different chat must NOT inherit the old, unrelated plan");
+    assert.equal(resumed.resumedFromPersistedState, false, "a genuinely new chat is not a resume");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("bootstrapSessionState STILL carries over a persisted plan across a real mid-conversation restart/roll (guards against the previous test's fix being too aggressive)", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    let history = "Turn 1: build a production REST API backend with Express and TypeScript\n".repeat(30);
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Build a production REST API backend with Express and TypeScript", ctl);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    await createPlan.implementation({ goal: "REST API backend", steps: ["scaffold project", "add routes", "add tests"], autoStart: false });
+
+    // Simulate a host-side roll/restart of the SAME conversation: the raw text changes (so the
+    // fingerprint no longer matches) but stays comparably long, as a real ongoing conversation would.
+    history = "Turn 1: build a production REST API backend with Express and TypeScript\n".repeat(28) + "Turn 29: continue where we left off, same project\n";
+    const resumed = await resolveSessionStateFromHistory(ctl, true);
+
+    assert.ok(resumed.plan, "a real restart/roll of the same, substantial conversation must still carry the plan over");
+    assert.equal(resumed.plan?.goal, "REST API backend");
+    assert.equal(resumed.resumedFromPersistedState, true);
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("a completed plan does not silently swallow a genuinely new follow-up instruction (live-testing regression: after a plan's steps were all marked done, a plain follow-up like 'cache it for an hour' was reproducibly ignored across two unrelated models — the model just replied with a recap of the already-done work and never called a tool, because nothing turned the new instruction into tracked work)", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a weather cli" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("build me a quick weather cli that takes a city and prints the weather", ctl);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    await createPlan.implementation({ goal: "weather cli", steps: ["write index.js"], autoStart: false });
+    const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+    await updatePlanStep.implementation({ index: 0, status: "done" });
+
+    const processed = await preprocessMessage("actually don't hit the network every time, cache it for an hour", ctl);
+
+    assert.ok(processed, "a new instruction after a completed plan must produce a directive, not silently pass through as null");
+    assert.match(processed as string, /cache it for an hour/, "the directive must carry the actual new instruction");
+    assert.match(processed as string, /Execute it now/, "the directive must compel action, matching the existing plan-step directive style");
+
+    const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(rs.plan?.steps?.length, 2, "a new pending step should be appended to the existing plan");
+    assert.equal(rs.plan?.steps?.[1]?.status, "pending");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
   it("delete_file uses the filePath param name, consistent with read_file/write_file (caught live: model used filePath from those tools, delete_file rejected it)", async () => {
     const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
     const ctl = makeCtl({ maxOrchestratorTurns: 0, toolToggles: { delete_file: true } });
