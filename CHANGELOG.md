@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-11
+
+### Fixed
+- **Expand literal `~` in file-tool paths** instead of treating it as a directory name — a model passing `filePath: '~/Desktop/...'` now correctly resolves the home directory instead of writing into a literal `~/` subdirectory within the workspace.
+
+### Changed
+- Ignore `.claude/` and `.agents/` directories in `.gitignore`.
+
 ## [0.2.6] - 2026-07-11
 
 ### Fixed
@@ -299,7 +307,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7
 [0.2.0]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/DrunkkToys/vibeLM/releases/tag/v0.1.0
