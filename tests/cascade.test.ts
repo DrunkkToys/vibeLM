@@ -752,4 +752,42 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(result.ok, "delete_file must accept filePath, matching read_file/write_file's param name");
     assert.ok(!existsSync(target), "the file must actually be deleted");
   });
+
+  it("write_file expands a leading ~ in filePath instead of writing a literal '~' directory (caught live: a model passed filePath: '~/Desktop/sandbox/weather-cli/index.js' and the file silently landed at '<workspace>/~/Desktop/sandbox/weather-cli/index.js' while still reporting success)", async () => {
+    const { homedir } = require("node:os");
+    const home = homedir();
+    const homeWorkspace = resolve(home, `.vibelm-cascade-tilde-test-${Date.now()}`);
+    mkdirSync(homeWorkspace, { recursive: true });
+    makeConfig({ workspacePath: homeWorkspace });
+    try {
+      const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+      const ctl: any = { getWorkingDirectory: () => homeWorkspace };
+      await resolveSessionStateFromHistory(ctl, true);
+      const tools = await toolsProvider(ctl);
+      const writeFile: any = tools.find((t: any) => t.name === "write_file");
+
+      const relFromHome = homeWorkspace.slice(home.length + 1);
+      const result: any = await writeFile.implementation({ filePath: `~/${relFromHome}/tilde-test.txt`, content: "hello" });
+
+      assert.ok(result.ok, "write_file should accept a ~-prefixed path that resolves inside the workspace");
+      const expected = resolve(homeWorkspace, "tilde-test.txt");
+      assert.equal(result.data.path, expected, "the ~ must be expanded to the real home directory, not treated as a literal path segment");
+      assert.ok(existsSync(expected), "the file must actually exist at the expanded path");
+      assert.ok(!existsSync(resolve(homeWorkspace, "~")), "no literal '~'-named directory should be created inside the workspace");
+    } finally {
+      makeConfig();
+      rmSync(homeWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("write_file still rejects a ~-prefixed path that resolves outside the workspace", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl();
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const writeFile: any = tools.find((t: any) => t.name === "write_file");
+
+    const result: any = await writeFile.implementation({ filePath: "~/some-other-place-outside-the-workspace.txt", content: "nope" });
+    assert.ok(!result.ok, "a ~-expanded path outside the workspace must still be rejected by the sandbox containment check");
+  });
 });
