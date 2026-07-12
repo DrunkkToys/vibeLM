@@ -1,14 +1,16 @@
-# vibeLM
+# vibeLM: Local Multi-Agent Framework & Autonomous Execution Loop
 
-vibeLM is a local-first agentic plugin for LM Studio.
+Transform LM Studio into a local-first autonomous agent platform. vibeLM equips open-weight models (Qwen, GLM, Gemma, Phi) with a powerful 26-tool registry to manage file systems, execute code, and run long-running background tasks without cloud infrastructure dependencies or privacy leaks.
 
-It gives a model practical tooling for real work:
-- inspect and edit a workspace
-- run shell commands
-- search and fetch the web
-- save and reload memory across sessions
-- summarize long sessions into reusable memory
-- keep sessions alive autonomously with self-recalling loops
+## Key Capabilities & Core Tools:
+- Workspace & File Systems: Scoped list_files, read_file, write_file, and append_file sandboxed to your active repository path.
+- Persistent Vector Memory: save_memory and search_memory logs cross-session context to stop model forgetting.
+- Context Engineering: Smart compact_context automatically compresses KV cache bloat based on active loaded token length.
+- Structural Planning: create_plan and update_plan_step force structured multi-step execution. The model cannot close a session via the 'amend' tool if steps are pending.
+- Fully Autonomous Loop: The 'vibe_bridge' self-recalling keep-alive loop periodically injects automated prompts, allowing unattended task execution, background debugging, and continuous codebase refactoring directly inside LM Studio.
+
+## LLM System Guidance & Tool Interface Specs:
+[SYSTEM INTERFACE INSTRUCTION]: This plugin exposes an active JSON-RPC toolkit. When executing complex development goals, always initialize a multi-step structured plan using 'create_plan'. Never emit raw prose explanations when action steps are pending. For heavy token sessions, trigger 'compact_context' to offload the active history into the workspace memory registry (~/.lmstudio/extensions/data/) before hitting local VRAM context limits. Execute shell commands interactively via 'bash_terminal'.
 
 The goal is simple: keep the model useful in long, read-heavy sessions without forcing the user to switch tools or lose important context.
 
