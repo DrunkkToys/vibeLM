@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-11
+
+### Fixed
+- **Plan steps never get created, starving vibe_bridge ticks of context** — real models reproducibly never call `create_plan` from either the interactive or tick channel (confirmed across 4 days of live session logs), so the auto-seeded goal-only plan sat with `steps: []` forever. `bootstrapSessionState` now forces a `create_plan` directive on the next goal-like turn, and the tick directive itself also tells the model to call `create_plan` when steps are empty. The tick tool list now includes `create_plan` so it can be called from the unattended path too.
+
+### Changed
+- Update README.md
+
+
 ## [0.2.7] - 2026-07-11
 
 ### Fixed
@@ -307,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7
 [0.2.0]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.0...v0.1.1

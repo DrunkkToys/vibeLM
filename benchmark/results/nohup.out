@@ -1,0 +1,19 @@
+[2026-07-10T23:03:21.395Z] Starting benchmark run 2026-07-10T23-03-21-395Z
+[2026-07-10T23:03:21.428Z] Discovered 8 model(s): local:qwen3.5-4b, local:zai-org/glm-4.6v-flash, local:qwen/qwen3-4b, local:llama-3.2-3b-instruct, local:ibm/granite-4-h-tiny, local:microsoft/phi-4-mini-reasoning, local:qwen/qwen3.5-9b, local:google/gemma-4-e4b
+[2026-07-10T23:03:21.431Z] Loading local:qwen3.5-4b (qwen3.5-4b)...
+[LMStudioClient][LLM] Verbose logging is enabled. To hide progress logs, set the "verbose" option to false in client.llm.load.
+[LMStudioClient][LLM] Start loading model qwen3.5-4b...
+[LMStudioClient][LLM] Loading the model, progress: 0.0%
+[LMStudioClient][LLM] Loading the model, progress: 7.5%
+[LMStudioClient][LLM] Loading the model, progress: 13.9%
+[LMStudioClient][LLM] Loading the model, progress: 19.5%
+[LMStudioClient][LLM] Loading the model, progress: 24.4%
+[LMStudioClient][LLM] Loading the model, progress: 28.7%
+[LMStudioClient][LLM] Loading the model, progress: 32.6%
+[LMStudioClient][LLM] Loading the model, progress: 36.1%
+[LMStudioClient][LLM] Loading the model, progress: 100.0%
+[LMStudioClient][LLM] Successfully loaded model qwen3.5-4b in 3970ms
+[2026-07-10T23:03:25.402Z]   [local:qwen3.5-4b] running arith-1...
+[2026-07-10T23:03:49.299Z]   [local:qwen3.5-4b] running arith-2...
+[2026-07-10T23:04:27.202Z]   [local:qwen3.5-4b] running logic-1...
+[2026-07-10T23:05:00.787Z]   [local:qwen3.5-4b] running needle-haystack...

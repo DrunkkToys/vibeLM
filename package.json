@@ -1,6 +1,6 @@
 {
   "name": "vibe-lm",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "A comprehensive set of agentic tools for LM Studio: file operations, web fetching/search, memory, SSH, and an autonomous vibe_bridge keep-alive loop.",
   "main": "dist/index.js",
   "scripts": {
