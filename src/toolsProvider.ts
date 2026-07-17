@@ -698,6 +698,13 @@ function parsePersistedPlan(value: unknown): Plan | null {
   };
 }
 
+// A goal-only plan (no steps yet) has nothing to resume — carrying it across a restart/new-session
+// boundary just means an old, possibly stale goal reasserts itself forever with no way to complete.
+// Only a plan the model actually populated via create_plan is worth re-asserting after a restart.
+function planWorthCarryingForward(plan: Plan | null | undefined): boolean {
+  return !!plan && plan.steps.length > 0;
+}
+
 function readRuntimeStateSync(): PersistedSessionState | null {
   try {
     if (!existsSync(RUNTIME_STATE_PATH)) return null;
@@ -781,9 +788,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
         // in-progress plan entirely because this branch had no such fallback while the sibling one did.
         activeSessionState = createSessionState();
         const persisted = readRuntimeStateSync();
-        if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
+        if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
           activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
-          activeSessionState.plan = persisted.plan ?? null;
+          activeSessionState.plan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
           activeSessionState.resumedFromPersistedState = true;
         }
       } else {
@@ -818,13 +825,13 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           const oldLength = persisted?.historyTextLength ?? 0;
           const looksLikeGenuinelyNewConversation = oldLength > MIN_SUBSTANTIAL_HISTORY_CHARS
             && historyText.length < oldLength * NEW_CONVERSATION_LENGTH_RATIO;
-          if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || persisted.plan)) {
+          if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
             // The raw history no longer matches what we last saw — either the process restarted
             // mid-conversation or the host rolled/truncated history. Session identity/counters can't
             // be trusted to still line up, but the last-known directive/plan is still worth
             // re-asserting rather than silently starting over with nothing.
             activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
-            activeSessionState.plan = persisted.plan ?? null;
+            activeSessionState.plan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
             activeSessionState.resumedFromPersistedState = true;
           }
         }
@@ -2728,13 +2735,25 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
             content: `Context from the current session:\n${handover}`,
           });
         }
+        // Each tick otherwise builds a brand-new, isolated Chat with no memory of what earlier ticks
+        // actually did — buildContextSpine (goal + full plan + established facts) already exists for
+        // exactly this purpose but was previously only wired into the interactive preprocessMessage
+        // path, never here. Without it, ticks "forget" everything but the current step's one-line
+        // description between rounds. Individual tool calls below already feed facts back into the
+        // session log via wrapTool, so this spine picks up what prior ticks learned too.
+        const spine = buildContextSpine(getSessionLog(), activeSessionState, headBudgetChars(await getContextWindow(ctl as any)));
+        if (spine) {
+          chatMessages.push({ role: "system", content: spine });
+        }
         // If a plan is active, point the tick at the next unfinished step so unattended ticks make
         // real progress instead of drifting — this is what makes create_plan's autoStart useful.
         const plan = activeSessionState.plan;
         const nextStep = plan?.steps.find((s) => s.status === "pending" || s.status === "in_progress");
         const planDirective = plan && nextStep
-          ? `${MANAGED_CONTEXT_MARKER}\n[Plan "${plan.goal}" — step ${nextStep.index + 1}/${plan.steps.length}: ${nextStep.description}\nExecute it now with your available tools. Call update_plan_step({ index: ${nextStep.index}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`
-          : "";
+          ? `${MANAGED_CONTEXT_MARKER}\n[Plan "${plan.goal}" — step ${nextStep.index + 1}/${plan.steps.length}: ${nextStep.description}${nextStep.note ? `\nNote from last attempt: ${nextStep.note}` : ""}\nExecute it now with your available tools. Call update_plan_step({ index: ${nextStep.index}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`
+          : plan && plan.steps.length === 0
+            ? `${MANAGED_CONTEXT_MARKER}\n[Goal "${plan.goal}" has no steps yet. Call create_plan({ goal: "${plan.goal}", steps: [...] }) now to break it into concrete steps, then execute the first one.]`
+            : "";
         // Apply the configured reasoning-effort directive to the tick prompt. Besides honoring the
         // user's setting, suppressing reasoning here curbs the unbounded "Wait... Actually..." loops
         // that the round/timeout caps above were added to bound.
@@ -2748,12 +2767,13 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         // bash_terminal is intentionally excluded from unattended ticks until it has a command
         // allowlist — see NOTES.md. vibe_bridge/amend are excluded to avoid nested bridge starts
         // and orchestrator-specific finalize semantics that don't apply to this standalone act() call.
-        // create_plan is excluded too (plans are created interactively); update_plan_step/get_plan
-        // are included so a tick can actually mark progress on the plan it's executing.
+        // create_plan IS included (unlike before): a tick that finds an empty plan.steps had no way
+        // to fix that itself, since plans were previously only ever created from the interactive
+        // channel — leaving an unattended session permanently stuck with no steps to work from.
         const bridgeTickTools = [
           exploreWorkspaceTool, listFilesTool, readFileTool, writeFileTool, appendFileTool,
           searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
-          updatePlanStepTool, getPlanTool,
+          createPlanTool, updatePlanStepTool, getPlanTool,
         ];
         const bridgeTickMaxTokens = resolveBridgeTickMaxTokens(await getLoadedModelArch());
         await model.act(chat, bridgeTickTools, {
@@ -3072,6 +3092,20 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     return recordProcessedPrompt(
       historyText,
       `[Plan "${plan.goal}" — new step ${newIndex + 1}/${plan.steps.length} added from this message: ${truncateText(t, 300)}\nExecute it now with your available tools. Call update_plan_step({ index: ${newIndex}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`,
+    );
+  }
+  // A plan with a goal but zero steps is a goal nobody ever expanded into executable work: the
+  // auto-seed above only ever sets goal + empty steps, and only a real create_plan call adds steps.
+  // Left alone, models reproducibly skip straight to bash_terminal/file tools without ever calling
+  // create_plan (caught live across every real session in session-log.jsonl — none contained a
+  // create_plan call). That leaves plan.steps permanently empty, which starves vibe_bridge's tick
+  // loop (it keys off plan.steps to build its directive) of any guidance at all. Force the directive
+  // on every goal-like turn until steps actually exist.
+  if (activeSessionState.plan && activeSessionState.plan.steps.length === 0 && isGoalLikeMessage(t)) {
+    const plan = activeSessionState.plan;
+    return recordProcessedPrompt(
+      historyText,
+      `[Goal recorded: "${plan.goal}". Before using any other tool, call create_plan({ goal: "${plan.goal}", steps: [...] }) to break it into concrete steps, THEN execute each step with your other tools. Do not skip straight to other tools without a plan.]`,
     );
   }
   return null;
