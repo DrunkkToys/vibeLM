@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,6 +29,8 @@ function makeCtl(overrides: { vibeBridgeEnabled?: boolean } = {}) {
         if (overrides.vibeBridgeEnabled) {
           if (key === "tools.vibe_bridge") return true;
           if (key === "tools.create_plan") return true;
+          if (key === "tools.update_plan_step") return true;
+          if (key === "tools.get_plan") return true;
         }
         return undefined;
       },
@@ -230,5 +232,111 @@ describe("plan execution", () => {
     assert.ok(capturedChat, "model.act() should have been called with a chat");
     const serialized = typeof capturedChat.toString === "function" ? capturedChat.toString() : JSON.stringify(capturedChat);
     assert.match(serialized, /Write the config file/, "the tick prompt should name the pending plan step");
+  });
+
+  it("vibe_bridge ticks include create_plan in their tool list (live-testing regression: create_plan was previously excluded from ticks under the assumption plans are only 'created interactively', but real models reproducibly never call create_plan from the interactive channel either — leaving an unattended tick permanently stuck with an empty plan.steps and no tool available to fix it)", async () => {
+    let capturedTools: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (_chat: any, tools: any) => { capturedTools = tools; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ vibeBridgeEnabled: true }), capturingClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    await bridge.implementation({ action: "start", prompt: "Keep going", interval: 5 });
+    await new Promise((r) => setTimeout(r, 7000));
+    await bridge.implementation({ action: "stop" });
+
+    assert.ok(capturedTools, "model.act() should have been called with a tools list");
+    assert.ok(capturedTools.some((t: any) => t.name === "create_plan"), "a tick must be able to create a plan itself when it finds none/an empty one, instead of being permanently stuck");
+  });
+
+  it("vibe_bridge tick directs the model to call create_plan when the plan has a goal but zero steps, instead of emitting an empty directive (live-testing regression: plan && nextStep was always false when steps was empty — found via runtime-state.json in production, a real 4-day-old plan with steps:[] — so planDirective silently evaluated to the empty string and ticks got zero plan guidance)", async () => {
+    let capturedChat: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (chat: any) => { capturedChat = chat; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ vibeBridgeEnabled: true }), capturingClient);
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    // create_plan's schema requires at least one step, so it can't produce a goal-only/zero-step plan
+    // directly — drive the same auto-seed-goal path a real session takes instead (preprocessMessageCore
+    // sets goal + empty steps from the first substantive message, exactly what produced the 4-day-old
+    // "can u finish the job?" / steps:[] plan found live in production runtime-state.json).
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const seedCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: can u finish the job?" }),
+    };
+    await resolveSessionStateFromHistory(seedCtl, true);
+    await preprocessMessage("can u finish the job?", seedCtl);
+
+    await bridge.implementation({ action: "start", prompt: "Keep going", interval: 5 });
+    await new Promise((r) => setTimeout(r, 7000));
+    await bridge.implementation({ action: "stop" });
+
+    assert.ok(capturedChat, "model.act() should have been called with a chat");
+    const serialized = typeof capturedChat.toString === "function" ? capturedChat.toString() : JSON.stringify(capturedChat);
+    assert.match(serialized, /create_plan/, "a stepless plan must direct the tick to create one, not emit an empty directive");
+    assert.match(serialized, /can u finish the job/, "the directive must reference the actual recorded goal");
+  });
+
+  it("vibe_bridge tick carries the current step's note and established facts forward instead of starting every round cold (live-testing regression: each tick built a brand-new isolated Chat with only a vague summary of the human's last chat messages — never anything a prior tick learned — because buildContextSpine already existed for exactly this but was only ever wired into the interactive preprocessMessage path)", async () => {
+    let capturedChat: any = undefined;
+    const capturingClient = {
+      llm: {
+        listLoaded: async () => [{
+          act: async (chat: any) => { capturedChat = chat; },
+          complete: async () => ({ content: "" }),
+        }],
+      },
+    } as any;
+
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const { SessionLog } = await import("../src/sessionLog");
+    const tools = await toolsProvider(makeCtl({ vibeBridgeEnabled: true }), capturingClient);
+    const createPlan = tools.find((t: any) => t.name === "create_plan");
+    const updateStep = tools.find((t: any) => t.name === "update_plan_step");
+    const bridge = tools.find((t: any) => t.name === "vibe_bridge");
+
+    await createPlan.implementation({
+      goal: "Multi-step tick task",
+      steps: ["First step: half-finished by a prior tick", "Second step: not started"],
+      autoStart: false,
+    });
+    // Simulate a prior tick that got partway through step 0 and left a note for the next round.
+    await updateStep.implementation({ index: 0, status: "in_progress", note: "found the config file, still need to update the port" });
+
+    // Simulate an established fact a prior tick's tool call would have produced (mirrors what
+    // wrapTool's distillToolFact already writes for real tool calls — session-log.jsonl is the same
+    // file getSessionLog() reads inside the tick). Must be tagged with the CURRENT session id:
+    // buildContextSpine's fact tier only falls back to session-agnostic facts when the exact-session
+    // query comes back empty, and create_plan/update_plan_step above already logged their own
+    // current-session facts, so a fact under an unrelated fake session id would be silently ignored.
+    const currentSessionId = JSON.parse(readFileSync(resolve(CONFIG_DIR, "runtime-state.json"), "utf-8")).sessionId;
+    const log = new SessionLog(resolve(CONFIG_DIR, "session-log.jsonl"));
+    log.saveMemory(["fact:write_file:#tick-fact:ok", `session:${currentSessionId}`], "wrote config.yaml with port 9443", 1, currentSessionId, TEST_DIR, "workspace");
+
+    await bridge.implementation({ action: "start", prompt: "Keep going", interval: 5 });
+    await new Promise((r) => setTimeout(r, 7000));
+    await bridge.implementation({ action: "stop" });
+
+    assert.ok(capturedChat, "model.act() should have been called with a chat");
+    const serialized = typeof capturedChat.toString === "function" ? capturedChat.toString() : JSON.stringify(capturedChat);
+    assert.match(serialized, /still need to update the port/, "the current step's note from a prior tick must carry forward");
+    assert.match(serialized, /port 9443/, "an established fact from a prior tick's tool call must be pinned into the next tick's context");
   });
 });

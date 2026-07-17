@@ -573,7 +573,7 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(rs2.plan, null, "continuations/commands do not become the session goal");
   });
 
-  it("a goal-only auto-plan survives the persisted round-trip and is restored on resume after a roll", async () => {
+  it("a goal-only auto-plan (zero steps) does NOT survive a resume after a roll — superseded by the create_plan-directive fix (previously this plan intentionally survived the round-trip; live evidence — a real 4-day-old 'can u finish the job?' / steps:[] plan still reasserting itself in production runtime-state.json — showed that just meant a dead goal nobody ever expanded into steps kept coming back forever, since create_plan is reproducibly never called on its own. See the dedicated 'does NOT carry over a goal-only plan' tests above for the full regression coverage; this one only guards the parsePersistedPlan round-trip itself still preserves a goal-only shape when read back, even though bootstrapSessionState now discards it.)", async () => {
     const { resolveSessionStateFromHistory, preprocessMessage } = await import("../src/toolsProvider");
     let history = "conversation head one";
     const ctl: any = {
@@ -585,12 +585,12 @@ describe("vibeLM Cascade Integration", () => {
     await preprocessMessage("Implement a CSV to JSON converter with unit tests", ctl);
 
     // Roll the raw history so the fingerprint mismatches — the resume path re-reads the persisted plan
-    // through parsePersistedPlan, which previously discarded any plan with zero steps (the auto-goal).
+    // through parsePersistedPlan, which still round-trips a goal-only shape correctly; it's
+    // bootstrapSessionState's carryover check (planWorthCarryingForward) that now drops it.
     history = "totally different head after a roll";
     const resumed: any = await resolveSessionStateFromHistory(ctl, true);
-    assert.equal(resumed.resumedFromPersistedState, true, "a roll is detected as a resume");
-    assert.ok(resumed.plan, "the goal-only plan must survive the persisted round-trip");
-    assert.match(resumed.plan.goal, /CSV to JSON/, "the restored goal is intact");
+    assert.equal(resumed.resumedFromPersistedState, false, "a goal-only plan has nothing to resume, so this no longer counts as a resume");
+    assert.equal(resumed.plan, null, "a goal-only plan must not survive the round-trip — it was never expanded into real steps");
   });
 
   it("toolsProvider() must not discard session identity every turn (live-testing regression: the real ToolsProviderController has no pullHistory, so a forced bootstrap there always manufactured a brand-new session, resetting turnCounter to 0 on every single turn and making auto-compaction/fact-dedup/spine-resume unreachable in production)", async () => {
@@ -734,6 +734,74 @@ describe("vibeLM Cascade Integration", () => {
     const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
     assert.equal(rs.plan?.steps?.length, 2, "a new pending step should be appended to the existing plan");
     assert.equal(rs.plan?.steps?.[1]?.status, "pending");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("bootstrapSessionState does NOT carry over a goal-only plan with zero steps across a reload with no readable history (live-testing regression: create_plan is reproducibly never called by real models — grepping every real session in session-log.jsonl across 4 days found zero create_plan calls — so the auto-seeded goal-only plan just sits there forever with nothing to execute; carrying it forward indefinitely only means a dead goal keeps reasserting itself into new sessions instead of ever being expanded into real steps)", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const preprocessCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a widget" }),
+    };
+    await resolveSessionStateFromHistory(preprocessCtl, true);
+    // A goal-like message auto-seeds plan.goal but leaves steps empty — create_plan is never called,
+    // matching every real session observed live.
+    await preprocessMessage("build me a quick widget cli", preprocessCtl);
+    const beforeReload = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.ok(beforeReload.plan, "goal should be auto-seeded");
+    assert.equal(beforeReload.plan.steps.length, 0, "steps should still be empty — create_plan was never called");
+
+    const noHistoryCtl: any = { getWorkingDirectory: () => TEST_DIR };
+    const resumed = await resolveSessionStateFromHistory(noHistoryCtl, true);
+
+    assert.equal(resumed.plan, null, "a goal-only, zero-step plan has nothing to resume and must not be carried forward");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("bootstrapSessionState does NOT carry over a goal-only plan with zero steps across a fingerprint-mismatch restart/roll either (same fix, other carryover branch)", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    let history = "Turn 1: build a production widget dashboard\n".repeat(30);
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("Build a production widget dashboard", ctl);
+    const beforeReload = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(beforeReload.plan?.steps?.length, 0, "steps should still be empty — create_plan was never called");
+
+    // Same-conversation restart/roll: comparable history length, different fingerprint — the case the
+    // existing "STILL carries over" guard test proves must keep working for a REAL (non-empty) plan.
+    history = "Turn 1: build a production widget dashboard\n".repeat(28) + "Turn 29: continue where we left off\n";
+    const resumed = await resolveSessionStateFromHistory(ctl, true);
+
+    assert.equal(resumed.plan, null, "a goal-only, zero-step plan must not survive even a same-conversation restart — it has no steps to resume");
+
+    if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("a goal-only plan with zero steps forces a create_plan directive on the next goal-like turn instead of silently letting the model skip straight to other tools (live-testing regression: every real session in session-log.jsonl skipped create_plan entirely and just called bash_terminal/read_file/write_file directly, leaving plan.steps empty forever, which in turn starves vibe_bridge's tick directive)", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a weather cli" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    await preprocessMessage("build me a quick weather cli that takes a city and prints the weather", ctl);
+
+    const processed = await preprocessMessage("also add a caching layer to the weather cli", ctl);
+
+    assert.ok(processed, "a goal-like follow-up while steps are still empty must produce a directive, not pass through silently");
+    assert.match(processed as string, /create_plan/, "the directive must explicitly tell the model to call create_plan");
+    assert.match(processed as string, /weather cli/, "the directive must reference the recorded goal");
 
     if (existsSync(rsPath)) rmSync(rsPath);
   });
