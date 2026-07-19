@@ -740,11 +740,15 @@ function parsePersistedPlan(value: unknown): Plan | null {
   };
 }
 
-// A goal-only plan (no steps yet) has nothing to resume — carrying it across a restart/new-session
-// boundary just means an old, possibly stale goal reasserts itself forever with no way to complete.
-// Only a plan the model actually populated via create_plan is worth re-asserting after a restart.
+function isCompletedPlan(plan: Plan | null | undefined): boolean {
+  return !!plan && plan.steps.length > 0 && plan.steps.every((step) => step.status === "done");
+}
+
+// Goal-only and completed plans have nothing left to route. The former was never expanded into
+// executable work; the latter remains visible in ordinary LM Studio history but must not be restored
+// into active runtime state, where its goal/directives would compete with the next user request.
 function planWorthCarryingForward(plan: Plan | null | undefined): boolean {
-  return !!plan && plan.steps.length > 0;
+  return !!plan && plan.steps.length > 0 && !isCompletedPlan(plan);
 }
 
 function readRuntimeStateSync(): PersistedSessionState | null {
@@ -931,7 +935,8 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
         // in-progress plan entirely because this branch had no such fallback while the sibling one did.
         activeSessionState = createSessionState();
         const persisted = readRuntimeStateSync();
-        if (persisted && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
+        const completedPersistedPlan = isCompletedPlan(persisted?.plan);
+        if (persisted && !completedPersistedPlan && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
           activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
           activeSessionState.plan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
           activeSessionState.resumedFromPersistedState = true;
@@ -963,6 +968,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
         const historyFingerprint = fingerprintHistoryText(historyText);
         const persisted = readRuntimeStateSync();
         if (persisted && persisted.historyFingerprint === historyFingerprint) {
+          const completedPersistedPlan = isCompletedPlan(persisted.plan);
+          const carriedPlan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
+          const carriedBlocks = completedPersistedPlan ? [] : persisted.managedContextBlocks ?? [];
           activeSessionState = {
             sessionId: persisted.sessionId,
             turnCounter: persisted.turnCounter,
@@ -972,11 +980,11 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             historyTextLength: historyText.length,
             systemPromptLength,
             lastSeenConversationChars: conversationLength(historyText.length, systemPromptLength),
-            resumedFromPersistedState: true,
-            managedContextBlocks: persisted.managedContextBlocks ?? [],
+            resumedFromPersistedState: !completedPersistedPlan,
+            managedContextBlocks: carriedBlocks,
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
             lastHandoffTurn: persisted.lastHandoffTurn ?? 0,
-            plan: persisted.plan ?? null,
+            plan: carriedPlan,
           };
         } else {
           activeSessionState = createSessionState();
@@ -1007,7 +1015,8 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           const newConversation = conversationLength(historyText.length, systemPromptLength);
           const looksLikeGenuinelyNewConversation = oldConversation > MIN_SUBSTANTIAL_HISTORY_CHARS
             && newConversation < oldConversation * NEW_CONVERSATION_LENGTH_RATIO;
-          if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
+          const completedPersistedPlan = isCompletedPlan(persisted?.plan);
+          if (persisted && !completedPersistedPlan && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
             // The raw history no longer matches what we last saw — either the process restarted
             // mid-conversation or the host rolled/truncated history. Session identity/counters can't
             // be trusted to still line up, but the last-known directive/plan is still worth
@@ -1166,16 +1175,22 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
   return estimateTokens(text);
 }
 
-function compactTaskReminder(stepCount: number, harmony = false): string {
+function compactTaskReminder(stepCount: number, latestRequest: string, harmony = false): string {
   const finish = harmony
     ? "Reply with your final answer when the task is done"
     : "Call amend when the task is done";
   return `${MANAGED_CONTEXT_MARKER}
+[Latest user request — execute this exact request and prioritize it over recapping earlier work:]
+${latestRequest}
+
 [Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. ${finish}, blocked, or you have the best available handoff and cannot safely continue.]`;
 }
 
-function compactContinueInstruction(): string {
+function compactContinueInstruction(latestRequest: string): string {
   return `${MANAGED_CONTEXT_MARKER}
+[Latest user request — execute this exact request and prioritize it over recapping earlier work:]
+${latestRequest}
+
 [Continue from the last completed step. Do NOT restart. Read the history and proceed with the next uncompleted step.]`;
 }
 
@@ -3240,7 +3255,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       }
       // Continuation: replace stale "follow all steps" instruction with a continue directive
       if (CONTINUATION_PATTERN.test(t)) {
-        return recordProcessedPrompt(historyText, compactContinueInstruction());
+        return recordProcessedPrompt(historyText, compactContinueInstruction(t));
       }
       return null;
     }
@@ -3248,7 +3263,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     if (report.overflow) {
       return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony, t));
     }
-    return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, harmony));
+    return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, t, harmony));
   }
 
   const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
@@ -3295,30 +3310,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   // (Rehydration of persisted managedContextBlocks after a context roll happens unconditionally,
   // one layer up in the preprocessMessage wrapper below — it no longer depends on CONTINUATION_PATTERN.)
   if (managedContextPresent && CONTINUATION_PATTERN.test(t)) {
-    return recordProcessedPrompt(historyText, compactContinueInstruction());
-  }
-  // Once every existing plan step reads "done", nothing previously turned a genuinely new follow-up
-  // instruction into tracked work: amend's pending-step guard only blocks premature completion when
-  // there ARE pending steps, and nothing ever added one for a new ask. Caught live (reproduced
-  // identically across two unrelated models): after a plan completed, a plain follow-up instruction
-  // ("cache it for an hour") was silently ignored — the model just replied with a recap of the
-  // already-done work and never called a tool, because nothing compelled it to. Auto-append a new
-  // step and direct the model at it, extending the same forcing function to new asks.
-  if (
-    activeSessionState.plan &&
-    activeSessionState.plan.steps.length > 0 &&
-    activeSessionState.plan.steps.every((s) => s.status === "done") &&
-    isGoalLikeMessage(t)
-  ) {
-    const plan = activeSessionState.plan;
-    const newIndex = plan.steps.length;
-    plan.steps.push({ index: newIndex, description: truncateText(t, 300), status: "pending" });
-    plan.updatedAt = new Date().toISOString();
-    writeRuntimeStateSync(activeSessionState);
-    return recordProcessedPrompt(
-      historyText,
-      `[Plan "${plan.goal}" — new step ${newIndex + 1}/${plan.steps.length} added from this message: ${truncateText(t, 300)}\nExecute it now with your available tools. Call update_plan_step({ index: ${newIndex}, status: "done" }) when finished, or "blocked" with a note if you can't proceed.]`,
-    );
+    return recordProcessedPrompt(historyText, compactContinueInstruction(t));
   }
   // A plan with a goal but zero steps is a goal nobody ever expanded into executable work: the
   // auto-seed above only ever sets goal + empty steps, and only a real create_plan call adds steps.
@@ -3331,7 +3323,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     const plan = activeSessionState.plan;
     return recordProcessedPrompt(
       historyText,
-      `[Goal recorded: "${plan.goal}". Before using any other tool, call create_plan({ goal: "${plan.goal}", steps: [...] }) to break it into concrete steps, THEN execute each step with your other tools. Do not skip straight to other tools without a plan.]`,
+      `[Latest user request — prioritize this over recapping completed work: "${t}"]\n[Goal recorded: "${plan.goal}". Before using any other tool, call create_plan({ goal: "${plan.goal}", steps: [...] }) to break this request into concrete steps, THEN execute each step with your other tools. Do not skip straight to other tools without a plan.]`,
     );
   }
   return null;
@@ -3349,6 +3341,10 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
 function isGoalLikeMessage(t: string): boolean {
   if (t.length < 15) return false;
   if (CONTINUATION_PATTERN.test(t)) return false;
+  // Questions and conversational information requests should remain ordinary chat. Prefixes such as
+  // "now" and "also" do not turn "tell me what..." into executable project work.
+  const withoutConversationalPrefixes = t.replace(/^(?:(?:now|also|and|actually|please)\b[\s,]*)+/i, "");
+  if (/^(?:tell\s+me\b|what\b|when\b|who\b|how\b|why\b|where\b|which\b)/i.test(withoutConversationalPrefixes)) return false;
   if (/^(?:set|pick|change|switch|go\s+to)\s+workspace\b/i.test(t) || /^workspace\b/i.test(t)) return false;
   if (/^(?:search|find|google|look\s+up|lookup|bing)\b/i.test(t)) return false;
   if (/^(?:calc|calculate|compute)\b/i.test(t) || /\d\s*[-+*/]\s*\d/.test(t)) return false;
@@ -3371,7 +3367,7 @@ export function buildContextSpine(session: SessionLog, state: SessionState, maxC
   let used = header.length;
 
   // Tier 1: goal + plan. Pinned — added even if it consumes most of the budget.
-  if (state.plan) {
+  if (state.plan && !isCompletedPlan(state.plan)) {
     const goalBlock = `[Goal] ${truncateText(state.plan.goal, 300)}`;
     tiers.push(goalBlock);
     used += goalBlock.length + 1;
@@ -3410,6 +3406,16 @@ export function buildContextSpine(session: SessionLog, state: SessionState, maxC
 
 export async function preprocessMessage(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   await bootstrapSessionState(ctl as any);
+  // Completion is a lifecycle boundary. Keep the completed work in LM Studio's normal conversation
+  // history, but remove its runtime plan and captured directives before building a resumable spine or
+  // classifying the next substantive turn. This prevents an all-done goal from hijacking follow-ups
+  // in the same process and after a persisted-state rehydration.
+  if (text.trim().length > 0 && isCompletedPlan(activeSessionState.plan)) {
+    activeSessionState.plan = null;
+    activeSessionState.managedContextBlocks = [];
+    activeSessionState.resumedFromPersistedState = false;
+    writeRuntimeStateSync(activeSessionState);
+  }
   const rehydrationBlocks = (activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0)
     ? activeSessionState.managedContextBlocks.slice()
     : null;
