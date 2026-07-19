@@ -91,15 +91,6 @@ export const configSchematics = createConfigSchematics()
         8,
       )
       .field(
-        "enforceMainChatBounds",
-        "boolean",
-        {
-          displayName: "Enforce Main Chat Bounds",
-          subtitle: "vibeLM owns the main chat's prediction loop so Max Orchestrator Turns and the always-reasoning token floor can actually cap the interactive chat too, not just vibe_bridge ticks — fixes a model rambling with no tool call ever bounding out. Turning this off keeps vibeLM rendering the chat but removes those caps (uncapped rounds/tokens), for use only if the caps themselves cause problems.",
-        },
-        true,
-      )
-      .field(
         "vibe_bridge_prompt",
         "string",
         {

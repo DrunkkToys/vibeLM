@@ -1,4 +1,4 @@
-import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController, type PredictionLoopHandlerController, type PredictionProcessToolStatusController } from "@lmstudio/sdk";
+import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
@@ -319,7 +319,7 @@ function readPluginConfigValue(ctl: any, keys: string[]): unknown {
   return undefined;
 }
 
-export function resolveMaxOrchestratorTurns(ctl?: any): number {
+function resolveMaxOrchestratorTurns(ctl?: any): number {
   const rawValue = readPluginConfigValue(ctl, ["tools.maxOrchestratorTurns", "maxOrchestratorTurns"]);
   if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
     return Math.max(0, Math.min(100, Math.floor(rawValue)));
@@ -453,20 +453,6 @@ const ALWAYS_REASONING_TICK_MAX_TOKENS = 6000;
 
 export function resolveBridgeTickMaxTokens(arch: string): number | undefined {
   return ALWAYS_REASONING_ARCH_PATTERN.test(arch) ? ALWAYS_REASONING_TICK_MAX_TOKENS : undefined;
-}
-
-// Unlike the tick (which only special-cases always-reasoning archs, relying on
-// VIBE_BRIDGE_TICK_TIMEOUT_MS as the real backstop for everything else), the main chat's
-// PredictionLoopHandler has no wall-clock timeout — a long multi-tool-call turn is expected and
-// legitimate, so a flat timeout would kill real work. maxPredictionRounds alone does NOT protect
-// against the reported failure (a model rambling with zero tool calls, forever): that cap only
-// counts ROUNDS THAT COMPLETE, and a round that never emits a tool call or stop token never
-// completes, so it never counts against the limit. A per-round token ceiling is what actually
-// forces a stuck round to end. Applied to every architecture, not just the always-reasoning ones.
-const DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS = 8000;
-
-export function resolveMainLoopRoundMaxTokens(arch: string): number {
-  return resolveBridgeTickMaxTokens(arch) ?? DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS;
 }
 
 function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
@@ -1079,20 +1065,15 @@ const STRAY_THINK_TAG = /<\/?think>/gi;
 // and cannot, fix the leak in LM Studio's own chat-bubble rendering (out of this plugin's reach) —
 // it only stops vibeLM's own stored/reused data (tick handover, memory, handoff summaries) from
 // getting polluted by it.
-// Variant used for streaming fragments — strips tags but does NOT trim the text
-// (trimming individual fragments would remove intentional word-boundary spaces).
-function stripFragmentArtifacts(text: string): string {
+export function stripModelArtifacts(text: string): string {
   if (!text) return text;
   return text
     .replace(THINK_BLOCK, "")
     .replace(HARMONY_CHANNEL_PREFIX, "")
     .replace(HARMONY_CONTROL_TOKEN, "")
     .replace(STRAY_THINK_TAG, "")
-    .replace(/\n{3,}/g, "\n\n");
-}
-
-export function stripModelArtifacts(text: string): string {
-  return stripFragmentArtifacts(text).trim();
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function splitLines(text: string): string[] {
@@ -2965,94 +2946,6 @@ The default prompt can be configured in tool settings.`,
   }
 
   return allTools;
-}
-
-// Takes over the MAIN interactive chat's generation loop (unlike vibe_bridge's standalone tick,
-// this is the channel the user actually talks to). Without this, LM Studio's own default loop
-// handler runs the turn and nothing in vibeLM can bound it — wrapTool's maxOrchestratorTurns
-// counter only increments when a tool is actually called, so a model that gets stuck rambling
-// with zero tool calls (confirmed live: 5+ hours silent after a failed bash_terminal call, no
-// further turns ever logged) has no ceiling at all. Gated behind tools.enforceMainChatBounds
-// (see index.ts) since @lmstudio/sdk's PredictionLoopHandler is tagged
-// @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" with no reference
-// implementation anywhere on this machine — this file is the first user of it.
-export async function predictionLoopHandler(ctl: PredictionLoopHandlerController, client?: LMStudioClient | null): Promise<void> {
-  const chat = await ctl.pullHistory();
-  const tokenSource = await ctl.tokenSource();
-  // Reuses toolsProvider's own enabled/ordered tool list (including bash_terminal, unlike the
-  // deliberately-restricted bridgeTickTools) so the main chat keeps exactly what the user has
-  // configured. Structurally safe: ToolsProviderController and PredictionLoopHandlerController
-  // both reduce to BaseController, and toolsProvider() only ever touches ctl via the
-  // already-`any`-typed readPluginConfigValue/resolveEnabledToolNames/getWorkingDirectory.
-  const tools = await toolsProvider(ctl as any, client);
-
-  // LM Studio has no way to hand the loop back to its own default handler once a
-  // PredictionLoopHandler is registered — vibeLM must always render this turn. What this setting
-  // actually toggles is just whether the round/token caps below apply, as an escape hatch if the
-  // caps themselves cause problems, not a full revert to pre-plugin behavior.
-  const boundsEnforced = String(readPluginConfigValue(ctl, ["tools.enforceMainChatBounds", "enforceMainChatBounds"])) !== "false";
-  const arch = await getLoadedModelArch();
-  const maxRounds = boundsEnforced ? resolveMaxOrchestratorTurns(ctl) : 0;
-  // Applied unconditionally (all archs) when bounds are enforced — see resolveMainLoopRoundMaxTokens's
-  // comment for why maxPredictionRounds alone can't stop a single round that never completes.
-  const roundMaxTokens = boundsEnforced ? resolveMainLoopRoundMaxTokens(arch) : undefined;
-
-  // Note: the reasoning-effort directive is NOT reapplied here — index.ts's promptPreprocessor
-  // already appends it to the user message before this handler ever runs, and pullHistory()
-  // above returns that already-preprocessed message. Reapplying it here would duplicate it.
-
-  // Two separate blocks are required, not a style choice: the SDK throws if you call
-  // appendToolRequest on anything but an "assistant"-role block, or appendToolResult on anything
-  // but a "tool"-role block — confirmed live ("Error in the onMessage callback: Tool results can
-  // only be appended to tool blocks. This is a assistant block."), reusing a single assistant
-  // block for both silently corrupted the last round's tool-result rendering.
-  const block = ctl.createContentBlock({ roleOverride: "assistant" });
-  const toolResultBlock = ctl.createContentBlock({ roleOverride: "tool" });
-  const toolStatuses = new Map<number, PredictionProcessToolStatusController>();
-  // Tool calls execute strictly in order by default (allowParallelToolExecution defaults to
-  // false), so a FIFO queue reliably pairs each tool-result message back to the callId that
-  // produced it — ToolCallResult only carries a model-specific toolCallId string, not the
-  // internal numeric callId, so this queue is the simplest correct pairing.
-  const pendingCallIds: number[] = [];
-
-  await tokenSource.act(chat, tools, {
-    maxPredictionRounds: maxRounds > 0 ? maxRounds : undefined,
-    signal: ctl.abortSignal,
-    ...(roundMaxTokens !== undefined ? { maxTokens: roundMaxTokens } : {}),
-    onPredictionFragment: (fragment) => block.appendText(stripFragmentArtifacts(fragment.content)),
-    onToolCallRequestStart: (_roundIndex, callId) => {
-      toolStatuses.set(callId, ctl.createToolStatus(callId, { type: "generatingToolCall" }));
-    },
-    onToolCallRequestFailure: (_roundIndex, callId, error) => {
-      toolStatuses.get(callId)?.setStatus({ type: "toolCallGenerationFailed", error: error.message });
-    },
-    // NOTE: does NOT route through ctl.requestConfirmToolCall() — confirmed live that it never
-    // resolves (a real multi-minute hang with zero further model activity, reproduced against
-    // qwen3.5-4b), consistent with RequestConfirmToolCallOpts/Result both still being tagged
-    // @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" in the SDK. vibeLM
-    // never required per-call user confirmation before this change either (LM Studio's default
-    // loop ran these same tools unprompted), so allowing directly here is not a new gap.
-    guardToolCall: (_roundIndex, _callId, controller) => controller.allow(),
-    onToolCallRequestFinalized: (_roundIndex, callId, info) => {
-      block.appendToolRequest({
-        callId,
-        toolCallRequestId: info.toolCallRequest.id,
-        name: info.toolCallRequest.name,
-        parameters: info.toolCallRequest.arguments ?? {},
-      });
-      toolStatuses.get(callId)?.setStatus({ type: "callingTool" });
-      pendingCallIds.push(callId);
-    },
-    onMessage: (message) => {
-      if (message.getRole() !== "tool") return;
-      for (const result of message.getToolCallResults()) {
-        const callId = pendingCallIds.shift();
-        if (callId === undefined) continue;
-        toolResultBlock.appendToolResult({ callId, toolCallRequestId: result.toolCallId, content: result.content });
-        toolStatuses.get(callId)?.setStatus({ type: "toolCallSucceeded", timeMs: 0 });
-      }
-    },
-  });
 }
 
 async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {

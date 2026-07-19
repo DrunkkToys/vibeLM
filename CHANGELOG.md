@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-19
+
+### Fixed
+- **Reverted the main-chat `PredictionLoopHandler` (0.2.9–0.2.11), which broke the chat on every thinking model.** Registering `withPredictionLoopHandler` takes ownership of the whole generation loop, and the handler rendered every prediction fragment as visible assistant text without checking `fragment.reasoningType`. LM Studio's default loop uses that field to route reasoning into the collapsible thinking UI and render only `"none"` fragments as chat; without it, reasoning prose and raw `<think>`/`</think>` tags leaked straight into the chat bubble. The fragment-level regex added in 0.2.11 could not fix this — `THINK_BLOCK` requires both tags in a single string, and streaming delivers them in separate fragments. `withToolsProvider` is restored, handing rendering, reasoning-channel routing, and tool-call parsing back to LM Studio.
+- The `Enforce Main Chat Bounds` setting (`tools.enforceMainChatBounds`) is removed along with the handler it gated. Bounding the main chat's loop remains an open problem; it will not be solved by owning the render loop.
+
 ## [0.2.11] - 2026-07-11
 
 ### Changed
