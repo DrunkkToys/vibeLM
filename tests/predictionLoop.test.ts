@@ -40,11 +40,28 @@ function makeCtl(overrides: { maxOrchestratorTurns?: number; enforceMainChatBoun
     }),
     pullHistory: async () => makeFakeChat(),
     tokenSource: async () => ({ act: overrides.act }),
-    createContentBlock: () => ({
-      appendText: (t: string) => contentBlockCalls.appendText.push(t),
-      appendToolRequest: (o: any) => contentBlockCalls.appendToolRequest.push(o),
-      appendToolResult: (o: any) => contentBlockCalls.appendToolResult.push(o),
-    }),
+    // Mirrors the real SDK's role gating (@lmstudio/sdk's PredictionProcessContentBlockController)
+    // so a regression like reusing one block for both text and tool results fails a unit test
+    // instead of only surfacing live: appendToolRequest requires an "assistant" block,
+    // appendToolResult requires a "tool" block — confirmed live via a thrown
+    // "Tool results can only be appended to tool blocks. This is a assistant block." error.
+    createContentBlock: ({ roleOverride }: { roleOverride?: string } = {}) => {
+      const role = roleOverride ?? "assistant";
+      return {
+        appendText: (t: string) => {
+          if (role === "tool") throw new Error("Text cannot be appended to tool blocks.");
+          contentBlockCalls.appendText.push(t);
+        },
+        appendToolRequest: (o: any) => {
+          if (role !== "assistant") throw new Error(`Tool requests can only be appended to assistant blocks. This is a ${role} block.`);
+          contentBlockCalls.appendToolRequest.push(o);
+        },
+        appendToolResult: (o: any) => {
+          if (role !== "tool") throw new Error(`Tool results can only be appended to tool blocks. This is a ${role} block.`);
+          contentBlockCalls.appendToolResult.push(o);
+        },
+      };
+    },
     createToolStatus: (_callId: number, initial: any) => {
       const status = { current: initial, setStatus: (s: any) => { status.current = s; } };
       toolStatuses.push(status);

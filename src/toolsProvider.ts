@@ -2996,7 +2996,13 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
   // already appends it to the user message before this handler ever runs, and pullHistory()
   // above returns that already-preprocessed message. Reapplying it here would duplicate it.
 
+  // Two separate blocks are required, not a style choice: the SDK throws if you call
+  // appendToolRequest on anything but an "assistant"-role block, or appendToolResult on anything
+  // but a "tool"-role block — confirmed live ("Error in the onMessage callback: Tool results can
+  // only be appended to tool blocks. This is a assistant block."), reusing a single assistant
+  // block for both silently corrupted the last round's tool-result rendering.
   const block = ctl.createContentBlock({ roleOverride: "assistant" });
+  const toolResultBlock = ctl.createContentBlock({ roleOverride: "tool" });
   const toolStatuses = new Map<number, PredictionProcessToolStatusController>();
   // Tool calls execute strictly in order by default (allowParallelToolExecution defaults to
   // false), so a FIFO queue reliably pairs each tool-result message back to the callId that
@@ -3037,7 +3043,7 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
       for (const result of message.getToolCallResults()) {
         const callId = pendingCallIds.shift();
         if (callId === undefined) continue;
-        block.appendToolResult({ callId, toolCallRequestId: result.toolCallId, content: result.content });
+        toolResultBlock.appendToolResult({ callId, toolCallRequestId: result.toolCallId, content: result.content });
         toolStatuses.get(callId)?.setStatus({ type: "toolCallSucceeded", timeMs: 0 });
       }
     },
