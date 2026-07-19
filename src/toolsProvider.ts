@@ -455,6 +455,20 @@ export function resolveBridgeTickMaxTokens(arch: string): number | undefined {
   return ALWAYS_REASONING_ARCH_PATTERN.test(arch) ? ALWAYS_REASONING_TICK_MAX_TOKENS : undefined;
 }
 
+// Unlike the tick (which only special-cases always-reasoning archs, relying on
+// VIBE_BRIDGE_TICK_TIMEOUT_MS as the real backstop for everything else), the main chat's
+// PredictionLoopHandler has no wall-clock timeout — a long multi-tool-call turn is expected and
+// legitimate, so a flat timeout would kill real work. maxPredictionRounds alone does NOT protect
+// against the reported failure (a model rambling with zero tool calls, forever): that cap only
+// counts ROUNDS THAT COMPLETE, and a round that never emits a tool call or stop token never
+// completes, so it never counts against the limit. A per-round token ceiling is what actually
+// forces a stuck round to end. Applied to every architecture, not just the always-reasoning ones.
+const DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS = 8000;
+
+export function resolveMainLoopRoundMaxTokens(arch: string): number {
+  return resolveBridgeTickMaxTokens(arch) ?? DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS;
+}
+
 function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
   const rawValue = readPluginConfigValue(ctl, ["tools.rollingWindowTriggerTokens", "rollingWindowTriggerTokens", "contextOverflowHeadroomTokens"]);
   if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
@@ -2974,7 +2988,9 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
   const boundsEnforced = String(readPluginConfigValue(ctl, ["tools.enforceMainChatBounds", "enforceMainChatBounds"])) !== "false";
   const arch = await getLoadedModelArch();
   const maxRounds = boundsEnforced ? resolveMaxOrchestratorTurns(ctl) : 0;
-  const alwaysReasoningMaxTokens = boundsEnforced ? resolveBridgeTickMaxTokens(arch) : undefined;
+  // Applied unconditionally (all archs) when bounds are enforced — see resolveMainLoopRoundMaxTokens's
+  // comment for why maxPredictionRounds alone can't stop a single round that never completes.
+  const roundMaxTokens = boundsEnforced ? resolveMainLoopRoundMaxTokens(arch) : undefined;
 
   // Note: the reasoning-effort directive is NOT reapplied here — index.ts's promptPreprocessor
   // already appends it to the user message before this handler ever runs, and pullHistory()
@@ -2991,7 +3007,7 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
   await tokenSource.act(chat, tools, {
     maxPredictionRounds: maxRounds > 0 ? maxRounds : undefined,
     signal: ctl.abortSignal,
-    ...(alwaysReasoningMaxTokens !== undefined ? { maxTokens: alwaysReasoningMaxTokens } : {}),
+    ...(roundMaxTokens !== undefined ? { maxTokens: roundMaxTokens } : {}),
     onPredictionFragment: (fragment) => block.appendText(fragment.content),
     onToolCallRequestStart: (_roundIndex, callId) => {
       toolStatuses.set(callId, ctl.createToolStatus(callId, { type: "generatingToolCall" }));

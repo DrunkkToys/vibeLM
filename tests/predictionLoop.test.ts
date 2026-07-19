@@ -86,7 +86,24 @@ describe("predictionLoopHandler Cascade", () => {
     assert.equal(capturedOpts.signal, ctl.abortSignal);
   });
 
-  it("leaves maxPredictionRounds unset when tools.enforceMainChatBounds is false (escape hatch)", async () => {
+  it("applies a per-round maxTokens cap for ALL architectures when bounds are enforced, not just always-reasoning ones", async () => {
+    // maxPredictionRounds only counts ROUNDS THAT COMPLETE — a round that never emits a tool call
+    // or stop token never completes, so it never counts against that limit. This is exactly the
+    // originally-reported failure (a model rambling with zero tool calls, for hours): without an
+    // unconditional per-round token ceiling, maxPredictionRounds alone does nothing to stop it on
+    // any architecture outside the always-reasoning special case.
+    const { predictionLoopHandler } = await import("../src/toolsProvider");
+    let capturedOpts: any = null;
+    const { ctl } = makeCtl({
+      maxOrchestratorTurns: 5,
+      act: async (_chat, _tools, opts) => { capturedOpts = opts; return {}; },
+    });
+    await predictionLoopHandler(ctl);
+    assert.equal(typeof capturedOpts.maxTokens, "number", "maxTokens must be set even when the arch isn't a known always-reasoning one");
+    assert.ok(capturedOpts.maxTokens > 0);
+  });
+
+  it("leaves maxPredictionRounds and maxTokens unset when tools.enforceMainChatBounds is false (escape hatch)", async () => {
     const { predictionLoopHandler } = await import("../src/toolsProvider");
     let capturedOpts: any = null;
     const { ctl } = makeCtl({
@@ -96,6 +113,7 @@ describe("predictionLoopHandler Cascade", () => {
     });
     await predictionLoopHandler(ctl);
     assert.equal(capturedOpts.maxPredictionRounds, undefined);
+    assert.equal(capturedOpts.maxTokens, undefined);
   });
 
   it("streams prediction fragments into the assistant content block", async () => {
