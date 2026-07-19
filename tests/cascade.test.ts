@@ -39,6 +39,15 @@ function makeCtl(options: { maxOrchestratorTurns?: number; rollingWindowTriggerT
 }
 
 describe("vibeLM Cascade Integration", () => {
+  // Pin the loaded-model architecture so the suite never depends on whichever model the developer
+  // happens to have loaded in LM Studio. toolsProvider() consults the arch to decide whether to offer
+  // `amend` (Harmony families must not be — they have a native final channel), so without this the
+  // tool list would silently change between machines. qwen3_5 is a non-Harmony arch, i.e. amend on.
+  before(async () => {
+    const { setLoadedModelInfoOverride } = await import("../src/toolsProvider");
+    setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
+  });
+
   before(() => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
@@ -281,15 +290,16 @@ describe("vibeLM Cascade Integration", () => {
   });
 
   it("reasoningDirectiveForSession lets a plan step's thinking override the session-wide reasoningEffort", async () => {
-    const { toolsProvider, reasoningDirectiveFor, reasoningDirectiveForSession, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const { toolsProvider, reasoningDirectiveFor, reasoningDirectiveForSession, resolveSessionStateFromHistory, setLoadedModelInfoOverride } = await import("../src/toolsProvider");
     const ctl: any = {
       getWorkingDirectory: () => TEST_DIR,
       getPluginConfig: () => ({ get: (key: string) => (key === "tools.reasoningEffort" || key === "reasoningEffort") ? "high" : undefined }),
     };
     // Force the "no live LM Studio model" fallback (arch: "") so this test is deterministic whether
-    // or not a real LM Studio instance happens to be reachable at API_BASE while tests run.
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => { throw new Error("no network in test"); }) as any;
+    // or not a real LM Studio instance happens to be reachable at API_BASE while tests run. This used
+    // to monkeypatch globalThis.fetch; the override seam does the same job without touching a global,
+    // and it also takes precedence over the suite-wide arch pin in this file's before() hook.
+    setLoadedModelInfoOverride({ arch: "", loadedContextLength: null });
     try {
       await resolveSessionStateFromHistory(ctl, true);
       const tools = await toolsProvider(ctl);
@@ -324,7 +334,8 @@ describe("vibeLM Cascade Integration", () => {
       const viaUpdateStep = await reasoningDirectiveForSession(ctl);
       assert.equal(viaUpdateStep, reasoningDirectiveFor("low", ""));
     } finally {
-      globalThis.fetch = originalFetch;
+      // Back to this file's suite-wide pin (a non-Harmony arch, i.e. amend enabled).
+      setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
       // Leaves a persisted plan on disk (config.json's runtime-state.json is shared across this whole
       // file's tests). bootstrapSessionState's "no history at all" path now correctly carries over a
       // persisted plan (fixed a live bug), so a leftover plan here would otherwise leak into later
@@ -845,6 +856,258 @@ describe("vibeLM Cascade Integration", () => {
     } finally {
       makeConfig();
       rmSync(homeWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("a brand-new chat does NOT inherit the previous session's plan, even though the system prompt dominates the history length", async () => {
+    // Live regression (reproduced in LM Studio): opening a fresh chat retitled it "[vibeLM:managed-cont"
+    // because preprocessMessage prepended a rehydration block ahead of the user's actual first message,
+    // and the previous session's plan came back with it.
+    //
+    // bootstrapSessionState decides "is this a genuinely new conversation?" by checking whether history
+    // shrank to under NEW_CONVERSATION_LENGTH_RATIO of what was last persisted. That check used to run on
+    // COMPOSED history — composeHistoryText(systemPrompt, conversation) — but vibeLM's system prompt (26
+    // tool descriptions) is a multi-thousand-char constant present in every chat. A brand-new chat is
+    // systemPrompt + ~20 chars, which is nowhere near 30% below an old chat's systemPrompt + conversation,
+    // so the guard could essentially never fire in production.
+    //
+    // Every other test in this file mocks `getSystemPrompt: () => ""`, which makes composed length equal
+    // conversation length and hides the bug completely. This test uses a realistically large system prompt
+    // on purpose — that is the whole point of it.
+    const { resolveSessionStateFromHistory, conversationLength } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    const SYSTEM_PROMPT = "You have access to the following tools.\n".repeat(150); // ~5.9k chars, like the real one
+    const OLD_CONVERSATION = "user: do the thing\nassistant: doing the thing\n".repeat(40); // ~1.8k chars
+    let conversation = OLD_CONVERSATION;
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => SYSTEM_PROMPT, toString: () => conversation }),
+    };
+
+    // Establish a session that owns a real multi-step plan.
+    await resolveSessionStateFromHistory(ctl, true);
+    const persisted = JSON.parse(readFileSync(rsPath, "utf-8"));
+    persisted.plan = {
+      goal: "Run these three bash commands and report each result",
+      steps: [
+        { index: 0, description: "Run echo one", status: "done" },
+        { index: 1, description: "Run echo two", status: "pending" },
+      ],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(rsPath, JSON.stringify(persisted, null, 2));
+
+    // Sanity-check the recorded lengths, so a future change to what gets persisted can't silently
+    // make the assertions below vacuous.
+    assert.ok(persisted.historyTextLength > SYSTEM_PROMPT.length, "composed history must include the system prompt");
+    assert.ok(persisted.systemPromptLength > 0, "the system prompt length must be persisted for the new-chat comparison");
+
+    // Now a brand-new chat: same big system prompt, essentially no conversation yet.
+    conversation = "user: hi\n";
+    const fresh: any = await resolveSessionStateFromHistory(ctl, true);
+
+    assert.equal(fresh.plan, null, "a brand-new chat must not inherit the previous session's plan");
+    assert.equal(
+      fresh.resumedFromPersistedState,
+      false,
+      "a brand-new chat must not be treated as a resume — that is what prepends the managed-context block ahead of the user's first message",
+    );
+
+    // The composed lengths are close enough that the OLD comparison would have concluded "not a new
+    // conversation" and carried the plan over. This is the exact arithmetic that was broken.
+    const oldComposed = persisted.historyTextLength;
+    const newComposed = SYSTEM_PROMPT.length + conversation.length;
+    assert.ok(
+      newComposed >= oldComposed * 0.3,
+      "guard rail: with the system prompt included, a new chat does NOT look 70% smaller — so comparing composed lengths cannot detect it",
+    );
+    assert.ok(
+      conversationLength(newComposed, SYSTEM_PROMPT.length) < conversationLength(oldComposed, persisted.systemPromptLength) * 0.3,
+      "but with the system prompt subtracted, the new chat is unmistakably smaller",
+    );
+  });
+
+  it("opening a new chat in a long-lived plugin process does NOT inherit the previous chat's plan (no force, exactly like production)", async () => {
+    // THE live bug: a brand-new chat asking "what is 2+2?" answered with the previous chat's
+    // `echo one/two/three` results, and LM Studio auto-titled it "Running Echo Commands".
+    //
+    // Cause: the plugin process outlives individual chats, so `activeSessionInitialized` stayed true
+    // and bootstrapSessionState's early return handed every new chat the previous chat's in-memory
+    // state. The new-conversation detection lived *below* that early return and therefore never ran
+    // in production even once. Every other test in this file calls resolveSessionStateFromHistory
+    // with force=true, which resets that flag and skips the entire broken path — which is why the
+    // detection looked well covered while being unreachable. This test never forces.
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    let conversation = "";
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => conversation }),
+    };
+
+    // Chat A: a substantial conversation that ends up owning a plan.
+    await resolveSessionStateFromHistory(ctl, true); // process start — the only legitimate force
+    conversation = "user: build the thing\nassistant: working on it\n".repeat(30); // ~1.3k chars
+    await preprocessMessage("Run these three bash commands: echo one, echo two, echo three", ctl);
+
+    const afterA = JSON.parse(readFileSync(rsPath, "utf-8"));
+    afterA.plan = {
+      goal: "Run these three bash commands",
+      steps: [{ index: 0, description: "Run echo one", status: "done" }],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(rsPath, JSON.stringify(afterA, null, 2));
+    const { resolveSessionStateFromHistory: _r } = await import("../src/toolsProvider");
+    void _r;
+
+    // Chat B: brand-new chat in the SAME process. No force — this is the production path.
+    conversation = "user: what is 2+2?\n";
+    await preprocessMessage("what is 2+2?", ctl);
+
+    const afterB = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(
+      afterB.plan,
+      null,
+      "a new chat must not inherit the previous chat's plan — this is what made a fresh chat answer 2+2 with stale echo results",
+    );
+    assert.notEqual(afterB.sessionId, afterA.sessionId, "a new chat must get its own session identity");
+  });
+
+  it("a mid-conversation compaction/roll still keeps the plan — the new-chat reset must not fire on a shrink that carries a managed-context block", async () => {
+    // Regression guard in the opposite direction. Auto-compaction and the rolling window legitimately
+    // shrink history mid-conversation; treating that as a new chat would wipe an in-progress plan,
+    // which is the bug 0.2.6 fixed. vibeLM re-injects its managed-context marker whenever it rolls,
+    // so that marker is what tells a roll apart from a genuinely new chat.
+    const { looksLikeDifferentConversation } = await import("../src/toolsProvider");
+
+    const rolled = "[vibeLM:managed-context]\n[Context spine - pinned]\n[Goal] ship the thing\nuser: carry on\n";
+    assert.equal(
+      looksLikeDifferentConversation(4000, 90, rolled),
+      false,
+      "a shrink that still carries vibeLM's managed-context block is a roll, not a new chat — the plan must survive",
+    );
+
+    const freshChat = "user: what is 2+2?\n";
+    assert.equal(
+      looksLikeDifferentConversation(4000, 20, freshChat),
+      true,
+      "a shrink with no managed-context block is a genuinely new chat",
+    );
+
+    assert.equal(
+      looksLikeDifferentConversation(4000, 3800, freshChat),
+      false,
+      "history that did not meaningfully shrink is the same conversation, still growing",
+    );
+    assert.equal(
+      looksLikeDifferentConversation(120, 20, freshChat),
+      false,
+      "a previous session too small to matter never triggers a reset",
+    );
+  });
+
+  it("a new chat that starts with tool enumeration (no pullHistory) still drops the previous chat's plan on the first real turn", async () => {
+    // The production ordering, and the reason the previous two fixes both missed:
+    // LM Studio calls toolsProvider() first, and the real ToolsProviderController has NO pullHistory.
+    // That lands in bootstrapSessionState's "no history at all" branch, which carries the persisted
+    // plan forward unconditionally (it cannot tell a hot-reload from a new chat) AND marks the session
+    // initialized. The later preprocessMessage call — which does have history and could tell the
+    // difference — then hits the early return.
+    //
+    // That handoff only works if the no-history branch also carries the persisted history SIZE. With it
+    // left at 0, the validating check bails at `previous <= MIN_SUBSTANTIAL_HISTORY_CHARS` and the plan
+    // survives. Live symptom: a fresh chat asking "what is 2+2?" answered with the prior chat's echo
+    // results, titled "Sequential Echo Commands".
+    const { preprocessMessage, resolveSessionStateFromHistory, toolsProvider } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+
+    // A previous chat left a substantial conversation and a real plan on disk.
+    writeFileSync(rsPath, JSON.stringify({
+      version: 1,
+      sessionId: "prev-session-id",
+      turnCounter: 7,
+      lastCompactionTurn: 0,
+      historyFingerprint: "deadbeef",
+      historyTextLength: 4000,
+      systemPromptLength: 0,
+      resumedFromPersistedState: false,
+      updatedAt: new Date().toISOString(),
+      managedContextBlocks: [],
+      lastHandoffSummary: "",
+      lastHandoffTurn: 0,
+      plan: {
+        goal: "Run these three bash commands and report their results",
+        steps: [
+          { index: 0, description: "Run echo one", status: "done" },
+          { index: 1, description: "Run echo two", status: "pending" },
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    }, null, 2));
+
+    // Fresh plugin process.
+    await resolveSessionStateFromHistory(makeCtl(), true);
+
+    // 1) LM Studio enumerates tools. This controller deliberately has NO pullHistory, like the real one.
+    await toolsProvider(makeCtl() as any);
+
+    // 2) The user's first message in the brand-new chat.
+    const freshChatCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "user: what is 2+2?\n" }),
+    };
+    await preprocessMessage("what is 2+2?", freshChatCtl);
+
+    const after = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(
+      after.plan,
+      null,
+      "the previous chat's plan must be dropped once a real history arrives showing this is a new chat",
+    );
+  });
+
+  it("Harmony models are not offered `amend`, because it collides with their native final channel", async () => {
+    // Live regression on gpt-oss-20b: every reply rendered
+    //   `<|channel|>final <|constrain|>amend<|message|>Here are the results...`
+    // as visible text in the chat bubble. `amend` asks the model to return its final answer *as a
+    // tool call*, but Harmony already expresses a finished turn via the `final` channel, so gpt-oss
+    // emitted a hybrid of the two. Confirmed it was vibeLM's doing by running the identical prompt
+    // with the plugin disabled (clean output), then confirmed the fix by re-running with amend gated
+    // off for Harmony (clean output, tools still executing).
+    //
+    // Non-Harmony families have no such native signal and still need amend — hence both directions.
+    const { toolsProvider, setLoadedModelInfoOverride, resolveSessionStateFromHistory, usesHarmonyFinalChannel } =
+      await import("../src/toolsProvider");
+
+    assert.equal(usesHarmonyFinalChannel("gpt-oss"), true);
+    assert.equal(usesHarmonyFinalChannel("gpt_oss"), true);
+    assert.equal(usesHarmonyFinalChannel("qwen3_5"), false);
+    assert.equal(usesHarmonyFinalChannel(""), false, "unknown arch must keep amend — dropping it by default would break every family");
+
+    try {
+      setLoadedModelInfoOverride({ arch: "gpt-oss", loadedContextLength: null });
+      await resolveSessionStateFromHistory(makeCtl(), true);
+      const harmonyTools = await toolsProvider(makeCtl() as any);
+      assert.ok(
+        !harmonyTools.some((t: any) => t.name === "amend"),
+        "amend must not be offered to a Harmony model — it is what produced the leaked <|channel|>final tags",
+      );
+      assert.ok(harmonyTools.length > 0, "the rest of the toolset must still be present for Harmony models");
+
+      setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
+      await resolveSessionStateFromHistory(makeCtl(), true);
+      const qwenTools = await toolsProvider(makeCtl() as any);
+      assert.ok(
+        qwenTools.some((t: any) => t.name === "amend"),
+        "non-Harmony families must still get amend — they have no native way to signal a finished turn",
+      );
+    } finally {
+      setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
     }
   });
 

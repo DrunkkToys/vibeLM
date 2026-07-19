@@ -375,7 +375,17 @@ export function parseLoadedModelInfo(data: { data?: Array<{ arch?: string; state
   };
 }
 
+// Test seam. toolsProvider() has to know the loaded model's architecture (Harmony families must not
+// be offered `amend` — see the tool assembly below), which would otherwise make the tool list depend
+// on whichever model the developer happens to have loaded in LM Studio while running the suite.
+// Tests pin this instead of reaching the network; production never sets it.
+let loadedModelInfoOverride: LoadedModelInfo | null = null;
+export function setLoadedModelInfoOverride(info: LoadedModelInfo | null): void {
+  loadedModelInfoOverride = info;
+}
+
 async function fetchLoadedModelInfo(): Promise<LoadedModelInfo> {
+  if (loadedModelInfoOverride) return loadedModelInfoOverride;
   const now = Date.now();
   if (cachedLoadedModelInfo && now - cachedLoadedModelInfo.ts < LOADED_MODEL_CACHE_TTL_MS) {
     return cachedLoadedModelInfo.info;
@@ -406,6 +416,14 @@ async function getLoadedModelArch(): Promise<string> {
 //    Keep that switch as the real lever and append a graduated natural-language qualifier so
 //    low/medium/high are at least textually distinct in the prompt.
 //  - everything else (Llama/Mistral/Gemma/DeepSeek/GLM/Phi/etc.): graduated natural-language nudges.
+// Harmony-format architectures express a finished turn natively via the `final` channel, so an
+// `amend`-style "return your final answer" tool duplicates a capability they already have and makes
+// them emit `<|channel|>final <|constrain|>amend<|message|>` as visible text. Same detection as the
+// reasoning-directive mapping below, kept as one predicate so both stay in sync.
+export function usesHarmonyFinalChannel(arch: string): boolean {
+  return /gpt.?oss/i.test(arch);
+}
+
 export function reasoningDirectiveFor(effort: ReasoningEffort, arch: string): string {
   if (/gpt.?oss/i.test(arch)) {
     switch (effort) {
@@ -582,6 +600,11 @@ type SessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   historyTextLength: number;
+  // Length of the system prompt inside historyTextLength. Tracked separately because the
+  // new-conversation heuristic in bootstrapSessionState compares CONVERSATION size, and vibeLM's
+  // system prompt (26 tool descriptions) is a multi-thousand-char constant present in every chat,
+  // new or old. Comparing composed lengths let that constant swamp the signal entirely.
+  systemPromptLength: number;
   resumedFromPersistedState: boolean;
   managedContextBlocks: string[];
   lastHandoffSummary: string;
@@ -597,6 +620,7 @@ function createSessionState(): SessionState {
     lastCompactionTurn: 0,
     historyFingerprint: "",
     historyTextLength: 0,
+    systemPromptLength: 0,
     resumedFromPersistedState: false,
     managedContextBlocks: [],
     lastHandoffSummary: "",
@@ -631,6 +655,7 @@ type PersistedSessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   historyTextLength?: number;
+  systemPromptLength?: number;
   resumedFromPersistedState: boolean;
   updatedAt: string;
   managedContextBlocks?: string[];
@@ -719,6 +744,7 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       lastCompactionTurn: Number.isFinite(parsed.lastCompactionTurn) ? Math.max(0, Math.floor(parsed.lastCompactionTurn ?? 0)) : 0,
       historyFingerprint: parsed.historyFingerprint,
       historyTextLength: Number.isFinite(parsed.historyTextLength) ? Math.max(0, Math.floor(parsed.historyTextLength ?? 0)) : 0,
+      systemPromptLength: Number.isFinite(parsed.systemPromptLength) ? Math.max(0, Math.floor(parsed.systemPromptLength ?? 0)) : 0,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
       managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
@@ -742,6 +768,7 @@ function writeRuntimeStateSync(state: SessionState): void {
       lastCompactionTurn: state.lastCompactionTurn,
       historyFingerprint: state.historyFingerprint,
       historyTextLength: state.historyTextLength,
+      systemPromptLength: state.systemPromptLength,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
       managedContextBlocks: state.managedContextBlocks,
@@ -755,18 +782,74 @@ function writeRuntimeStateSync(state: SessionState): void {
   }
 }
 
-async function readHistoryText(ctl?: PromptPreprocessorController | ToolsProviderController): Promise<string | null> {
+// Conversation size = composed history minus the system prompt. Exported for the cascade test:
+// this subtraction is the whole fix for new chats inheriting a previous session's plan.
+export function conversationLength(composedLength: number, systemPromptLength: number): number {
+  return Math.max(0, composedLength - systemPromptLength);
+}
+
+async function readHistoryParts(
+  ctl?: PromptPreprocessorController | ToolsProviderController,
+): Promise<{ text: string; systemPromptLength: number } | null> {
   try {
     const history = await (ctl as any)?.pullHistory?.();
     if (!history) return null;
-    return composeHistoryText(history.getSystemPrompt(), history.toString());
+    const systemPrompt = history.getSystemPrompt() ?? "";
+    return {
+      text: composeHistoryText(systemPrompt, history.toString()),
+      systemPromptLength: normalizeHistoryText(systemPrompt).length,
+    };
   } catch {
     return null;
   }
 }
 
+// Does this turn's history belong to a different conversation than the one the in-memory session is
+// tracking? Only ever answers true for a DRAMATIC shrink with no vibeLM-managed block present.
+//
+// Both conditions are load-bearing:
+//  - Shrink alone is not enough: auto-compaction and the rolling window legitimately shrink history
+//    mid-conversation, and wiping a plan there is exactly the bug 0.2.6 fixed.
+//  - vibeLM re-injects its own managed-context block whenever it compacts/rolls, so that marker
+//    surviving in history means "same conversation, just rolled". A brand new chat has no marker.
+//
+// Erring toward "same conversation" (a false negative) is what produced the live bug this guards:
+// a fresh chat asking "what is 2+2?" answered with the previous chat's echo results. Erring the
+// other way costs a re-plan, which the model recovers from on the next turn.
+export function looksLikeDifferentConversation(
+  previousConversationChars: number,
+  incomingConversationChars: number,
+  incomingHistoryText: string,
+): boolean {
+  if (previousConversationChars <= MIN_SUBSTANTIAL_HISTORY_CHARS) return false;
+  if (incomingConversationChars >= previousConversationChars * NEW_CONVERSATION_LENGTH_RATIO) return false;
+  return !hasManagedContext(incomingHistoryText);
+}
+
 async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsProviderController, force = false): Promise<SessionState> {
   if (activeSessionInitialized && !force) {
+    // The plugin process outlives individual chats: opening a new chat in LM Studio does NOT restart
+    // it, so this early return used to hand every new chat the PREVIOUS chat's in-memory state —
+    // plan, managed-context blocks and all — and the new-conversation detection below never ran even
+    // once. Reproduced live: a brand new chat asking "what is 2+2?" replied with the prior session's
+    // `echo one/two/three` results and was auto-titled "Running Echo Commands".
+    //
+    // Detection has to run per-turn, not once per process. It stays inside this early-return branch
+    // (rather than falling through to the full bootstrap) so an ongoing conversation keeps its
+    // session identity, turn counter and dedup history exactly as before — nothing changes unless
+    // the history genuinely belongs to a different chat.
+    const parts = await readHistoryParts(ctl);
+    if (parts) {
+      const previous = conversationLength(activeSessionState.historyTextLength, activeSessionState.systemPromptLength);
+      const incoming = conversationLength(parts.text.length, parts.systemPromptLength);
+      if (looksLikeDifferentConversation(previous, incoming, parts.text)) {
+        activeSessionState = createSessionState();
+        activeSessionState.historyFingerprint = fingerprintHistoryText(parts.text);
+        activeSessionState.historyTextLength = parts.text.length;
+        activeSessionState.systemPromptLength = parts.systemPromptLength;
+        writeRuntimeStateSync(activeSessionState);
+      }
+    }
     return activeSessionState;
   }
 
@@ -778,7 +861,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
 
   if (!activeSessionBootstrapPromise) {
     activeSessionBootstrapPromise = (async () => {
-      const historyText = await readHistoryText(ctl);
+      const historyParts = await readHistoryParts(ctl);
+      const historyText = historyParts?.text ?? null;
+      const systemPromptLength = historyParts?.systemPromptLength ?? 0;
       if (!historyText) {
         // No history available at all (e.g. a vibe_bridge tick's internal ctl right after a hot
         // reload/process restart wiped module state, before any real preprocessMessage call has run
@@ -792,6 +877,21 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
           activeSessionState.plan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
           activeSessionState.resumedFromPersistedState = true;
+          // Carry the persisted SIZE forward too, not just the contents. This branch runs with no
+          // history to check against, so the carryover above is provisional — it has no way to tell a
+          // hot-reload mid-conversation from the first tool-enumeration of a brand new chat. It is
+          // reached in production because LM Studio calls toolsProvider() (whose controller has no
+          // pullHistory) before the prompt preprocessor, and it sets activeSessionInitialized, so the
+          // NEXT call — preprocessMessage, which does have history — validates it via the early-return
+          // check at the top of this function.
+          //
+          // Leaving these at createSessionState()'s 0 broke exactly that handoff: the validating check
+          // compares against `previous` and bails out when previous <= MIN_SUBSTANTIAL_HISTORY_CHARS,
+          // so a zero here made it decline to act and the plan survived into the new chat anyway.
+          // Reproduced live: a fresh chat asking "what is 2+2?" answered with the previous chat's
+          // echo results and was auto-titled "Sequential Echo Commands".
+          activeSessionState.historyTextLength = persisted.historyTextLength ?? 0;
+          activeSessionState.systemPromptLength = persisted.systemPromptLength ?? 0;
         }
       } else {
         const historyFingerprint = fingerprintHistoryText(historyText);
@@ -804,6 +904,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             lastCompactionTurn: persisted.lastCompactionTurn,
             historyFingerprint,
             historyTextLength: historyText.length,
+            systemPromptLength,
             resumedFromPersistedState: true,
             managedContextBlocks: persisted.managedContextBlocks ?? [],
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
@@ -814,17 +915,30 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           activeSessionState = createSessionState();
           activeSessionState.historyFingerprint = historyFingerprint;
           activeSessionState.historyTextLength = historyText.length;
+          activeSessionState.systemPromptLength = systemPromptLength;
           // A fingerprint mismatch is ambiguous: it's either (a) the process restarted mid-conversation
           // or the host rolled/truncated history — same conversation, still worth re-asserting the plan
           // — or (b) this is a genuinely new/different chat that happens to reuse the same persisted
-          // state file. Only the raw history text length distinguishes them: a restart/roll of an
-          // ongoing conversation still carries a comparable (or larger) amount of text, while a brand
-          // new chat starts from just the system prompt + first message. Caught live: a fresh chat
-          // asking for an unrelated weather CLI resurrected a many-turn REST-API-backend plan from a
-          // previous, unrelated session because this branch carried it over unconditionally.
-          const oldLength = persisted?.historyTextLength ?? 0;
-          const looksLikeGenuinelyNewConversation = oldLength > MIN_SUBSTANTIAL_HISTORY_CHARS
-            && historyText.length < oldLength * NEW_CONVERSATION_LENGTH_RATIO;
+          // state file. Conversation size distinguishes them: a restart/roll of an ongoing conversation
+          // still carries a comparable (or larger) amount of text, while a brand new chat starts from
+          // just the first message. Caught live: a fresh chat asking for an unrelated weather CLI
+          // resurrected a many-turn REST-API-backend plan from a previous, unrelated session.
+          //
+          // This MUST compare conversation size, not composed history size. vibeLM's system prompt
+          // (26 tool descriptions) is a multi-thousand-char constant present in every chat, and
+          // composeHistoryText prepends it to both sides of the comparison. Measuring composed
+          // lengths let that constant dominate: a brand new chat came out as systemPrompt + ~20 chars,
+          // which is nowhere near 30% below an older chat's systemPrompt + conversation, so the guard
+          // never fired and every new chat inherited the previous session's plan and managed-context
+          // blocks. Reproduced live: a fresh chat was retitled "[vibeLM:managed-cont" because
+          // preprocessMessage prepended a rehydration block ahead of the user's actual first message.
+          const oldConversation = conversationLength(
+            persisted?.historyTextLength ?? 0,
+            persisted?.systemPromptLength ?? 0,
+          );
+          const newConversation = conversationLength(historyText.length, systemPromptLength);
+          const looksLikeGenuinelyNewConversation = oldConversation > MIN_SUBSTANTIAL_HISTORY_CHARS
+            && newConversation < oldConversation * NEW_CONVERSATION_LENGTH_RATIO;
           if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
             // The raw history no longer matches what we last saw — either the process restarted
             // mid-conversation or the host rolled/truncated history. Session identity/counters can't
@@ -1082,12 +1196,13 @@ function splitLines(text: string): string[] {
 
 async function getHistoryText(ctl?: PromptPreprocessorController): Promise<string> {
   if (!ctl) return "";
-  try {
-    const history = await ctl.pullHistory();
-    return composeHistoryText(history.getSystemPrompt(), history.toString());
-  } catch {
-    return "";
-  }
+  const parts = await readHistoryParts(ctl);
+  if (!parts) return "";
+  // Keep the system-prompt length current for every turn, not just at bootstrap. syncRuntimeState
+  // persists historyTextLength on each turn, and the next chat's new-conversation check subtracts
+  // this from it — a stale value would skew that comparison.
+  activeSessionState.systemPromptLength = parts.systemPromptLength;
+  return parts.text;
 }
 
 function hasManagedContext(historyText: string): boolean {
@@ -2916,12 +3031,23 @@ The default prompt can be configured in tool settings.`,
     vibe_bridge: vibeBridgeTool,
   };
 
-  const MANDATORY_ENABLED = ["amend"];
+  // `amend` exists so families with no native "I'm done" signal can hand a final answer back
+  // explicitly. Harmony models already have one — the `final` channel — and exposing both makes them
+  // emit a hybrid of the two as literal text. Reproduced live on gpt-oss-20b: every reply opened with
+  // `<|channel|>final <|constrain|>amend<|message|>` in the visible chat bubble. Confirmed as vibeLM's
+  // doing by running the identical prompt with the plugin disabled, which rendered cleanly.
+  //
+  // Dropping amend for Harmony costs nothing: the model ends its turn by closing the final channel,
+  // which is what amend was emulating. Every other family keeps it (see MANDATORY_ENABLED below).
+  const arch = await getLoadedModelArch();
+  const amendConflictsWithNativeFinalChannel = usesHarmonyFinalChannel(arch);
+
+  const MANDATORY_ENABLED = amendConflictsWithNativeFinalChannel ? [] : ["amend"];
 
   const enabledNames = dedupeTags([
     ...resolveEnabledToolNames(ctl),
     ...MANDATORY_ENABLED,
-  ]);
+  ]).filter((name: string) => !(amendConflictsWithNativeFinalChannel && name === "amend"));
   const allTools = enabledNames
     .filter((name: string) => ALL_TOOL_MAP[name])
     .map((name: string) => ALL_TOOL_MAP[name]);

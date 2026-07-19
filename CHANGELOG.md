@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Harmony models (gpt-oss) leaked raw `<|channel|>final <|constrain|>amend<|message|>` into every visible reply.** `amend` asks the model to return its final answer *as a tool call*, but Harmony already expresses a finished turn natively via the `final` channel, so gpt-oss emitted a hybrid of the two as literal text. `amend` is now withheld from Harmony architectures, which have no need for it; every other family still gets it (they have no native finished-turn signal). Isolated by running the identical prompt with the plugin disabled — output was clean, proving the leak was vibeLM's and not the model's prompt template — and confirmed fixed live on `gpt-oss-20b` with tools still executing normally.
+- **A new chat inherited the previous chat's plan.** The plugin process outlives individual chats, so `bootstrapSessionState`'s `activeSessionInitialized` early return handed each new chat the previous one's in-memory state, and the new-conversation detection below it never ran in production. Detection now runs per-turn. Additionally, the "no history available" branch (reached because LM Studio calls `toolsProvider()`, whose controller has no `pullHistory`, before the prompt preprocessor) now carries the persisted history *size* forward as well as its contents, so the next call that does have history can actually validate the carryover instead of bailing out on a zero. Live symptom: a fresh chat asking "what is 2+2?" answered with the prior chat's `echo one/two/three` results and was auto-titled "Sequential Echo Commands".
+  - A mid-conversation compaction/roll still preserves the plan — the reset only fires on a dramatic shrink with no vibeLM managed-context block present, which is what distinguishes a new chat from a roll.
+
+### Changed
+- Tests pin the loaded-model architecture via a new `setLoadedModelInfoOverride` seam instead of depending on whichever model happens to be loaded in LM Studio (or monkeypatching `globalThis.fetch`). `toolsProvider()` now consults the arch, so without this the tool list would differ between machines.
+
 ## [0.2.12] - 2026-07-19
 
 ### Fixed
