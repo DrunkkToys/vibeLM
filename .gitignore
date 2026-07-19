@@ -14,5 +14,7 @@ config.json
 knowledge-base.json
 CLAUDE.md
 CODEX.md
+AGENTS.md
+benchmark/
 NOTES.md
 opencode.json
