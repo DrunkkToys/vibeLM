@@ -5,9 +5,13 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.12] - 2026-07-19
 
 ### Fixed
+- **Reverted the main-chat `PredictionLoopHandler` (0.2.9-0.2.11), which broke the chat on every thinking model.** Registering `withPredictionLoopHandler` takes ownership of the whole generation loop, and the handler appended every prediction fragment to the visible assistant block without checking `fragment.reasoningType`. LM Studio's default loop uses that field to route `"reasoning"` fragments into the collapsible thinking UI and render only `"none"` fragments as chat; without it, reasoning prose and raw `<think>` / `<|channel|>` tags rendered straight into the chat bubble, and this affected every model family. The fragment-level strip added in 0.2.11 could not fix it: `THINK_BLOCK` matches `<think>[\s\S]*?</think>` and needs both tags in one string, but streaming delivers them in separate fragments, so it never matched. `withToolsProvider` is restored, handing rendering, reasoning-channel routing, and tool-call parsing back to LM Studio.
+  - Verified live in LM Studio on `google/gemma-4-26b-a4b-qat` and `gpt-oss-20b`: reasoning collapses into the native "Thought for Ns" block, `bash_terminal` / `update_plan_step` execute as real tool calls with correct names and expandable arguments/results, and no raw tags reach the chat bubble.
+  - `tests/index.test.ts` previously asserted the inverted invariant (that `withToolsProvider` was never registered), so it would have stayed green on the broken wiring indefinitely. It now guards both directions.
+- The `Enforce Main Chat Bounds` setting (`tools.enforceMainChatBounds`) is removed along with the handler it gated. Bounding the main chat's generation loop remains an open problem, but it will not be solved by owning the render loop.
 - **vibeLM was never reading chat history at all.** History was read via `Chat.toString()`, but `@lmstudio/sdk`'s `Chat` has no content-returning `toString()` — it yields the object's debug representation, literally `"Chat {\n  system: \n}"`. Confirmed by logging the real value inside the running plugin. So `historyTextLength`, the history fingerprint, the new-conversation check and any compaction/budget math keyed off history size were all operating on a ~19-character constant that never changed as a conversation grew. History is now read through the real API (`getLength()` / `at(i)` / `ChatMessage.getText()`), and a single real exchange measures ~414 chars instead of 19.
   - Consequence: `MIN_SUBSTANTIAL_HISTORY_CHARS` was recalibrated 500 → 150. Against the 19-char constant, `> 500` was never true, so the new-conversation detection had never fired in production in any code path.
 - **Harmony models (gpt-oss) leaked raw `<|channel|>final <|constrain|>amend<|message|>` into every visible reply.** `amend` asks the model to return its final answer *as a tool call*, but Harmony already expresses a finished turn natively via the `final` channel, so gpt-oss emitted a hybrid of the two as literal text. `amend` is now withheld from Harmony architectures, which have no need for it; every other family still gets it (they have no native finished-turn signal). Isolated by running the identical prompt with the plugin disabled — output was clean, proving the leak was vibeLM's and not the model's prompt template — and confirmed fixed live on `gpt-oss-20b` with tools still executing normally.
@@ -17,13 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Tests pin the loaded-model architecture via a new `setLoadedModelInfoOverride` seam instead of depending on whichever model happens to be loaded in LM Studio (or monkeypatching `globalThis.fetch`). `toolsProvider()` now consults the arch, so without this the tool list would differ between machines.
 
-## [0.2.12] - 2026-07-19
-
-### Fixed
-- **Reverted the main-chat `PredictionLoopHandler` (0.2.9-0.2.11), which broke the chat on every thinking model.** Registering `withPredictionLoopHandler` takes ownership of the whole generation loop, and the handler appended every prediction fragment to the visible assistant block without checking `fragment.reasoningType`. LM Studio's default loop uses that field to route `"reasoning"` fragments into the collapsible thinking UI and render only `"none"` fragments as chat; without it, reasoning prose and raw `<think>` / `<|channel|>` tags rendered straight into the chat bubble, and this affected every model family. The fragment-level strip added in 0.2.11 could not fix it: `THINK_BLOCK` matches `<think>[\s\S]*?</think>` and needs both tags in one string, but streaming delivers them in separate fragments, so it never matched. `withToolsProvider` is restored, handing rendering, reasoning-channel routing, and tool-call parsing back to LM Studio.
-  - Verified live in LM Studio on `google/gemma-4-26b-a4b-qat` and `gpt-oss-20b`: reasoning collapses into the native "Thought for Ns" block, `bash_terminal` / `update_plan_step` execute as real tool calls with correct names and expandable arguments/results, and no raw tags reach the chat bubble.
-  - `tests/index.test.ts` previously asserted the inverted invariant (that `withToolsProvider` was never registered), so it would have stayed green on the broken wiring indefinitely. It now guards both directions.
-- The `Enforce Main Chat Bounds` setting (`tools.enforceMainChatBounds`) is removed along with the handler it gated. Bounding the main chat's generation loop remains an open problem, but it will not be solved by owning the render loop.
 
 ## [0.2.11] - 2026-07-11
 
@@ -339,7 +336,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.8...HEAD
+[0.2.12]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.11...v0.2.12
 [0.2.8]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7
 [0.2.0]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...v0.2.0
