@@ -1008,6 +1008,16 @@ describe("vibeLM Cascade Integration", () => {
       false,
       "a previous session too small to matter never triggers a reset",
     );
+
+    // Calibration guard. A complete single tool-using exchange measures ~414 chars of real
+    // conversation text (measured live), and a fresh chat's opening message ~20. The threshold has to
+    // sit between them or the check silently never fires — which is exactly what happened while
+    // history was read via Chat.toString() and every session measured a constant 19 chars.
+    assert.equal(
+      looksLikeDifferentConversation(414, 18, freshChat),
+      true,
+      "one real exchange must count as substantial, or a new chat keeps inheriting the previous plan",
+    );
   });
 
   it("a new chat that starts with tool enumeration (no pullHistory) still drops the previous chat's plan on the first real turn", async () => {
@@ -1109,6 +1119,51 @@ describe("vibeLM Cascade Integration", () => {
     } finally {
       setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
     }
+  });
+
+  it("reads conversation text off the SDK Chat object, not its debug toString()", async () => {
+    // Root cause of the whole plan-bleeding class of bugs. @lmstudio/sdk's Chat has NO
+    // content-returning toString(): calling it yields the object's debug representation, literally
+    //   "Chat {\n  system: \n}"
+    // Confirmed by logging the real value inside the running plugin. So every history consumer here —
+    // length, fingerprint, the new-conversation check, compaction/budget math — was operating on a
+    // ~19-character constant that never changed as the conversation grew. The real API is
+    // getLength() / at(i) / ChatMessage.getText()+getRole().
+    const { chatToText } = await import("../src/toolsProvider");
+
+    // A mock shaped like the real SDK object, including the misleading toString().
+    const messages = [
+      { role: "user", text: "run the three echo commands" },
+      { role: "assistant", text: "done: one two three" },
+      { role: "user", text: "what is 2+2?" },
+    ];
+    const sdkShapedChat: any = {
+      getLength: () => messages.length,
+      at: (i: number) => ({
+        getRole: () => messages[i].role,
+        getText: () => messages[i].text,
+      }),
+      getSystemPrompt: () => "",
+      toString: () => "Chat {\n  system: \n}",
+    };
+
+    const text = chatToText(sdkShapedChat);
+    assert.match(text, /run the three echo commands/, "actual user turns must appear");
+    assert.match(text, /done: one two three/, "actual assistant turns must appear");
+    assert.match(text, /what is 2\+2\?/);
+    assert.ok(!text.includes("Chat {"), "must never fall back to the debug representation when the real API is available");
+    assert.ok(
+      text.length > 40,
+      `history text must reflect real conversation size, got ${text.length} chars — the bug produced a constant ~19`,
+    );
+
+    // Growth must be observable: this is precisely what the new-conversation check compares.
+    messages.push({ role: "assistant", text: "4. ".repeat(50) });
+    assert.ok(chatToText(sdkShapedChat).length > text.length, "history text must grow as the conversation grows");
+
+    // Objects without the real API (this file's older test doubles) still work.
+    assert.equal(chatToText({ toString: () => "user: hi" }), "user: hi");
+    assert.equal(chatToText(null), "");
   });
 
   it("write_file still rejects a ~-prefixed path that resolves outside the workspace", async () => {

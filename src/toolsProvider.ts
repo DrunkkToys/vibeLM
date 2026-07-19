@@ -75,7 +75,17 @@ const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 // chat on a historyFingerprint mismatch (see bootstrapSessionState). Only treat it as a new
 // conversation — and skip carrying over the old plan — when the *previous* history was substantial
 // (not just a short placeholder/first turn) AND the new history is dramatically shorter than it.
-const MIN_SUBSTANTIAL_HISTORY_CHARS = 500;
+// Floor below which a previous session is too small to draw any conclusion from. This only guards
+// against a noisy baseline — the actual new-chat discriminators are the shrink RATIO below and the
+// absence of a managed-context block (see looksLikeDifferentConversation).
+//
+// Recalibrated from 500 once chatToText started returning real conversation text. While history was
+// being read via Chat.toString(), this measured a constant 19-char debug string, so `> 500` was never
+// once true and the new-conversation detection never fired in production in any code path. Measured
+// live afterwards: a complete single tool-using exchange (user turn + assistant answer) is ~414
+// chars, and a fresh chat's first message is ~20. 150 sits clearly between them, so one real exchange
+// counts as substantial while a trivial "hi"/"hello" chat still does not.
+const MIN_SUBSTANTIAL_HISTORY_CHARS = 150;
 const NEW_CONVERSATION_LENGTH_RATIO = 0.3;
 // Denylist, not allowlist: bash_terminal is a general-purpose dev tool (git, npm, build scripts,
 // etc.), so an allowlist would block too much legitimate use. This blocks clearly destructive or
@@ -605,6 +615,11 @@ type SessionState = {
   // system prompt (26 tool descriptions) is a multi-thousand-char constant present in every chat,
   // new or old. Comparing composed lengths let that constant swamp the signal entirely.
   systemPromptLength: number;
+  // Size of the CONVERSATION alone, as last seen by readHistoryParts. Deliberately separate from
+  // historyTextLength, which recordProcessedPrompt also folds vibeLM's own injected directive into —
+  // comparing that against a raw history read is apples-to-oranges and inflates the "previous" side,
+  // which makes the new-chat check fire spuriously mid-conversation.
+  lastSeenConversationChars: number;
   resumedFromPersistedState: boolean;
   managedContextBlocks: string[];
   lastHandoffSummary: string;
@@ -621,6 +636,7 @@ function createSessionState(): SessionState {
     historyFingerprint: "",
     historyTextLength: 0,
     systemPromptLength: 0,
+    lastSeenConversationChars: 0,
     resumedFromPersistedState: false,
     managedContextBlocks: [],
     lastHandoffSummary: "",
@@ -656,6 +672,7 @@ type PersistedSessionState = {
   historyFingerprint: string;
   historyTextLength?: number;
   systemPromptLength?: number;
+  lastSeenConversationChars?: number;
   resumedFromPersistedState: boolean;
   updatedAt: string;
   managedContextBlocks?: string[];
@@ -745,6 +762,7 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       historyFingerprint: parsed.historyFingerprint,
       historyTextLength: Number.isFinite(parsed.historyTextLength) ? Math.max(0, Math.floor(parsed.historyTextLength ?? 0)) : 0,
       systemPromptLength: Number.isFinite(parsed.systemPromptLength) ? Math.max(0, Math.floor(parsed.systemPromptLength ?? 0)) : 0,
+      lastSeenConversationChars: Number.isFinite(parsed.lastSeenConversationChars) ? Math.max(0, Math.floor(parsed.lastSeenConversationChars ?? 0)) : 0,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
       managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
@@ -769,6 +787,7 @@ function writeRuntimeStateSync(state: SessionState): void {
       historyFingerprint: state.historyFingerprint,
       historyTextLength: state.historyTextLength,
       systemPromptLength: state.systemPromptLength,
+      lastSeenConversationChars: state.lastSeenConversationChars,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
       managedContextBlocks: state.managedContextBlocks,
@@ -788,15 +807,50 @@ export function conversationLength(composedLength: number, systemPromptLength: n
   return Math.max(0, composedLength - systemPromptLength);
 }
 
+// Render an @lmstudio/sdk Chat as conversation text.
+//
+// This exists because `Chat` has NO content-returning toString(). Calling it yields the object's
+// debug representation — literally `"Chat {\n  system: \n}"` — so every consumer of history text in
+// this file was measuring, fingerprinting and budgeting against a ~19-character constant that never
+// changed no matter how long the conversation got. Confirmed live by logging the value in the
+// running plugin. That silently disabled the new-conversation detection (every chat looked identical
+// in size), and any compaction/budget logic keyed off history length.
+//
+// The real API is getLength() / at(i) / ChatMessage.getText()+getRole().
+//
+// The toString() fallback is deliberate and is NOT the old bug: it only runs for objects that do not
+// expose getLength, which in practice means this file's test doubles (`{ toString: () => "..." }`).
+// The real SDK object always takes the iteration path.
+export function chatToText(history: any): string {
+  if (!history) return "";
+  try {
+    if (typeof history.getLength === "function" && typeof history.at === "function") {
+      const lines: string[] = [];
+      const length = history.getLength();
+      for (let i = 0; i < length; i++) {
+        const message = history.at(i);
+        const body = typeof message?.getText === "function" ? message.getText() : "";
+        if (!body) continue;
+        const role = typeof message?.getRole === "function" ? message.getRole() : "";
+        lines.push(role ? `${role}: ${body}` : body);
+      }
+      return lines.join("\n");
+    }
+    return typeof history.toString === "function" ? history.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
 async function readHistoryParts(
   ctl?: PromptPreprocessorController | ToolsProviderController,
 ): Promise<{ text: string; systemPromptLength: number } | null> {
   try {
     const history = await (ctl as any)?.pullHistory?.();
     if (!history) return null;
-    const systemPrompt = history.getSystemPrompt() ?? "";
+    const systemPrompt = history.getSystemPrompt?.() ?? "";
     return {
-      text: composeHistoryText(systemPrompt, history.toString()),
+      text: composeHistoryText(systemPrompt, chatToText(history)),
       systemPromptLength: normalizeHistoryText(systemPrompt).length,
     };
   } catch {
@@ -840,15 +894,19 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
     // the history genuinely belongs to a different chat.
     const parts = await readHistoryParts(ctl);
     if (parts) {
-      const previous = conversationLength(activeSessionState.historyTextLength, activeSessionState.systemPromptLength);
+      const previous = activeSessionState.lastSeenConversationChars;
       const incoming = conversationLength(parts.text.length, parts.systemPromptLength);
       if (looksLikeDifferentConversation(previous, incoming, parts.text)) {
         activeSessionState = createSessionState();
         activeSessionState.historyFingerprint = fingerprintHistoryText(parts.text);
         activeSessionState.historyTextLength = parts.text.length;
         activeSessionState.systemPromptLength = parts.systemPromptLength;
-        writeRuntimeStateSync(activeSessionState);
       }
+      // Track the largest conversation size seen for this session. Using the max rather than the
+      // latest keeps a host-side history roll (which shrinks the visible conversation without
+      // starting a new chat) from quietly lowering the bar for the next comparison.
+      activeSessionState.lastSeenConversationChars = Math.max(activeSessionState.lastSeenConversationChars, incoming);
+      writeRuntimeStateSync(activeSessionState);
     }
     return activeSessionState;
   }
@@ -892,6 +950,14 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           // echo results and was auto-titled "Sequential Echo Commands".
           activeSessionState.historyTextLength = persisted.historyTextLength ?? 0;
           activeSessionState.systemPromptLength = persisted.systemPromptLength ?? 0;
+          // Fall back to the older historyTextLength for state files written before
+          // lastSeenConversationChars existed. Without this, everyone upgrading would have the
+          // new-chat check silently disabled (previous = 0 fails the MIN_SUBSTANTIAL floor) until
+          // their first turn happened to repopulate it.
+          // `||`, not `??`: readRuntimeStateSync normalizes a missing field to 0, so `??` would never
+          // reach the fallback. 0 carries no information here, which makes `||` the correct choice.
+          activeSessionState.lastSeenConversationChars = persisted.lastSeenConversationChars
+            || conversationLength(persisted.historyTextLength ?? 0, persisted.systemPromptLength ?? 0);
         }
       } else {
         const historyFingerprint = fingerprintHistoryText(historyText);
@@ -905,6 +971,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             historyFingerprint,
             historyTextLength: historyText.length,
             systemPromptLength,
+            lastSeenConversationChars: conversationLength(historyText.length, systemPromptLength),
             resumedFromPersistedState: true,
             managedContextBlocks: persisted.managedContextBlocks ?? [],
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
@@ -916,6 +983,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           activeSessionState.historyFingerprint = historyFingerprint;
           activeSessionState.historyTextLength = historyText.length;
           activeSessionState.systemPromptLength = systemPromptLength;
+          activeSessionState.lastSeenConversationChars = conversationLength(historyText.length, systemPromptLength);
           // A fingerprint mismatch is ambiguous: it's either (a) the process restarted mid-conversation
           // or the host rolled/truncated history — same conversation, still worth re-asserting the plan
           // — or (b) this is a genuinely new/different chat that happens to reuse the same persisted
