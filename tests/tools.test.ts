@@ -138,6 +138,8 @@ describe("checkBashCommandSafety", () => {
     assert.equal(checkBashCommandSafety("rm -rf node_modules"), null);
     assert.equal(checkBashCommandSafety("rm -rf ./dist"), null);
     assert.equal(checkBashCommandSafety("grep -rn TODO src/"), null);
+    assert.equal(checkBashCommandSafety("echo hi >/dev/null; echo ok"), null);
+    assert.equal(checkBashCommandSafety("mv index.js app/index.js 2>/dev/null; ls -la app/"), null);
   });
 });
 
