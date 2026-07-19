@@ -2999,16 +2999,13 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
     onToolCallRequestFailure: (_roundIndex, callId, error) => {
       toolStatuses.get(callId)?.setStatus({ type: "toolCallGenerationFailed", error: error.message });
     },
-    guardToolCall: async (_roundIndex, callId, controller) => {
-      toolStatuses.get(callId)?.setStatus({ type: "confirmingToolCall" });
-      const result = await ctl.requestConfirmToolCall({
-        callId,
-        name: controller.tool.name,
-        parameters: controller.toolCallRequest.arguments ?? {},
-      });
-      if (result.type === "allow") controller.allow();
-      else controller.deny(result.denyReason);
-    },
+    // NOTE: does NOT route through ctl.requestConfirmToolCall() — confirmed live that it never
+    // resolves (a real multi-minute hang with zero further model activity, reproduced against
+    // qwen3.5-4b), consistent with RequestConfirmToolCallOpts/Result both still being tagged
+    // @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" in the SDK. vibeLM
+    // never required per-call user confirmation before this change either (LM Studio's default
+    // loop ran these same tools unprompted), so allowing directly here is not a new gap.
+    guardToolCall: (_roundIndex, _callId, controller) => controller.allow(),
     onToolCallRequestFinalized: (_roundIndex, callId, info) => {
       block.appendToolRequest({
         callId,

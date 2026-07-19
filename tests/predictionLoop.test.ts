@@ -112,25 +112,25 @@ describe("predictionLoopHandler Cascade", () => {
     assert.deepEqual(contentBlockCalls.appendText, ["hello ", "world"]);
   });
 
-  it("routes guardToolCall through ctl.requestConfirmToolCall and allows on approval", async () => {
+  it("guardToolCall allows directly without waiting on ctl.requestConfirmToolCall (confirmed live to hang forever)", async () => {
     const { predictionLoopHandler } = await import("../src/toolsProvider");
     const { ctl, confirmCalls } = makeCtl({
       maxOrchestratorTurns: 5,
       act: async (_chat, _tools, opts) => {
         let allowed = false;
-        await opts.guardToolCall(0, 1, {
+        const result = opts.guardToolCall(0, 1, {
           tool: { name: "write_file" },
           toolCallRequest: { arguments: { path: "x" } },
           allow: () => { allowed = true; },
           deny: () => { throw new Error("should not deny"); },
         });
-        assert.equal(allowed, true);
+        assert.equal(allowed, true, "must allow synchronously, not after an awaited round-trip");
+        await result;
         return {};
       },
     });
     await predictionLoopHandler(ctl);
-    assert.equal(confirmCalls.length, 1);
-    assert.equal(confirmCalls[0].name, "write_file");
+    assert.equal(confirmCalls.length, 0, "must not call the confirm-tool-call API at all");
   });
 
   it("pairs a tool result message back to its callId via FIFO ordering and appends it to the block", async () => {

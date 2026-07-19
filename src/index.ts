@@ -2,7 +2,7 @@ console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage, LMStudioClient } from "@lmstudio/sdk";
 import { configSchematics } from "./config";
-import { toolsProvider, preprocessMessage, reasoningDirectiveForSession, predictionLoopHandler } from "./toolsProvider";
+import { preprocessMessage, reasoningDirectiveForSession, predictionLoopHandler } from "./toolsProvider";
 
 export async function main(context: PluginContext) {
   console.log("[AgenticTools] main() called");
@@ -26,14 +26,14 @@ export async function main(context: PluginContext) {
     ? new LMStudioClient({ clientIdentifier, clientPasskey, baseUrl })
     : null;
 
-  console.log("[AgenticTools] Registering tools provider...");
-  try {
-    context.withConfigSchematics(configSchematics);
-    context.withToolsProvider((ctl) => toolsProvider(ctl, bridgeClient));
-  } catch (error) {
-    console.error("[AgenticTools] Failed to register tools provider.");
-    throw error;
-  }
+  // NOTE: withToolsProvider and withPredictionLoopHandler are mutually exclusive — LM Studio
+  // throws "PredictionLoopHandler cannot be used with a tools provider" if both are registered
+  // (confirmed live: this crashed main() entirely, so the plugin never initialized). Since
+  // predictionLoopHandler() takes over the whole main-chat loop itself, it calls toolsProvider()
+  // directly as a plain function to get the same tool list — it doesn't need the separate
+  // registration hook, which exists only so LM Studio's OWN default loop knows what tools to call.
+  console.log("[AgenticTools] Registering config schematics...");
+  context.withConfigSchematics(configSchematics);
 
   console.log("[AgenticTools] Registering prediction loop handler...");
   try {
@@ -68,5 +68,5 @@ export async function main(context: PluginContext) {
     throw error;
   }
 
-  console.log("[AgenticTools] Tools provider registered.");
+  console.log("[AgenticTools] Plugin registration complete.");
 }
