@@ -2,7 +2,7 @@ console.log("[ENTRY] dist/index.js loaded");
 
 import { type PluginContext, type ChatMessage, LMStudioClient } from "@lmstudio/sdk";
 import { configSchematics } from "./config";
-import { toolsProvider, preprocessMessage, reasoningDirectiveForSession } from "./toolsProvider";
+import { toolsProvider, preprocessMessage, reasoningDirectiveForSession, predictionLoopHandler } from "./toolsProvider";
 
 export async function main(context: PluginContext) {
   console.log("[AgenticTools] main() called");
@@ -32,6 +32,14 @@ export async function main(context: PluginContext) {
     context.withToolsProvider((ctl) => toolsProvider(ctl, bridgeClient));
   } catch (error) {
     console.error("[AgenticTools] Failed to register tools provider.");
+    throw error;
+  }
+
+  console.log("[AgenticTools] Registering prediction loop handler...");
+  try {
+    context.withPredictionLoopHandler((ctl) => predictionLoopHandler(ctl, bridgeClient));
+  } catch (error) {
+    console.error("[AgenticTools] Failed to register prediction loop handler.");
     throw error;
   }
 

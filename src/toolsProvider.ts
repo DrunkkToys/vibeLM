@@ -1,4 +1,4 @@
-import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
+import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController, type PredictionLoopHandlerController, type PredictionProcessToolStatusController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
@@ -319,7 +319,7 @@ function readPluginConfigValue(ctl: any, keys: string[]): unknown {
   return undefined;
 }
 
-function resolveMaxOrchestratorTurns(ctl?: any): number {
+export function resolveMaxOrchestratorTurns(ctl?: any): number {
   const rawValue = readPluginConfigValue(ctl, ["tools.maxOrchestratorTurns", "maxOrchestratorTurns"]);
   if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
     return Math.max(0, Math.min(100, Math.floor(rawValue)));
@@ -2946,6 +2946,89 @@ The default prompt can be configured in tool settings.`,
   }
 
   return allTools;
+}
+
+// Takes over the MAIN interactive chat's generation loop (unlike vibe_bridge's standalone tick,
+// this is the channel the user actually talks to). Without this, LM Studio's own default loop
+// handler runs the turn and nothing in vibeLM can bound it — wrapTool's maxOrchestratorTurns
+// counter only increments when a tool is actually called, so a model that gets stuck rambling
+// with zero tool calls (confirmed live: 5+ hours silent after a failed bash_terminal call, no
+// further turns ever logged) has no ceiling at all. Gated behind tools.enforceMainChatBounds
+// (see index.ts) since @lmstudio/sdk's PredictionLoopHandler is tagged
+// @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" with no reference
+// implementation anywhere on this machine — this file is the first user of it.
+export async function predictionLoopHandler(ctl: PredictionLoopHandlerController, client?: LMStudioClient | null): Promise<void> {
+  const chat = await ctl.pullHistory();
+  const tokenSource = await ctl.tokenSource();
+  // Reuses toolsProvider's own enabled/ordered tool list (including bash_terminal, unlike the
+  // deliberately-restricted bridgeTickTools) so the main chat keeps exactly what the user has
+  // configured. Structurally safe: ToolsProviderController and PredictionLoopHandlerController
+  // both reduce to BaseController, and toolsProvider() only ever touches ctl via the
+  // already-`any`-typed readPluginConfigValue/resolveEnabledToolNames/getWorkingDirectory.
+  const tools = await toolsProvider(ctl as any, client);
+
+  // LM Studio has no way to hand the loop back to its own default handler once a
+  // PredictionLoopHandler is registered — vibeLM must always render this turn. What this setting
+  // actually toggles is just whether the round/token caps below apply, as an escape hatch if the
+  // caps themselves cause problems, not a full revert to pre-plugin behavior.
+  const boundsEnforced = String(readPluginConfigValue(ctl, ["tools.enforceMainChatBounds", "enforceMainChatBounds"])) !== "false";
+  const arch = await getLoadedModelArch();
+  const maxRounds = boundsEnforced ? resolveMaxOrchestratorTurns(ctl) : 0;
+  const alwaysReasoningMaxTokens = boundsEnforced ? resolveBridgeTickMaxTokens(arch) : undefined;
+
+  // Note: the reasoning-effort directive is NOT reapplied here — index.ts's promptPreprocessor
+  // already appends it to the user message before this handler ever runs, and pullHistory()
+  // above returns that already-preprocessed message. Reapplying it here would duplicate it.
+
+  const block = ctl.createContentBlock({ roleOverride: "assistant" });
+  const toolStatuses = new Map<number, PredictionProcessToolStatusController>();
+  // Tool calls execute strictly in order by default (allowParallelToolExecution defaults to
+  // false), so a FIFO queue reliably pairs each tool-result message back to the callId that
+  // produced it — ToolCallResult only carries a model-specific toolCallId string, not the
+  // internal numeric callId, so this queue is the simplest correct pairing.
+  const pendingCallIds: number[] = [];
+
+  await tokenSource.act(chat, tools, {
+    maxPredictionRounds: maxRounds > 0 ? maxRounds : undefined,
+    signal: ctl.abortSignal,
+    ...(alwaysReasoningMaxTokens !== undefined ? { maxTokens: alwaysReasoningMaxTokens } : {}),
+    onPredictionFragment: (fragment) => block.appendText(fragment.content),
+    onToolCallRequestStart: (_roundIndex, callId) => {
+      toolStatuses.set(callId, ctl.createToolStatus(callId, { type: "generatingToolCall" }));
+    },
+    onToolCallRequestFailure: (_roundIndex, callId, error) => {
+      toolStatuses.get(callId)?.setStatus({ type: "toolCallGenerationFailed", error: error.message });
+    },
+    guardToolCall: async (_roundIndex, callId, controller) => {
+      toolStatuses.get(callId)?.setStatus({ type: "confirmingToolCall" });
+      const result = await ctl.requestConfirmToolCall({
+        callId,
+        name: controller.tool.name,
+        parameters: controller.toolCallRequest.arguments ?? {},
+      });
+      if (result.type === "allow") controller.allow();
+      else controller.deny(result.denyReason);
+    },
+    onToolCallRequestFinalized: (_roundIndex, callId, info) => {
+      block.appendToolRequest({
+        callId,
+        toolCallRequestId: info.toolCallRequest.id,
+        name: info.toolCallRequest.name,
+        parameters: info.toolCallRequest.arguments ?? {},
+      });
+      toolStatuses.get(callId)?.setStatus({ type: "callingTool" });
+      pendingCallIds.push(callId);
+    },
+    onMessage: (message) => {
+      if (message.getRole() !== "tool") return;
+      for (const result of message.getToolCallResults()) {
+        const callId = pendingCallIds.shift();
+        if (callId === undefined) continue;
+        block.appendToolResult({ callId, toolCallRequestId: result.toolCallId, content: result.content });
+        toolStatuses.get(callId)?.setStatus({ type: "toolCallSucceeded", timeMs: 0 });
+      }
+    },
+  });
 }
 
 async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The main interactive chat could ramble unbounded with no tool call, for hours, with nothing to stop it.** `Max Orchestrator Turns` and the always-reasoning token floor were only ever enforced inside `wrapTool` (which only fires when a tool is actually called) or vibe_bridge's own standalone tick — the main channel's generation loop was entirely owned by LM Studio's default handler and had no cap at all (confirmed live: a session sat silent for 5+ hours after a failed `bash_terminal` call, with zero further tool calls logged). vibeLM now registers its own `PredictionLoopHandler` for the main chat, reusing the exact tool list `toolsProvider()` already resolves, so `Max Orchestrator Turns` and the always-reasoning `maxTokens` floor genuinely bound the interactive channel too. New setting `Enforce Main Chat Bounds` (`tools.enforceMainChatBounds`, default on) is the escape hatch if the caps themselves cause problems.
+
 ## [0.2.8] - 2026-07-11
 
 ### Fixed
