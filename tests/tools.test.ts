@@ -35,6 +35,15 @@ function binaryExtCheck(p: string): boolean {
 }
 
 describe("sandboxPath", () => {
+  // Pin the loaded-model architecture so the suite never depends on whichever model the developer
+  // happens to have loaded in LM Studio. toolsProvider() consults the arch to decide whether to offer
+  // `amend` (Harmony families must not be — they have a native final channel), so without this the
+  // tool list would silently change between machines. qwen3_5 is a non-Harmony arch, i.e. amend on.
+  before(async () => {
+    const { setLoadedModelInfoOverride } = await import("../src/toolsProvider");
+    setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
+  });
+
   before(() => {
     rmSync(TEST_DIR, { recursive: true, force: true });
     mkdirSync(TEST_DIR, { recursive: true });

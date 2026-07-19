@@ -1,4 +1,4 @@
-import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController, type PredictionLoopHandlerController, type PredictionProcessToolStatusController } from "@lmstudio/sdk";
+import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
@@ -75,7 +75,17 @@ const MANAGED_CONTEXT_MARKER = "[vibeLM:managed-context]";
 // chat on a historyFingerprint mismatch (see bootstrapSessionState). Only treat it as a new
 // conversation — and skip carrying over the old plan — when the *previous* history was substantial
 // (not just a short placeholder/first turn) AND the new history is dramatically shorter than it.
-const MIN_SUBSTANTIAL_HISTORY_CHARS = 500;
+// Floor below which a previous session is too small to draw any conclusion from. This only guards
+// against a noisy baseline — the actual new-chat discriminators are the shrink RATIO below and the
+// absence of a managed-context block (see looksLikeDifferentConversation).
+//
+// Recalibrated from 500 once chatToText started returning real conversation text. While history was
+// being read via Chat.toString(), this measured a constant 19-char debug string, so `> 500` was never
+// once true and the new-conversation detection never fired in production in any code path. Measured
+// live afterwards: a complete single tool-using exchange (user turn + assistant answer) is ~414
+// chars, and a fresh chat's first message is ~20. 150 sits clearly between them, so one real exchange
+// counts as substantial while a trivial "hi"/"hello" chat still does not.
+const MIN_SUBSTANTIAL_HISTORY_CHARS = 150;
 const NEW_CONVERSATION_LENGTH_RATIO = 0.3;
 // Denylist, not allowlist: bash_terminal is a general-purpose dev tool (git, npm, build scripts,
 // etc.), so an allowlist would block too much legitimate use. This blocks clearly destructive or
@@ -319,7 +329,7 @@ function readPluginConfigValue(ctl: any, keys: string[]): unknown {
   return undefined;
 }
 
-export function resolveMaxOrchestratorTurns(ctl?: any): number {
+function resolveMaxOrchestratorTurns(ctl?: any): number {
   const rawValue = readPluginConfigValue(ctl, ["tools.maxOrchestratorTurns", "maxOrchestratorTurns"]);
   if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
     return Math.max(0, Math.min(100, Math.floor(rawValue)));
@@ -375,7 +385,17 @@ export function parseLoadedModelInfo(data: { data?: Array<{ arch?: string; state
   };
 }
 
+// Test seam. toolsProvider() has to know the loaded model's architecture (Harmony families must not
+// be offered `amend` — see the tool assembly below), which would otherwise make the tool list depend
+// on whichever model the developer happens to have loaded in LM Studio while running the suite.
+// Tests pin this instead of reaching the network; production never sets it.
+let loadedModelInfoOverride: LoadedModelInfo | null = null;
+export function setLoadedModelInfoOverride(info: LoadedModelInfo | null): void {
+  loadedModelInfoOverride = info;
+}
+
 async function fetchLoadedModelInfo(): Promise<LoadedModelInfo> {
+  if (loadedModelInfoOverride) return loadedModelInfoOverride;
   const now = Date.now();
   if (cachedLoadedModelInfo && now - cachedLoadedModelInfo.ts < LOADED_MODEL_CACHE_TTL_MS) {
     return cachedLoadedModelInfo.info;
@@ -406,6 +426,14 @@ async function getLoadedModelArch(): Promise<string> {
 //    Keep that switch as the real lever and append a graduated natural-language qualifier so
 //    low/medium/high are at least textually distinct in the prompt.
 //  - everything else (Llama/Mistral/Gemma/DeepSeek/GLM/Phi/etc.): graduated natural-language nudges.
+// Harmony-format architectures express a finished turn natively via the `final` channel, so an
+// `amend`-style "return your final answer" tool duplicates a capability they already have and makes
+// them emit `<|channel|>final <|constrain|>amend<|message|>` as visible text. Same detection as the
+// reasoning-directive mapping below, kept as one predicate so both stay in sync.
+export function usesHarmonyFinalChannel(arch: string): boolean {
+  return /gpt.?oss/i.test(arch);
+}
+
 export function reasoningDirectiveFor(effort: ReasoningEffort, arch: string): string {
   if (/gpt.?oss/i.test(arch)) {
     switch (effort) {
@@ -453,20 +481,6 @@ const ALWAYS_REASONING_TICK_MAX_TOKENS = 6000;
 
 export function resolveBridgeTickMaxTokens(arch: string): number | undefined {
   return ALWAYS_REASONING_ARCH_PATTERN.test(arch) ? ALWAYS_REASONING_TICK_MAX_TOKENS : undefined;
-}
-
-// Unlike the tick (which only special-cases always-reasoning archs, relying on
-// VIBE_BRIDGE_TICK_TIMEOUT_MS as the real backstop for everything else), the main chat's
-// PredictionLoopHandler has no wall-clock timeout — a long multi-tool-call turn is expected and
-// legitimate, so a flat timeout would kill real work. maxPredictionRounds alone does NOT protect
-// against the reported failure (a model rambling with zero tool calls, forever): that cap only
-// counts ROUNDS THAT COMPLETE, and a round that never emits a tool call or stop token never
-// completes, so it never counts against the limit. A per-round token ceiling is what actually
-// forces a stuck round to end. Applied to every architecture, not just the always-reasoning ones.
-const DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS = 8000;
-
-export function resolveMainLoopRoundMaxTokens(arch: string): number {
-  return resolveBridgeTickMaxTokens(arch) ?? DEFAULT_MAIN_LOOP_ROUND_MAX_TOKENS;
 }
 
 function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
@@ -596,6 +610,16 @@ type SessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   historyTextLength: number;
+  // Length of the system prompt inside historyTextLength. Tracked separately because the
+  // new-conversation heuristic in bootstrapSessionState compares CONVERSATION size, and vibeLM's
+  // system prompt (26 tool descriptions) is a multi-thousand-char constant present in every chat,
+  // new or old. Comparing composed lengths let that constant swamp the signal entirely.
+  systemPromptLength: number;
+  // Size of the CONVERSATION alone, as last seen by readHistoryParts. Deliberately separate from
+  // historyTextLength, which recordProcessedPrompt also folds vibeLM's own injected directive into —
+  // comparing that against a raw history read is apples-to-oranges and inflates the "previous" side,
+  // which makes the new-chat check fire spuriously mid-conversation.
+  lastSeenConversationChars: number;
   resumedFromPersistedState: boolean;
   managedContextBlocks: string[];
   lastHandoffSummary: string;
@@ -611,6 +635,8 @@ function createSessionState(): SessionState {
     lastCompactionTurn: 0,
     historyFingerprint: "",
     historyTextLength: 0,
+    systemPromptLength: 0,
+    lastSeenConversationChars: 0,
     resumedFromPersistedState: false,
     managedContextBlocks: [],
     lastHandoffSummary: "",
@@ -645,6 +671,8 @@ type PersistedSessionState = {
   lastCompactionTurn: number;
   historyFingerprint: string;
   historyTextLength?: number;
+  systemPromptLength?: number;
+  lastSeenConversationChars?: number;
   resumedFromPersistedState: boolean;
   updatedAt: string;
   managedContextBlocks?: string[];
@@ -733,6 +761,8 @@ function readRuntimeStateSync(): PersistedSessionState | null {
       lastCompactionTurn: Number.isFinite(parsed.lastCompactionTurn) ? Math.max(0, Math.floor(parsed.lastCompactionTurn ?? 0)) : 0,
       historyFingerprint: parsed.historyFingerprint,
       historyTextLength: Number.isFinite(parsed.historyTextLength) ? Math.max(0, Math.floor(parsed.historyTextLength ?? 0)) : 0,
+      systemPromptLength: Number.isFinite(parsed.systemPromptLength) ? Math.max(0, Math.floor(parsed.systemPromptLength ?? 0)) : 0,
+      lastSeenConversationChars: Number.isFinite(parsed.lastSeenConversationChars) ? Math.max(0, Math.floor(parsed.lastSeenConversationChars ?? 0)) : 0,
       resumedFromPersistedState: Boolean(parsed.resumedFromPersistedState),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
       managedContextBlocks: Array.isArray(parsed.managedContextBlocks) ? parsed.managedContextBlocks.filter((b: unknown) => typeof b === "string") : [],
@@ -756,6 +786,8 @@ function writeRuntimeStateSync(state: SessionState): void {
       lastCompactionTurn: state.lastCompactionTurn,
       historyFingerprint: state.historyFingerprint,
       historyTextLength: state.historyTextLength,
+      systemPromptLength: state.systemPromptLength,
+      lastSeenConversationChars: state.lastSeenConversationChars,
       resumedFromPersistedState: state.resumedFromPersistedState,
       updatedAt: new Date().toISOString(),
       managedContextBlocks: state.managedContextBlocks,
@@ -769,18 +801,113 @@ function writeRuntimeStateSync(state: SessionState): void {
   }
 }
 
-async function readHistoryText(ctl?: PromptPreprocessorController | ToolsProviderController): Promise<string | null> {
+// Conversation size = composed history minus the system prompt. Exported for the cascade test:
+// this subtraction is the whole fix for new chats inheriting a previous session's plan.
+export function conversationLength(composedLength: number, systemPromptLength: number): number {
+  return Math.max(0, composedLength - systemPromptLength);
+}
+
+// Render an @lmstudio/sdk Chat as conversation text.
+//
+// This exists because `Chat` has NO content-returning toString(). Calling it yields the object's
+// debug representation — literally `"Chat {\n  system: \n}"` — so every consumer of history text in
+// this file was measuring, fingerprinting and budgeting against a ~19-character constant that never
+// changed no matter how long the conversation got. Confirmed live by logging the value in the
+// running plugin. That silently disabled the new-conversation detection (every chat looked identical
+// in size), and any compaction/budget logic keyed off history length.
+//
+// The real API is getLength() / at(i) / ChatMessage.getText()+getRole().
+//
+// The toString() fallback is deliberate and is NOT the old bug: it only runs for objects that do not
+// expose getLength, which in practice means this file's test doubles (`{ toString: () => "..." }`).
+// The real SDK object always takes the iteration path.
+export function chatToText(history: any): string {
+  if (!history) return "";
+  try {
+    if (typeof history.getLength === "function" && typeof history.at === "function") {
+      const lines: string[] = [];
+      const length = history.getLength();
+      for (let i = 0; i < length; i++) {
+        const message = history.at(i);
+        const body = typeof message?.getText === "function" ? message.getText() : "";
+        if (!body) continue;
+        const role = typeof message?.getRole === "function" ? message.getRole() : "";
+        lines.push(role ? `${role}: ${body}` : body);
+      }
+      return lines.join("\n");
+    }
+    return typeof history.toString === "function" ? history.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+async function readHistoryParts(
+  ctl?: PromptPreprocessorController | ToolsProviderController,
+): Promise<{ text: string; systemPromptLength: number } | null> {
   try {
     const history = await (ctl as any)?.pullHistory?.();
     if (!history) return null;
-    return composeHistoryText(history.getSystemPrompt(), history.toString());
+    const systemPrompt = history.getSystemPrompt?.() ?? "";
+    return {
+      text: composeHistoryText(systemPrompt, chatToText(history)),
+      systemPromptLength: normalizeHistoryText(systemPrompt).length,
+    };
   } catch {
     return null;
   }
 }
 
+// Does this turn's history belong to a different conversation than the one the in-memory session is
+// tracking? Only ever answers true for a DRAMATIC shrink with no vibeLM-managed block present.
+//
+// Both conditions are load-bearing:
+//  - Shrink alone is not enough: auto-compaction and the rolling window legitimately shrink history
+//    mid-conversation, and wiping a plan there is exactly the bug 0.2.6 fixed.
+//  - vibeLM re-injects its own managed-context block whenever it compacts/rolls, so that marker
+//    surviving in history means "same conversation, just rolled". A brand new chat has no marker.
+//
+// Erring toward "same conversation" (a false negative) is what produced the live bug this guards:
+// a fresh chat asking "what is 2+2?" answered with the previous chat's echo results. Erring the
+// other way costs a re-plan, which the model recovers from on the next turn.
+export function looksLikeDifferentConversation(
+  previousConversationChars: number,
+  incomingConversationChars: number,
+  incomingHistoryText: string,
+): boolean {
+  if (previousConversationChars <= MIN_SUBSTANTIAL_HISTORY_CHARS) return false;
+  if (incomingConversationChars >= previousConversationChars * NEW_CONVERSATION_LENGTH_RATIO) return false;
+  return !hasManagedContext(incomingHistoryText);
+}
+
 async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsProviderController, force = false): Promise<SessionState> {
   if (activeSessionInitialized && !force) {
+    // The plugin process outlives individual chats: opening a new chat in LM Studio does NOT restart
+    // it, so this early return used to hand every new chat the PREVIOUS chat's in-memory state —
+    // plan, managed-context blocks and all — and the new-conversation detection below never ran even
+    // once. Reproduced live: a brand new chat asking "what is 2+2?" replied with the prior session's
+    // `echo one/two/three` results and was auto-titled "Running Echo Commands".
+    //
+    // Detection has to run per-turn, not once per process. It stays inside this early-return branch
+    // (rather than falling through to the full bootstrap) so an ongoing conversation keeps its
+    // session identity, turn counter and dedup history exactly as before — nothing changes unless
+    // the history genuinely belongs to a different chat.
+    const parts = await readHistoryParts(ctl);
+    if (parts) {
+      const previous = activeSessionState.lastSeenConversationChars;
+      const incoming = conversationLength(parts.text.length, parts.systemPromptLength);
+      if (looksLikeDifferentConversation(previous, incoming, parts.text)) {
+        activeSessionState = createSessionState();
+        activeSessionState.historyFingerprint = fingerprintHistoryText(parts.text);
+        activeSessionState.historyTextLength = parts.text.length;
+        activeSessionState.systemPromptLength = parts.systemPromptLength;
+      }
+      // Track the largest conversation size seen for this session. Using the max rather than the
+      // latest keeps a host-side history roll (which shrinks the visible conversation without
+      // starting a new chat) from quietly lowering the bar for the next comparison.
+      activeSessionState.lastSeenConversationChars = Math.max(activeSessionState.lastSeenConversationChars, incoming);
+      writeRuntimeStateSync(activeSessionState);
+    }
     return activeSessionState;
   }
 
@@ -792,7 +919,9 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
 
   if (!activeSessionBootstrapPromise) {
     activeSessionBootstrapPromise = (async () => {
-      const historyText = await readHistoryText(ctl);
+      const historyParts = await readHistoryParts(ctl);
+      const historyText = historyParts?.text ?? null;
+      const systemPromptLength = historyParts?.systemPromptLength ?? 0;
       if (!historyText) {
         // No history available at all (e.g. a vibe_bridge tick's internal ctl right after a hot
         // reload/process restart wiped module state, before any real preprocessMessage call has run
@@ -806,6 +935,29 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           activeSessionState.managedContextBlocks = persisted.managedContextBlocks ?? [];
           activeSessionState.plan = planWorthCarryingForward(persisted.plan) ? persisted.plan ?? null : null;
           activeSessionState.resumedFromPersistedState = true;
+          // Carry the persisted SIZE forward too, not just the contents. This branch runs with no
+          // history to check against, so the carryover above is provisional — it has no way to tell a
+          // hot-reload mid-conversation from the first tool-enumeration of a brand new chat. It is
+          // reached in production because LM Studio calls toolsProvider() (whose controller has no
+          // pullHistory) before the prompt preprocessor, and it sets activeSessionInitialized, so the
+          // NEXT call — preprocessMessage, which does have history — validates it via the early-return
+          // check at the top of this function.
+          //
+          // Leaving these at createSessionState()'s 0 broke exactly that handoff: the validating check
+          // compares against `previous` and bails out when previous <= MIN_SUBSTANTIAL_HISTORY_CHARS,
+          // so a zero here made it decline to act and the plan survived into the new chat anyway.
+          // Reproduced live: a fresh chat asking "what is 2+2?" answered with the previous chat's
+          // echo results and was auto-titled "Sequential Echo Commands".
+          activeSessionState.historyTextLength = persisted.historyTextLength ?? 0;
+          activeSessionState.systemPromptLength = persisted.systemPromptLength ?? 0;
+          // Fall back to the older historyTextLength for state files written before
+          // lastSeenConversationChars existed. Without this, everyone upgrading would have the
+          // new-chat check silently disabled (previous = 0 fails the MIN_SUBSTANTIAL floor) until
+          // their first turn happened to repopulate it.
+          // `||`, not `??`: readRuntimeStateSync normalizes a missing field to 0, so `??` would never
+          // reach the fallback. 0 carries no information here, which makes `||` the correct choice.
+          activeSessionState.lastSeenConversationChars = persisted.lastSeenConversationChars
+            || conversationLength(persisted.historyTextLength ?? 0, persisted.systemPromptLength ?? 0);
         }
       } else {
         const historyFingerprint = fingerprintHistoryText(historyText);
@@ -818,6 +970,8 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             lastCompactionTurn: persisted.lastCompactionTurn,
             historyFingerprint,
             historyTextLength: historyText.length,
+            systemPromptLength,
+            lastSeenConversationChars: conversationLength(historyText.length, systemPromptLength),
             resumedFromPersistedState: true,
             managedContextBlocks: persisted.managedContextBlocks ?? [],
             lastHandoffSummary: persisted.lastHandoffSummary ?? "",
@@ -828,17 +982,31 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
           activeSessionState = createSessionState();
           activeSessionState.historyFingerprint = historyFingerprint;
           activeSessionState.historyTextLength = historyText.length;
+          activeSessionState.systemPromptLength = systemPromptLength;
+          activeSessionState.lastSeenConversationChars = conversationLength(historyText.length, systemPromptLength);
           // A fingerprint mismatch is ambiguous: it's either (a) the process restarted mid-conversation
           // or the host rolled/truncated history — same conversation, still worth re-asserting the plan
           // — or (b) this is a genuinely new/different chat that happens to reuse the same persisted
-          // state file. Only the raw history text length distinguishes them: a restart/roll of an
-          // ongoing conversation still carries a comparable (or larger) amount of text, while a brand
-          // new chat starts from just the system prompt + first message. Caught live: a fresh chat
-          // asking for an unrelated weather CLI resurrected a many-turn REST-API-backend plan from a
-          // previous, unrelated session because this branch carried it over unconditionally.
-          const oldLength = persisted?.historyTextLength ?? 0;
-          const looksLikeGenuinelyNewConversation = oldLength > MIN_SUBSTANTIAL_HISTORY_CHARS
-            && historyText.length < oldLength * NEW_CONVERSATION_LENGTH_RATIO;
+          // state file. Conversation size distinguishes them: a restart/roll of an ongoing conversation
+          // still carries a comparable (or larger) amount of text, while a brand new chat starts from
+          // just the first message. Caught live: a fresh chat asking for an unrelated weather CLI
+          // resurrected a many-turn REST-API-backend plan from a previous, unrelated session.
+          //
+          // This MUST compare conversation size, not composed history size. vibeLM's system prompt
+          // (26 tool descriptions) is a multi-thousand-char constant present in every chat, and
+          // composeHistoryText prepends it to both sides of the comparison. Measuring composed
+          // lengths let that constant dominate: a brand new chat came out as systemPrompt + ~20 chars,
+          // which is nowhere near 30% below an older chat's systemPrompt + conversation, so the guard
+          // never fired and every new chat inherited the previous session's plan and managed-context
+          // blocks. Reproduced live: a fresh chat was retitled "[vibeLM:managed-cont" because
+          // preprocessMessage prepended a rehydration block ahead of the user's actual first message.
+          const oldConversation = conversationLength(
+            persisted?.historyTextLength ?? 0,
+            persisted?.systemPromptLength ?? 0,
+          );
+          const newConversation = conversationLength(historyText.length, systemPromptLength);
+          const looksLikeGenuinelyNewConversation = oldConversation > MIN_SUBSTANTIAL_HISTORY_CHARS
+            && newConversation < oldConversation * NEW_CONVERSATION_LENGTH_RATIO;
           if (persisted && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
             // The raw history no longer matches what we last saw — either the process restarted
             // mid-conversation or the host rolled/truncated history. Session identity/counters can't
@@ -1096,12 +1264,13 @@ function splitLines(text: string): string[] {
 
 async function getHistoryText(ctl?: PromptPreprocessorController): Promise<string> {
   if (!ctl) return "";
-  try {
-    const history = await ctl.pullHistory();
-    return composeHistoryText(history.getSystemPrompt(), history.toString());
-  } catch {
-    return "";
-  }
+  const parts = await readHistoryParts(ctl);
+  if (!parts) return "";
+  // Keep the system-prompt length current for every turn, not just at bootstrap. syncRuntimeState
+  // persists historyTextLength on each turn, and the next chat's new-conversation check subtracts
+  // this from it — a stale value would skew that comparison.
+  activeSessionState.systemPromptLength = parts.systemPromptLength;
+  return parts.text;
 }
 
 function hasManagedContext(historyText: string): boolean {
@@ -2930,12 +3099,23 @@ The default prompt can be configured in tool settings.`,
     vibe_bridge: vibeBridgeTool,
   };
 
-  const MANDATORY_ENABLED = ["amend"];
+  // `amend` exists so families with no native "I'm done" signal can hand a final answer back
+  // explicitly. Harmony models already have one — the `final` channel — and exposing both makes them
+  // emit a hybrid of the two as literal text. Reproduced live on gpt-oss-20b: every reply opened with
+  // `<|channel|>final <|constrain|>amend<|message|>` in the visible chat bubble. Confirmed as vibeLM's
+  // doing by running the identical prompt with the plugin disabled, which rendered cleanly.
+  //
+  // Dropping amend for Harmony costs nothing: the model ends its turn by closing the final channel,
+  // which is what amend was emulating. Every other family keeps it (see MANDATORY_ENABLED below).
+  const arch = await getLoadedModelArch();
+  const amendConflictsWithNativeFinalChannel = usesHarmonyFinalChannel(arch);
+
+  const MANDATORY_ENABLED = amendConflictsWithNativeFinalChannel ? [] : ["amend"];
 
   const enabledNames = dedupeTags([
     ...resolveEnabledToolNames(ctl),
     ...MANDATORY_ENABLED,
-  ]);
+  ]).filter((name: string) => !(amendConflictsWithNativeFinalChannel && name === "amend"));
   const allTools = enabledNames
     .filter((name: string) => ALL_TOOL_MAP[name])
     .map((name: string) => ALL_TOOL_MAP[name]);
@@ -2960,94 +3140,6 @@ The default prompt can be configured in tool settings.`,
   }
 
   return allTools;
-}
-
-// Takes over the MAIN interactive chat's generation loop (unlike vibe_bridge's standalone tick,
-// this is the channel the user actually talks to). Without this, LM Studio's own default loop
-// handler runs the turn and nothing in vibeLM can bound it — wrapTool's maxOrchestratorTurns
-// counter only increments when a tool is actually called, so a model that gets stuck rambling
-// with zero tool calls (confirmed live: 5+ hours silent after a failed bash_terminal call, no
-// further turns ever logged) has no ceiling at all. Gated behind tools.enforceMainChatBounds
-// (see index.ts) since @lmstudio/sdk's PredictionLoopHandler is tagged
-// @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" with no reference
-// implementation anywhere on this machine — this file is the first user of it.
-export async function predictionLoopHandler(ctl: PredictionLoopHandlerController, client?: LMStudioClient | null): Promise<void> {
-  const chat = await ctl.pullHistory();
-  const tokenSource = await ctl.tokenSource();
-  // Reuses toolsProvider's own enabled/ordered tool list (including bash_terminal, unlike the
-  // deliberately-restricted bridgeTickTools) so the main chat keeps exactly what the user has
-  // configured. Structurally safe: ToolsProviderController and PredictionLoopHandlerController
-  // both reduce to BaseController, and toolsProvider() only ever touches ctl via the
-  // already-`any`-typed readPluginConfigValue/resolveEnabledToolNames/getWorkingDirectory.
-  const tools = await toolsProvider(ctl as any, client);
-
-  // LM Studio has no way to hand the loop back to its own default handler once a
-  // PredictionLoopHandler is registered — vibeLM must always render this turn. What this setting
-  // actually toggles is just whether the round/token caps below apply, as an escape hatch if the
-  // caps themselves cause problems, not a full revert to pre-plugin behavior.
-  const boundsEnforced = String(readPluginConfigValue(ctl, ["tools.enforceMainChatBounds", "enforceMainChatBounds"])) !== "false";
-  const arch = await getLoadedModelArch();
-  const maxRounds = boundsEnforced ? resolveMaxOrchestratorTurns(ctl) : 0;
-  // Applied unconditionally (all archs) when bounds are enforced — see resolveMainLoopRoundMaxTokens's
-  // comment for why maxPredictionRounds alone can't stop a single round that never completes.
-  const roundMaxTokens = boundsEnforced ? resolveMainLoopRoundMaxTokens(arch) : undefined;
-
-  // Note: the reasoning-effort directive is NOT reapplied here — index.ts's promptPreprocessor
-  // already appends it to the user message before this handler ever runs, and pullHistory()
-  // above returns that already-preprocessed message. Reapplying it here would duplicate it.
-
-  // Two separate blocks are required, not a style choice: the SDK throws if you call
-  // appendToolRequest on anything but an "assistant"-role block, or appendToolResult on anything
-  // but a "tool"-role block — confirmed live ("Error in the onMessage callback: Tool results can
-  // only be appended to tool blocks. This is a assistant block."), reusing a single assistant
-  // block for both silently corrupted the last round's tool-result rendering.
-  const block = ctl.createContentBlock({ roleOverride: "assistant" });
-  const toolResultBlock = ctl.createContentBlock({ roleOverride: "tool" });
-  const toolStatuses = new Map<number, PredictionProcessToolStatusController>();
-  // Tool calls execute strictly in order by default (allowParallelToolExecution defaults to
-  // false), so a FIFO queue reliably pairs each tool-result message back to the callId that
-  // produced it — ToolCallResult only carries a model-specific toolCallId string, not the
-  // internal numeric callId, so this queue is the simplest correct pairing.
-  const pendingCallIds: number[] = [];
-
-  await tokenSource.act(chat, tools, {
-    maxPredictionRounds: maxRounds > 0 ? maxRounds : undefined,
-    signal: ctl.abortSignal,
-    ...(roundMaxTokens !== undefined ? { maxTokens: roundMaxTokens } : {}),
-    onPredictionFragment: (fragment) => block.appendText(fragment.content),
-    onToolCallRequestStart: (_roundIndex, callId) => {
-      toolStatuses.set(callId, ctl.createToolStatus(callId, { type: "generatingToolCall" }));
-    },
-    onToolCallRequestFailure: (_roundIndex, callId, error) => {
-      toolStatuses.get(callId)?.setStatus({ type: "toolCallGenerationFailed", error: error.message });
-    },
-    // NOTE: does NOT route through ctl.requestConfirmToolCall() — confirmed live that it never
-    // resolves (a real multi-minute hang with zero further model activity, reproduced against
-    // qwen3.5-4b), consistent with RequestConfirmToolCallOpts/Result both still being tagged
-    // @deprecated [DEP-PLUGIN-PREDICTION-LOOP-HANDLER] "still in development" in the SDK. vibeLM
-    // never required per-call user confirmation before this change either (LM Studio's default
-    // loop ran these same tools unprompted), so allowing directly here is not a new gap.
-    guardToolCall: (_roundIndex, _callId, controller) => controller.allow(),
-    onToolCallRequestFinalized: (_roundIndex, callId, info) => {
-      block.appendToolRequest({
-        callId,
-        toolCallRequestId: info.toolCallRequest.id,
-        name: info.toolCallRequest.name,
-        parameters: info.toolCallRequest.arguments ?? {},
-      });
-      toolStatuses.get(callId)?.setStatus({ type: "callingTool" });
-      pendingCallIds.push(callId);
-    },
-    onMessage: (message) => {
-      if (message.getRole() !== "tool") return;
-      for (const result of message.getToolCallResults()) {
-        const callId = pendingCallIds.shift();
-        if (callId === undefined) continue;
-        toolResultBlock.appendToolResult({ callId, toolCallRequestId: result.toolCallId, content: result.content });
-        toolStatuses.get(callId)?.setStatus({ type: "toolCallSucceeded", timeMs: 0 });
-      }
-    },
-  });
 }
 
 async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
