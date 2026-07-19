@@ -13,13 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Third issue, caught on review after the above: `maxPredictionRounds` only counts ROUNDS THAT COMPLETE — a round that never emits a tool call or stop token never completes, so it never counted against that limit, meaning the exact originally-reported failure (endless rambling with zero tool calls) was still unbounded for any model architecture outside the small always-reasoning special case. `resolveMainLoopRoundMaxTokens` now applies a per-round `maxTokens` ceiling (8000, or the existing always-reasoning floor where lower) to every architecture whenever bounds are enforced, so a single stuck round is forced to end regardless of model family. Live-verified this doesn't clip normal short responses.
   - Fourth issue, only found by a longer live stress test (forcing a multi-tool-call turn): `onMessage`'s `appendToolResult` call was throwing on every single tool call ("Tool results can only be appended to tool blocks. This is a assistant block.") — the SDK requires tool results on a separate `"tool"`-role content block from the one used for `appendToolRequest`/text (`"assistant"`-role); reusing one block for both silently corrupted every tool result's rendering (this had been happening in the background through several earlier "successful" live tests too — visible only as a permanently-spinning tool-status icon, which had been mistaken for a cosmetic gap). `predictionLoopHandler` now creates a second, dedicated `"tool"`-role block for results. The unit-test mock now enforces the same role gating the real SDK does, so this class of regression fails a unit test instead of only surfacing live.
 
-## [0.2.9] - 2026-07-11
-
-### Fixed
-- **Main chat's thinking loop had no cap — only vibe_bridge ticks did.** Previously only the bridge had a prediction round limit; the primary chat could loop forever producing reasoning chains without calling a tool. Imported the shared `capPredictionRounds` into the main orchestrator loop so the host-assistant route also respects `maxThinkingSteps`.
-- **`appendToolResult` was throwing on every tool call** — a regression that silently broke tool result rendering post-call. Real regression tests now cover this path.
-- **`maxPredictionRounds` alone didn't bound the originally-reported failure** — the fix needed to apply at every model.act() call site, not only the one gating the tick channel.
-
 ## [0.2.8] - 2026-07-11
 
 ### Fixed
@@ -329,8 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.9...HEAD
-[0.2.9]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.8...v0.2.9
+[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.8...HEAD
 [0.2.8]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7
 [0.2.0]: https://github.com/DrunkkToys/vibeLM/compare/v0.1.1...v0.2.0
