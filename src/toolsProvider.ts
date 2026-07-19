@@ -1096,10 +1096,27 @@ export function finishInstruction(harmony: boolean): string {
     : "call amend with the best available handoff";
 }
 
-function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general", harmony = false): string {
+function formatPromptBudgetHandoff(
+  contextWindow: number,
+  estimatedTokens: number,
+  mode: "workspace" | "multi-step" | "general",
+  harmony = false,
+  userMessage = "",
+): string {
+  // The returned string REPLACES the user's message (see recordProcessedPrompt's callers), so it has
+  // to carry that message forward. Without this the user's turn is silently dropped: reproduced live
+  // by lowering the trigger to 300 tokens and asking "now also tell me what day of the week it is" —
+  // the model answered with a summary of the previous echo commands and never addressed the question.
+  // That path was unreachable while history was read via Chat.toString() (it measured a ~19-char
+  // constant, so the budget was never approached), and became reachable the moment history was read
+  // correctly, which would have started eating user messages in long sessions.
+  const request = userMessage.trim();
+  const carried = request
+    ? `\n[The user's latest message still needs an answer. Address it as part of that handoff:]\n${request}`
+    : "";
   return `${MANAGED_CONTEXT_MARKER}
 [Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
-[Action: preserve code verbatim, summarize only the actionable state, and ${finishInstruction(harmony)}.]
+[Action: preserve code verbatim, summarize only the actionable state, and ${finishInstruction(harmony)}.]${carried}
 [If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
 }
 
@@ -3219,7 +3236,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     if (managedContextPresent) {
       const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
       if (plainReport.overflow) {
-        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step", harmony));
+        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step", harmony, t));
       }
       // Continuation: replace stale "follow all steps" instruction with a continue directive
       if (CONTINUATION_PATTERN.test(t)) {
@@ -3229,7 +3246,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     }
     const report = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
     if (report.overflow) {
-      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony));
+      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony, t));
     }
     return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, harmony));
   }
@@ -3242,7 +3259,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         const processed = `[Tool executed: calculate → ${calcResp}]`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony));
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
         }
         return recordProcessedPrompt(historyText, processed);
       }
@@ -3260,7 +3277,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony));
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
         }
         return recordProcessedPrompt(historyText, processed);
       }
@@ -3272,7 +3289,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
 
   const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
   if (plainReport.overflow) {
-    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general", harmony));
+    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general", harmony, t));
   }
   // Continuation in managed-context session: prevent LLM from re-executing stale instructions.
   // (Rehydration of persisted managedContextBlocks after a context roll happens unconditionally,
