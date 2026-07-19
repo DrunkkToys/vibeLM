@@ -7,15 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.11] - 2026-07-11
+## [0.2.10] - 2026-07-11
 
 ### Changed
 - **Gitignore cleanup** — untracked internal files (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`), `.claude/` skills directory, and `benchmark/` artifacts from git tracking. These files are no longer shipped in the plugin.
 
 ### Fixed
-- **Leaked model-side tags now stripped from streaming chat output** — `<think>...</think>`, Harmony `<|channel|>...<|message|>`, and stray control tokens from the model's raw output are now filtered fragment by fragment before they render in the LM Studio chat. Previously the filter only ran on stored data; the visible chat showed raw tags.
 - **appendToolResult no longer throws on every tool call** — regression caught by real test coverage.
 - **Main chat thinking loop now respects maxThinkingSteps cap** — the main orchestrator route (host-assistant) now passes `maxPredictionRounds` to `model.act()` the same way vibe_bridge ticks did. A stuck model can no longer loop indefinitely on the primary chat channel.
+
+### Fixed
 - **The main interactive chat could ramble unbounded with no tool call, for hours, with nothing to stop it.** `Max Orchestrator Turns` and the always-reasoning token floor were only ever enforced inside `wrapTool` (which only fires when a tool is actually called) or vibe_bridge's own standalone tick — the main channel's generation loop was entirely owned by LM Studio's default handler and had no cap at all (confirmed live: a session sat silent for 5+ hours after a failed `bash_terminal` call, with zero further tool calls logged). vibeLM now registers its own `PredictionLoopHandler` for the main chat, reusing the exact tool list `toolsProvider()` already resolves, so `Max Orchestrator Turns` and the always-reasoning `maxTokens` floor genuinely bound the interactive channel too. New setting `Enforce Main Chat Bounds` (`tools.enforceMainChatBounds`, default on) is the escape hatch if the caps themselves cause problems. Live-tested end to end in LM Studio: a stuck round now gets cut off and the model hands back a final answer instead of hanging.
   - Two issues only surfaced by live testing (not reproducible in unit tests, which mock the SDK): (1) `withPredictionLoopHandler` and `withToolsProvider` are mutually exclusive — registering both crashed the plugin's `main()` outright ("PredictionLoopHandler cannot be used with a tools provider"), so `withToolsProvider` is no longer registered; the loop handler already gets its tools by calling `toolsProvider()` directly. (2) `ctl.requestConfirmToolCall()` never resolves — confirmed live as a multi-minute hang with zero model activity — so `guardToolCall` no longer routes through it and allows tool calls directly, matching pre-existing behavior (LM Studio's default loop never required per-call confirmation for vibeLM's tools either).
   - Third issue, caught on review after the above: `maxPredictionRounds` only counts ROUNDS THAT COMPLETE — a round that never emits a tool call or stop token never completes, so it never counted against that limit, meaning the exact originally-reported failure (endless rambling with zero tool calls) was still unbounded for any model architecture outside the small always-reasoning special case. `resolveMainLoopRoundMaxTokens` now applies a per-round `maxTokens` ceiling (8000, or the existing always-reasoning floor where lower) to every architecture whenever bounds are enforced, so a single stuck round is forced to end regardless of model family. Live-verified this doesn't clip normal short responses.
@@ -337,8 +338,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
-[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.11...HEAD
-[0.2.11]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.10...v0.2.11
+[Unreleased]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7

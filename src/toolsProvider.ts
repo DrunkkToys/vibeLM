@@ -1079,20 +1079,15 @@ const STRAY_THINK_TAG = /<\/?think>/gi;
 // and cannot, fix the leak in LM Studio's own chat-bubble rendering (out of this plugin's reach) —
 // it only stops vibeLM's own stored/reused data (tick handover, memory, handoff summaries) from
 // getting polluted by it.
-// Variant used for streaming fragments — strips tags but does NOT trim the text
-// (trimming individual fragments would remove intentional word-boundary spaces).
-function stripFragmentArtifacts(text: string): string {
+export function stripModelArtifacts(text: string): string {
   if (!text) return text;
   return text
     .replace(THINK_BLOCK, "")
     .replace(HARMONY_CHANNEL_PREFIX, "")
     .replace(HARMONY_CONTROL_TOKEN, "")
     .replace(STRAY_THINK_TAG, "")
-    .replace(/\n{3,}/g, "\n\n");
-}
-
-export function stripModelArtifacts(text: string): string {
-  return stripFragmentArtifacts(text).trim();
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function splitLines(text: string): string[] {
@@ -3019,7 +3014,7 @@ export async function predictionLoopHandler(ctl: PredictionLoopHandlerController
     maxPredictionRounds: maxRounds > 0 ? maxRounds : undefined,
     signal: ctl.abortSignal,
     ...(roundMaxTokens !== undefined ? { maxTokens: roundMaxTokens } : {}),
-    onPredictionFragment: (fragment) => block.appendText(stripFragmentArtifacts(fragment.content)),
+    onPredictionFragment: (fragment) => block.appendText(fragment.content),
     onToolCallRequestStart: (_roundIndex, callId) => {
       toolStatuses.set(callId, ctl.createToolStatus(callId, { type: "generatingToolCall" }));
     },
