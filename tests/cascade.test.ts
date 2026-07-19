@@ -1166,6 +1166,36 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(chatToText(null), "");
   });
 
+  it("directives never tell a Harmony model to call `amend`, since it is not in its toolset", async () => {
+    // Companion to the amend gating. Withholding the tool but still instructing the model to call it
+    // points it at something that does not exist for that family.
+    const { finishInstruction } = await import("../src/toolsProvider");
+    assert.match(finishInstruction(false), /call amend/, "families that have the tool are still told to use it");
+    assert.ok(!/amend/.test(finishInstruction(true)), "Harmony families must not be pointed at a tool they were not given");
+    assert.match(finishInstruction(true), /reply/i, "Harmony families are told to answer directly instead");
+  });
+
+  it("the prompt-budget report does not trip on an ordinary conversation now that history is read for real", async () => {
+    // buildPromptBudgetReport consumes history text, so while history was Chat.toString() it measured
+    // a ~19-char constant and the near-limit / overflow handoff path was unreachable. Reading history
+    // correctly makes that path live for the first time, so this pins the two ends of it: a normal
+    // exchange must not trip it, and genuinely oversized history must.
+    const { buildPromptBudgetReport, estimateCharsFromTokens } = await import("../src/toolsProvider") as any;
+    const contextWindow = 131072;
+    const trigger = 12032;
+
+    // A realistic exchange: measured live at ~414 chars for one full tool-using turn.
+    const ordinary = "user: run the three echo commands\nassistant: one two three\n".repeat(7);
+    const small = buildPromptBudgetReport(ordinary, "what is 2+2?", contextWindow, trigger);
+    assert.equal(small.nearLimit, false, `an ordinary ${ordinary.length}-char conversation must not be treated as near the limit`);
+    assert.equal(small.overflow, false);
+
+    // Genuinely large history must still trip it, or the budget guard is useless.
+    const huge = "x".repeat(estimateCharsFromTokens(trigger) + 5000);
+    const big = buildPromptBudgetReport(huge, "continue", contextWindow, trigger);
+    assert.equal(big.nearLimit, true, "history past the configured trigger must be flagged");
+  });
+
   it("write_file still rejects a ~-prefixed path that resolves outside the workspace", async () => {
     const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
     const ctl = makeCtl();
