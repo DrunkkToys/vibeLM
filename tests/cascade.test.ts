@@ -401,13 +401,16 @@ describe("vibeLM Cascade Integration", () => {
 
     // Replays the observed live failure: probing for node/npm one path per turn. Every call has a
     // distinct exact signature, so only the coarse (program-name) guard can catch it.
+    // These paths are deliberately impossible on both developer machines and hosted CI runners.
+    // Real system paths such as /usr/local/bin/node may exist in CI, and a successful probe must
+    // correctly reset the no-progress streak.
     const probes = [
-      "ls /usr/local/opt/node",
-      "ls /usr/local/Cellar/node",
-      "ls /usr/local/bin/node",
-      "ls /usr/bin/node",
-      "ls /bin/node",
-      "ls /opt/node",
+      "ls /vibelm-definitely-missing-probe-a",
+      "ls /vibelm-definitely-missing-probe-b",
+      "ls /vibelm-definitely-missing-probe-c",
+      "ls /vibelm-definitely-missing-probe-d",
+      "ls /vibelm-definitely-missing-probe-e",
+      "ls /vibelm-definitely-missing-probe-f",
     ];
     let loopError: string | null = null;
     let tripIndex = -1;
@@ -422,6 +425,40 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(loopError, "distinct-arg shell probing must eventually trip the loop guard");
     assert.equal(tripIndex, 4, "guard should trip on the 5th consecutive same-program probe");
     assert.match(loopError as string, /change strategy|amend/i, "the steering message must point the model to a new approach");
+  });
+
+  it("does not treat successful distinct node commands as a loop or poison the next unrelated tool", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const bash: any = tools.find((t: any) => t.name === "bash_terminal");
+    const getPlan: any = tools.find((t: any) => t.name === "get_plan");
+
+    for (const value of ["add", "list", "complete", "list-again", "clear"]) {
+      const result = await bash.implementation({ command: `node -e "console.log('${value}')"` }, {});
+      assert.equal(result?.ok, true, `successful node command ${value} must not be rejected as a loop`);
+    }
+
+    const unrelated = await getPlan.implementation({}, {});
+    assert.notEqual(unrelated?.ok, false, "an old shell family must never block an unrelated current tool");
+  });
+
+  it("does not let an exact-call loop rejection poison a different tool", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 0 });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const bash: any = tools.find((t: any) => t.name === "bash_terminal");
+    const getPlan: any = tools.find((t: any) => t.name === "get_plan");
+
+    let rejected = false;
+    for (let i = 0; i < 4; i++) {
+      const result = await bash.implementation({ command: "printf exact-loop" }, {});
+      rejected ||= result?.ok === false && /loop detected/i.test(result?.error || "");
+    }
+    assert.equal(rejected, true, "guard condition must be established before checking isolation");
+    assert.notEqual((await getPlan.implementation({}, {}))?.ok, false, "a rejected exact call must not block get_plan");
   });
 
   it("distils tool results into deduped facts instead of dumping raw result blobs", async () => {
@@ -776,6 +813,61 @@ describe("vibeLM Cascade Integration", () => {
       const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
       assert.equal(rs.plan, null, `must not create a plan for: ${request}`);
     }
+  });
+
+  it("keeps local searches unchanged while explicit web searches still execute end to end", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    if (existsSync(rsPath)) rmSync(rsPath);
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "An ordinary local development conversation" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+
+    const originalFetch = globalThis.fetch;
+    const originalEndpoint = process.env.AGENTIC_SEARCH_ENDPOINT;
+    const requests: string[] = [];
+    process.env.AGENTIC_SEARCH_ENDPOINT = "https://cascade-search.invalid/search";
+    globalThis.fetch = async (input) => {
+      requests.push(String(input));
+      return new Response(JSON.stringify({ results: [
+        { title: "TypeScript", url: "https://www.typescriptlang.org/", snippet: "Official site" },
+      ] }), { status: 200 });
+    };
+
+    try {
+      const localRequest = "search old sessions and find bugs that have been not fixed yet";
+      assert.equal(await preprocessMessage(localRequest, ctl), null, "local search intent must reach the model unchanged");
+      assert.equal(requests.length, 0, "bare local search must perform no network request");
+
+      const webRequest = "search the web for TypeScript official site";
+      const processed = await preprocessMessage(webRequest, ctl);
+      assert.equal(requests.length, 1, "explicit web intent must execute exactly one search request");
+      assert.equal(new URL(requests[0]).searchParams.get("q"), "TypeScript official site", "the proxy must receive the exact search query");
+      assert.match(processed as string, /Tool executed: web_search/, "the proxy result must be injected into the model prompt");
+      assert.match(processed as string, /https:\/\/www\.typescriptlang\.org\//, "the injected result must include its URL");
+      assert.ok((processed as string).includes(webRequest), "the explicit request must remain visible after preprocessing");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalEndpoint === undefined) delete process.env.AGENTIC_SEARCH_ENDPOINT;
+      else process.env.AGENTIC_SEARCH_ENDPOINT = originalEndpoint;
+    }
+  });
+
+  it("only preprocesses expression-shaped calculator prompts and accepts terminal question marks", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    if (existsSync(rsPath)) rmSync(rsPath);
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "An ordinary conversation" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+
+    assert.equal(await preprocessMessage("what is the status of the build?", ctl), null, "natural-language questions must bypass mathjs");
+    const calculated = await preprocessMessage("what is 2+2?", ctl);
+    assert.match(calculated as string, /calculate → 4/, "a terminal question mark must not break a valid calculation");
   });
 
   it("starts a fresh plan for an actionable follow-up after completion", async () => {

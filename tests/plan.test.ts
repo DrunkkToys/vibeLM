@@ -103,6 +103,18 @@ describe("plan execution", () => {
     assert.ok(names.includes("get_plan"));
   });
 
+  it("spells out gpt-oss-safe argument formatting without changing public schemas", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    const getCurrentDatetime: any = tools.find((t: any) => t.name === "get_current_datetime");
+
+    assert.match(String(createPlan.description), /ONLY step strings.*objects/i);
+    assert.match(String(createPlan.description), /Do not insert numeric list labels/i);
+    assert.match(String(getCurrentDatetime.description), /exactly an empty object: \{\}/i);
+    assert.match(String(getCurrentDatetime.description), /Do not add an empty-string key/i);
+  });
+
   it("create_plan stores an ordered list of pending steps, visible via get_plan", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl());

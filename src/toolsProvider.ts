@@ -93,7 +93,7 @@ const NEW_CONVERSATION_LENGTH_RATIO = 0.3;
 const BASH_DANGEROUS_PATTERNS: RegExp[] = [
   /rm\s+(-\w*[rf]\w*[rf]?\w*|--recursive|--force)\s+(-\w*\s+)*(\/|~|\$HOME|\*)(\s|$)/i,
   /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
-  />\s*\/dev\/(sd|nvme|disk|hd|null\s*;)/i,
+  />\s*\/dev\/(sd|nvme|disk|hd)/i,
   /\bmkfs(\.\w+)?\b/i,
   /\bdd\b[^\n]*\bof=\/dev\//i,
   /\bchmod\s+(-R\s+)?(777|a\+rwx)\s+\//i,
@@ -606,7 +606,7 @@ function currentPlanStepThinking(): ReasoningEffort | undefined {
 type SessionState = {
   sessionId: string;
   turnCounter: number;
-  toolCallHistory: Array<{ name: string; signature: string; coarse: string; ts: number }>;
+  toolCallHistory: Array<{ name: string; signature: string; coarse: string; ts: number; outcome?: "ok" | "fail" | "info" }>;
   lastCompactionTurn: number;
   historyFingerprint: string;
   historyTextLength: number;
@@ -1243,28 +1243,20 @@ function detectRepeatedToolSignature(state: SessionState, name: string, signatur
       return exactWindow[exactWindow.length - 1].name;
     }
   }
-  const counts: Record<string, number> = {};
-  for (const t of exactWindow) {
-    counts[t.signature] = (counts[t.signature] || 0) + 1;
-  }
-  for (const [n, c] of Object.entries(counts)) {
-    if (c >= 4) {
-      const match = exactWindow.find((entry) => entry.signature === n);
-      return match?.name || null;
-    }
-  }
-  // Semantic guard: same shell program probed repeatedly with different args.
+  // A prior repeated call must not poison a different current tool. Only the signature being
+  // attempted now can trip this non-consecutive guard.
+  if (exactWindow.filter((entry) => entry.signature === signature).length >= 4) return name;
+  // Semantic guard: only stop the CURRENT shell family after consecutive failed probes. Counting
+  // successful calls caused legitimate workflows such as `node todo.js add/list/complete/clear` to
+  // be rejected, while scanning every coarse family let an old bash loop block an unrelated tool.
   const coarseWindow = state.toolCallHistory.slice(-COARSE_LOOP_WINDOW);
-  const coarseCounts: Record<string, number> = {};
-  for (const t of coarseWindow) {
-    coarseCounts[t.coarse] = (coarseCounts[t.coarse] || 0) + 1;
+  let consecutiveFailedProbes = 1; // the current call has not executed yet
+  for (let i = coarseWindow.length - 2; i >= 0; i--) {
+    const prior = coarseWindow[i];
+    if (prior.coarse !== coarse || prior.outcome !== "fail") break;
+    consecutiveFailedProbes++;
   }
-  for (const [cs, c] of Object.entries(coarseCounts)) {
-    if (c >= COARSE_LOOP_THRESHOLD) {
-      const match = coarseWindow.find((entry) => entry.coarse === cs);
-      return match?.name || null;
-    }
-  }
+  if (SHELL_TOOLS.has(name) && consecutiveFailedProbes >= COARSE_LOOP_THRESHOLD) return name;
   return null;
 }
 
@@ -1983,6 +1975,11 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         result = { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
 
+      // Feed the semantic guard real progress information. Exact duplicate calls are still guarded
+      // before execution, but distinct successful commands reset the coarse no-progress streak.
+      const currentHistoryEntry = [...state.toolCallHistory].reverse().find((entry) => entry.signature === toolSignature(name, args) && entry.outcome === undefined);
+      if (currentHistoryEntry) currentHistoryEntry.outcome = classifyToolOutcome(name, result).outcome;
+
       const log = getSessionLog();
       const serializedResult = stringifyToolResult(result, name);
       const workspace = currentWorkspacePath(ctx) || undefined;
@@ -2232,7 +2229,7 @@ NOTE: For complex expressions, keep them under 500 chars.`,
     description: text`Returns current date, time, timezone, and unix timestamp.
 USE WHEN: you need to know the current time, date, or timezone for context.
 EXAMPLE: get_current_datetime()
-NOTE: This uses the system clock. Timezone reflects local machine settings.`,
+NOTE: Call with exactly an empty object: {}. Do not add an empty-string key or placeholder property. This uses the system clock. Timezone reflects local machine settings.`,
     parameters: {},
     implementation: async () => {
       const now = new Date();
@@ -2303,6 +2300,7 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
     description: text`Creates or replaces the session's execution plan — an ordered list of concrete steps toward a goal.
 USE WHEN: a request needs more than one action to complete. Create the plan, THEN execute each step yourself with your other tools (bash_terminal, file tools, etc.) — do not just describe the plan to the user and stop. Before claiming a capability (node, npm, docker, cron, etc.) is missing, check it yourself with bash_terminal rather than assuming a bare environment.
 Each step can optionally set "thinking" ("off"|"low"|"medium"|"high") to override the session's reasoning-effort setting just for that step — mark mechanical steps "off" and tricky ones "high" instead of applying one uniform level everywhere.
+The steps array contains ONLY step strings or { description, thinking } objects. Do not insert numeric list labels such as 1, 2, or 3 as array items; array order already defines numbering.
 EXAMPLE: create_plan({ goal: "Set up a nightly backup of /data", steps: ["Check what's installed: which cron crontab", { description: "Design the backup retention policy", thinking: "high" }, "Write backup script to /data/backup.sh", "Register the crontab entry", "Verify with crontab -l"] })`,
     parameters: {
       goal: z.string().min(1).max(2000),
@@ -3266,10 +3264,16 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, t, harmony));
   }
 
-  const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
-  if (calcMatch) {
+  const explicitCalcMatch = t.match(/^(?:calculate|evaluate|solve|compute)\s+(.+)/i);
+  const conversationalCalcMatch = t.match(/^what\s+is\s+(.+)/i);
+  const rawCalcExpression = explicitCalcMatch?.[1] || conversationalCalcMatch?.[1] || "";
+  const calcExpression = rawCalcExpression.replace(/\?\s*$/, "").trim();
+  // "What is" is overwhelmingly conversational, so only intercept it when the remainder is visibly
+  // arithmetic. Explicit calculator verbs retain mathjs's broader expression language.
+  const expressionShaped = !!explicitCalcMatch || /^[\d\s+\-*/%^().,!]+$/.test(calcExpression);
+  if (calcExpression && expressionShaped) {
     try {
-      const calcResp = await import("mathjs").then(m => m.evaluate(calcMatch[1]));
+      const calcResp = await import("mathjs").then(m => m.evaluate(calcExpression));
       if (typeof calcResp === "number" || typeof calcResp === "string") {
         const processed = `[Tool executed: calculate → ${calcResp}]`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
@@ -3278,12 +3282,13 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         }
         return recordProcessedPrompt(historyText, processed);
       }
-    } catch (e) {
-      console.warn(`[AgenticTools] calculate preprocessor failed:`, e);
-    }
+    } catch {}
   }
 
-  const searchMatch = t.match(/^(?:search|find|google|look\s+up|lookup|bing)\s+(?:the\s+web\s+)?(?:for\s+)?(.+)/i);
+  // Bare "search" and "find" are usually local/contextual requests (workspace, sessions, files).
+  // Only perform network I/O when the user explicitly names a web search surface.
+  const searchMatch = t.match(/^(?:google|bing)\s+(?:for\s+)?(.+)/i)
+    || t.match(/^(?:search|find|look\s+up|lookup)\s+(?:(?:the\s+)?(?:web|internet)|online)\s+(?:for\s+)?(.+)/i);
   if (searchMatch) {
     try {
       const results = await webSearch(searchMatch[1], 5);
