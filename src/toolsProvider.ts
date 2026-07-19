@@ -1078,7 +1078,7 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function estimateCharsFromTokens(tokens: number): number {
+export function estimateCharsFromTokens(tokens: number): number {
   return Math.max(1, tokens * 4);
 }
 
@@ -1086,14 +1086,24 @@ function hardPromptBudgetLimit(contextWindow: number): number {
   return Math.max(512, Math.floor(contextWindow * PROMPT_BUDGET_RATIO));
 }
 
-function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general"): string {
+// How to tell the model to deliver a final answer. Harmony families are not offered the `amend`
+// tool (it collides with their native `final` channel — see the tool assembly in toolsProvider), so
+// naming it in a directive would point them at a tool that is not in their toolset. They finish a
+// turn by simply answering.
+export function finishInstruction(harmony: boolean): string {
+  return harmony
+    ? "reply directly with the best available handoff"
+    : "call amend with the best available handoff";
+}
+
+function formatPromptBudgetHandoff(contextWindow: number, estimatedTokens: number, mode: "workspace" | "multi-step" | "general", harmony = false): string {
   return `${MANAGED_CONTEXT_MARKER}
 [Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
-[Action: preserve code verbatim, summarize only the actionable state, and call amend with the best available handoff.]
+[Action: preserve code verbatim, summarize only the actionable state, and ${finishInstruction(harmony)}.]
 [If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
 }
 
-function buildPromptBudgetReport(
+export function buildPromptBudgetReport(
   historyText: string,
   rewrittenText: string,
   contextWindow: number,
@@ -1139,9 +1149,12 @@ function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionSt
   return estimateTokens(text);
 }
 
-function compactTaskReminder(stepCount: number): string {
+function compactTaskReminder(stepCount: number, harmony = false): string {
+  const finish = harmony
+    ? "Reply with your final answer when the task is done"
+    : "Call amend when the task is done";
   return `${MANAGED_CONTEXT_MARKER}
-[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. Call amend when the task is done, blocked, or you have the best available handoff and cannot safely continue.]`;
+[Task mode: follow all ${stepCount} listed steps in order. Use one tool call at a time. ${finish}, blocked, or you have the best available handoff and cannot safely continue.]`;
 }
 
 function compactContinueInstruction(): string {
@@ -3146,6 +3159,8 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   const t = text.trim();
   await bootstrapSessionState(ctl as any);
   const contextWindow = await getContextWindow(ctl as any);
+  // Harmony families don't get the `amend` tool, so directives below must not tell them to call it.
+  const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
   const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl as any);
   const rollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
   const historyText = await getHistoryText(ctl);
@@ -3204,7 +3219,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     if (managedContextPresent) {
       const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
       if (plainReport.overflow) {
-        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step"));
+        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step", harmony));
       }
       // Continuation: replace stale "follow all steps" instruction with a continue directive
       if (CONTINUATION_PATTERN.test(t)) {
@@ -3214,9 +3229,9 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     }
     const report = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
     if (report.overflow) {
-      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step"));
+      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony));
     }
-    return recordProcessedPrompt(historyText, compactTaskReminder(steps.length));
+    return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, harmony));
   }
 
   const calcMatch = t.match(/^(?:calculate|evaluate|solve|what\s+is|compute)\s+(.+)/i);
@@ -3227,7 +3242,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         const processed = `[Tool executed: calculate → ${calcResp}]`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony));
         }
         return recordProcessedPrompt(historyText, processed);
       }
@@ -3245,7 +3260,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
         if (report.overflow) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general"));
+          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony));
         }
         return recordProcessedPrompt(historyText, processed);
       }
@@ -3257,7 +3272,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
 
   const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
   if (plainReport.overflow) {
-    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general"));
+    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general", harmony));
   }
   // Continuation in managed-context session: prevent LLM from re-executing stale instructions.
   // (Rehydration of persisted managedContextBlocks after a context roll happens unconditionally,
