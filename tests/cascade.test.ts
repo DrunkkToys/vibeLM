@@ -352,6 +352,8 @@ describe("vibeLM Cascade Integration", () => {
 
     const first = await preprocessMessage("1. do a\n2. do b\n3. do c", ctl);
     assert.ok(first?.includes("[vibeLM:managed-context]"), "a multi-step message should trigger a task-mode directive");
+    assert.match(first as string, /1\. do a\n2\. do b\n3\. do c/, "the rewrite must preserve the exact latest multi-step request");
+    assert.match(first as string, /prioritize it over recapping earlier work/i, "the latest request must outrank stale recap context");
 
     const runtimeStatePath = resolve(CONFIG_DIR, "runtime-state.json");
     const persisted1 = JSON.parse(readFileSync(runtimeStatePath, "utf-8"));
@@ -720,33 +722,129 @@ describe("vibeLM Cascade Integration", () => {
     if (existsSync(rsPath)) rmSync(rsPath);
   });
 
-  it("a completed plan does not silently swallow a genuinely new follow-up instruction (live-testing regression: after a plan's steps were all marked done, a plain follow-up like 'cache it for an hour' was reproducibly ignored across two unrelated models — the model just replied with a recap of the already-done work and never called a tool, because nothing turned the new instruction into tracked work)", async () => {
+  it("retires the completed echo-command plan before the exact day-of-week follow-up reaches the model", async () => {
     const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
     const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
 
     const ctl: any = {
       getWorkingDirectory: () => TEST_DIR,
-      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a weather cli" }),
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Running Echo Commands\nAll four plan steps completed." }),
     };
     await resolveSessionStateFromHistory(ctl, true);
-    await preprocessMessage("build me a quick weather cli that takes a city and prints the weather", ctl);
+    await preprocessMessage("Create a plan: run echo one, echo two, echo three, then report every result.", ctl);
     const tools = await toolsProvider(makeCtl());
     const createPlan: any = tools.find((t: any) => t.name === "create_plan");
-    await createPlan.implementation({ goal: "weather cli", steps: ["write index.js"], autoStart: false });
+    await createPlan.implementation({
+      goal: "Run three echo commands and report every result",
+      steps: ["run echo one", "run echo two", "run echo three", "report every result"],
+      autoStart: false,
+    });
     const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
-    await updatePlanStep.implementation({ index: 0, status: "done" });
+    for (let index = 0; index < 4; index++) {
+      await updatePlanStep.implementation({ index, status: "done" });
+    }
 
-    const processed = await preprocessMessage("actually don't hit the network every time, cache it for an hour", ctl);
+    const question = "now also tell me what day of the week it is";
+    const processed = await preprocessMessage(question, ctl);
 
-    assert.ok(processed, "a new instruction after a completed plan must produce a directive, not silently pass through as null");
-    assert.match(processed as string, /cache it for an hour/, "the directive must carry the actual new instruction");
-    assert.match(processed as string, /Execute it now/, "the directive must compel action, matching the existing plan-step directive style");
+    assert.equal(processed, null, "the informational question must reach the model unchanged, not become a plan directive");
 
     const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
-    assert.equal(rs.plan?.steps?.length, 2, "a new pending step should be appended to the existing plan");
-    assert.equal(rs.plan?.steps?.[1]?.status, "pending");
+    assert.equal(rs.plan, null, "the completed echo plan must leave active runtime routing before the follow-up");
+    assert.doesNotMatch(JSON.stringify(rs), /day of the week/, "the question must not be persisted as step 5 of the echo plan");
 
     if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("passes prefixed informational and conversational requests through without auto-creating goals", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "An ordinary conversation" }),
+    };
+    const requests = [
+      "now also tell me what day of the week it is",
+      "also what time does the meeting begin",
+      "now when does daylight saving time end",
+      "also who wrote the original implementation",
+      "now how does this function work",
+    ];
+    await resolveSessionStateFromHistory(ctl, true);
+    for (const request of requests) {
+      assert.equal(await preprocessMessage(request, ctl), null, `must pass through unchanged: ${request}`);
+      const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+      assert.equal(rs.plan, null, `must not create a plan for: ${request}`);
+    }
+  });
+
+  it("starts a fresh plan for an actionable follow-up after completion", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a weather cli\nTurn 2: done" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+    await createPlan.implementation({ goal: "weather cli", steps: ["write index.js"], autoStart: false });
+    await updatePlanStep.implementation({ index: 0, status: "done" });
+
+    const request = "cache it for an hour";
+    const processed = await preprocessMessage(request, ctl);
+
+    assert.ok(processed, "an actionable follow-up should start fresh tracked work");
+    assert.match(processed as string, /cache it for an hour/, "a rewrite must include the exact latest request");
+    assert.match(processed as string, /prioritize.*over recapping completed work/i, "the latest request must outrank completed-work recap");
+    assert.match(processed as string, /create_plan/, "fresh actionable work should be expanded into its own plan");
+    const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(rs.plan?.goal, request, "the new plan must be anchored to the follow-up, not the completed goal");
+    assert.equal(rs.plan?.steps?.length, 0, "the old completed steps must not be mutated or retained");
+  });
+
+  it("keeps an unfinished plan active while passing its follow-up through unchanged", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: run three echo commands" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+    await createPlan.implementation({ goal: "echo plan", steps: ["echo one", "echo two", "report"], autoStart: false });
+    await updatePlanStep.implementation({ index: 0, status: "done" });
+
+    const processed = await preprocessMessage("also use uppercase output for the remaining commands", ctl);
+
+    assert.equal(processed, null, "a follow-up to an unfinished plan should remain ordinary model input");
+    const rs = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(rs.plan?.goal, "echo plan");
+    assert.equal(rs.plan?.steps?.length, 3, "pending-plan follow-ups must not be auto-appended");
+    assert.equal(rs.plan?.steps?.[1]?.status, "pending");
+  });
+
+  it("does not rehydrate a completed plan or its context spine after plugin restart", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Running Echo Commands\nAll echo steps and reporting are done." }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(makeCtl());
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+    await createPlan.implementation({ goal: "echo plan", steps: ["echo one", "echo two", "echo three", "report"], autoStart: false });
+    for (let index = 0; index < 4; index++) await updatePlanStep.implementation({ index, status: "done" });
+
+    const restarted = await resolveSessionStateFromHistory(ctl, true);
+    assert.equal(restarted.plan, null, "a completed plan must not become active again during bootstrap");
+
+    const processed = await preprocessMessage("now also tell me what day of the week it is", ctl);
+    assert.equal(processed, null, "restart must not inject the completed plan's context spine ahead of the question");
   });
 
   it("bootstrapSessionState does NOT carry over a goal-only plan with zero steps across a reload with no readable history (live-testing regression: create_plan is reproducibly never called by real models — grepping every real session in session-log.jsonl across 4 days found zero create_plan calls — so the auto-seeded goal-only plan just sits there forever with nothing to execute; carrying it forward indefinitely only means a dead goal keeps reasserting itself into new sessions instead of ever being expanded into real steps)", async () => {
