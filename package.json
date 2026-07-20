@@ -11,7 +11,9 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "test:watch": "node --import tsx --test --watch tests/*.test.ts",
     "bench": "node benchmark/run.mjs",
-    "bench:report": "node benchmark/report.mjs"
+    "bench:report": "node benchmark/report.mjs",
+    "qscore:preflight": "node --import tsx benchmark/qscore/preflight.ts",
+    "qscore:run": "node --import tsx benchmark/qscore/run.ts"
   },
   "author": "drunkktoys",
   "license": "MIT",
