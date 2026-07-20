@@ -5,6 +5,11 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.14] - 2026-07-19
+
+### Fixed
+- Completed-plan follow-up guards now fully reset session state (turn counter, tool call history, compaction state, handoff state, managed context blocks) when a completed plan is detected, preventing stale state from leaking into the next conversation.
+
 ## [0.2.12] - 2026-07-19
 
 ### Fixed
@@ -336,6 +341,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
+[0.2.14]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.13...v0.2.14
 [0.2.12]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.11...v0.2.12
 [0.2.8]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.6...v0.2.7
