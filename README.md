@@ -137,7 +137,12 @@ npm install
 npm run build
 npm run dev    # lms dev (hot reload)
 npm test       # unit + integration coverage
+npm run qscore:run -- --model <model-key> --engine <mlx|gguf> --seed <1|2|3>
 ```
+
+The versioned PatchTrack/QScore benchmark specification and artifact contract are documented in
+[`benchmark/qscore/README.md`](./benchmark/qscore/README.md). Raw runs use LM Studio's `act()` API;
+vibeLM-system runs use the real installed plugin and remain a separate leaderboard.
 
 ## Config
 
