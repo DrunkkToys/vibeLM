@@ -1378,8 +1378,8 @@ function unwrapToolResult(result: any): any {
 // and searches get the high tier; failures get the low tier (already distilled into a fact); everything
 // else gets the default. Replaces the old flat MAX_TOOL_RESULT_CHARS applied to every tool alike.
 export function resultCharBudget(name: string | undefined, result: unknown): number {
-  if (name && HIGH_VALUE_RESULT_TOOLS.has(name)) return TOOL_RESULT_CHARS_HIGH;
   if (classifyToolOutcome(name ?? "", result).outcome === "fail") return TOOL_RESULT_CHARS_LOW;
+  if (name && HIGH_VALUE_RESULT_TOOLS.has(name)) return TOOL_RESULT_CHARS_HIGH;
   return MAX_TOOL_RESULT_CHARS;
 }
 
@@ -1952,17 +1952,19 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       }
 
       if (maxTurns > 0 && name !== "amend" && state.turnCounter > maxTurns) {
+        const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
         return {
           ok: false,
-          error: `Max turns (${maxTurns}) exceeded. Use amend with what you have so far.`,
+          error: `Max turns (${maxTurns}) exceeded. ${finishInstruction(harmony)}.`,
         };
       }
 
       const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args), coarseToolSignature(name, args));
       if (looped) {
+        const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
         return {
           ok: false,
-          error: `Loop detected: tool "${looped}" has been called repeatedly without making progress (same call or same command probed with different arguments). Stop retrying the same approach — the earlier results already tell you what you need. Change strategy, or call amend to produce your answer with what you have.`,
+          error: `Loop detected: tool "${looped}" has been called repeatedly without making progress (same call or same command probed with different arguments). Stop retrying the same approach — the earlier results already tell you what you need. Change strategy, or ${finishInstruction(harmony)}.`,
         };
       }
 
@@ -2361,7 +2363,7 @@ EXAMPLE: update_plan_step({ index: 0, status: "done" })`,
 
   const getPlanTool = wrapTool(tool({
     name: "get_plan",
-    description: "Returns the current plan and each step's status, or null if no plan is active.",
+    description: "Returns the current plan and each step's status, or null if no plan is active. Call with exactly an empty object: {}. Do not pass goal, steps, or any other properties.",
     parameters: {},
     implementation: async () => ok({ plan: activeSessionState.plan }),
   }), "get_plan");
@@ -3417,6 +3419,11 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   // in the same process and after a persisted-state rehydration.
   if (text.trim().length > 0 && isCompletedPlan(activeSessionState.plan)) {
     activeSessionState.plan = null;
+    activeSessionState.turnCounter = 0;
+    activeSessionState.toolCallHistory = [];
+    activeSessionState.lastCompactionTurn = 0;
+    activeSessionState.lastHandoffSummary = "";
+    activeSessionState.lastHandoffTurn = 0;
     activeSessionState.managedContextBlocks = [];
     activeSessionState.resumedFromPersistedState = false;
     writeRuntimeStateSync(activeSessionState);

@@ -573,8 +573,85 @@ describe("vibeLM Cascade Integration", () => {
     const { resultCharBudget } = await import("../src/toolsProvider");
     assert.equal(resultCharBudget("read_file", { ok: true, data: "x".repeat(9000) }), 1500, "reads get the high tier");
     assert.equal(resultCharBudget("search_files", { ok: true, data: [] }), 1500, "searches get the high tier");
+    assert.equal(resultCharBudget("read_file", { ok: false, error: "x".repeat(9000) }), 300, "a failed high-value read still gets the low failure tier");
+    assert.equal(resultCharBudget("web_search", { ok: false, error: "x".repeat(9000) }), 300, "a failed high-value search still gets the low failure tier");
     assert.equal(resultCharBudget("bash_terminal", { ok: true, data: { exitCode: 1, stderr: "nope" } }), 300, "failures get the low tier");
     assert.equal(resultCharBudget("generate_uuid", { ok: true, data: "abc" }), 500, "everything else gets the default tier");
+  });
+
+  it("resets the tool-turn budget when completed work gives way to a fresh actionable follow-up", async () => {
+    const { preprocessMessage, toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
+    if (existsSync(rsPath)) rmSync(rsPath);
+    const ctl: any = {
+      ...makeCtl({ maxOrchestratorTurns: 0 }),
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: finish the old task\nTurn 2: old task done" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const createPlan: any = tools.find((t: any) => t.name === "create_plan");
+    const updatePlanStep: any = tools.find((t: any) => t.name === "update_plan_step");
+    const getPlan: any = tools.find((t: any) => t.name === "get_plan");
+
+    assert.ok((await createPlan.implementation({ goal: "old task", steps: ["finish it"], autoStart: false }, {})).ok);
+    for (let i = 0; i < 3; i++) assert.ok((await getPlan.implementation({}, {})).ok);
+    assert.ok((await updatePlanStep.implementation({ index: 0, status: "done" }, {})).ok);
+
+    const followup = "cache it for an hour";
+    const processed = await preprocessMessage(followup, ctl);
+    assert.match(processed as string, /cache it for an hour/, "the fresh request must still become the new goal");
+    const retired = JSON.parse(readFileSync(rsPath, "utf-8"));
+    assert.equal(retired.turnCounter, 0, "completed-plan retirement must give the new task a full turn budget");
+
+    const freshTools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 4 }));
+    const freshCreatePlan: any = freshTools.find((t: any) => t.name === "create_plan");
+    const freshUpdatePlanStep: any = freshTools.find((t: any) => t.name === "update_plan_step");
+    const freshGetPlan: any = freshTools.find((t: any) => t.name === "get_plan");
+    assert.ok((await freshCreatePlan.implementation({ goal: followup, steps: ["prepare", "cache"], autoStart: false }, {})).ok);
+    assert.ok((await freshUpdatePlanStep.implementation({ index: 0, status: "in_progress" }, {})).ok);
+    assert.ok((await freshUpdatePlanStep.implementation({ index: 0, status: "done" }, {})).ok);
+    assert.ok((await freshGetPlan.implementation({}, {})).ok, "the old task's get_plan history must not trip the fresh task's loop guard or budget");
+  });
+
+  it("Harmony max-turn and loop-guard errors never point at the withheld amend tool", async () => {
+    const { toolsProvider, setLoadedModelInfoOverride, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    try {
+      setLoadedModelInfoOverride({ arch: "gpt-oss", loadedContextLength: 131072 });
+
+      const cappedCtl = makeCtl({ maxOrchestratorTurns: 1 });
+      await resolveSessionStateFromHistory(cappedCtl, true);
+      const cappedTools = await toolsProvider(cappedCtl);
+      assert.ok(!cappedTools.some((t: any) => t.name === "amend"), "the Harmony toolset must withhold amend");
+      const cappedGetPlan: any = cappedTools.find((t: any) => t.name === "get_plan");
+      assert.ok(cappedGetPlan, "get_plan must be available for the cap regression");
+      assert.ok((await cappedGetPlan.implementation({}, {})).ok);
+      const capped: any = await cappedGetPlan.implementation({}, {});
+      assert.equal(capped.ok, false);
+      assert.doesNotMatch(capped.error, /amend/i, "max-turn recovery must not name an unavailable tool");
+      assert.match(capped.error, /reply directly/i, "Harmony recovery must tell the model how to finish natively");
+
+      const loopCtl = makeCtl({ maxOrchestratorTurns: 0 });
+      await resolveSessionStateFromHistory(loopCtl, true);
+      const loopTools = await toolsProvider(loopCtl);
+      const getPlan: any = loopTools.find((t: any) => t.name === "get_plan");
+      assert.ok(getPlan, "get_plan must be available for the loop regression");
+      let looped: any = null;
+      for (let i = 0; i < 4; i++) looped = await getPlan.implementation({}, {});
+      assert.equal(looped.ok, false, "the fourth exact call must exercise the loop guard");
+      assert.doesNotMatch(looped.error, /amend/i, "loop recovery must not name an unavailable tool");
+      assert.match(looped.error, /reply directly/i, "Harmony loop recovery must use the native final channel");
+    } finally {
+      setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: null });
+    }
+  });
+
+  it("describes get_plan as an exact empty-object call for gpt-oss compatibility", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 0 }));
+    const getPlan: any = tools.find((t: any) => t.name === "get_plan");
+    assert.ok(getPlan, "get_plan must be exposed");
+    assert.match(getPlan.description, /exactly an empty object:\s*\{\}/i);
+    assert.match(getPlan.description, /do not.*goal.*steps/i, "the live malformed argument names must be called out explicitly");
   });
 
   it("buildContextSpine budgets tiers: goal pinned, facts fill remaining budget", async () => {
