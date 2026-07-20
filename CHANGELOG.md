@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw LM Studio tool-loop execution, protected-fixture hashes, hidden acceptance probes, JSONL artifacts,
   evidence-weighted scoring, and honesty/safety caps.
 
+### Fixed
+- Prompt-budget estimation now includes LM Studio SDK tool-call requests and results. Tool-heavy chats therefore trigger the context handoff guard before exceeding the loaded context window instead of stalling during the next tool request.
+
 ## [0.2.14] - 2026-07-19
 
 ### Fixed

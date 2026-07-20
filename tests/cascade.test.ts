@@ -1433,6 +1433,38 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(chatToText(null), "");
   });
 
+  it("includes SDK tool-call requests and results in prompt-budget history", async () => {
+    const { buildPromptBudgetReport, chatToText } = await import("../src/toolsProvider");
+    const largeToolResult = "x".repeat(70_000);
+    const messages = [
+      {
+        role: "assistant",
+        text: "",
+        requests: [{ id: "call-1", name: "bash_terminal", arguments: { command: "node --test" } }],
+        results: [{ toolCallId: "call-1", content: largeToolResult }],
+      },
+    ];
+    const sdkShapedChat: any = {
+      getLength: () => messages.length,
+      at: (i: number) => ({
+        getRole: () => messages[i].role,
+        getText: () => messages[i].text,
+        getToolCallRequests: () => messages[i].requests,
+        getToolCallResults: () => messages[i].results,
+      }),
+      toString: () => "Chat {\n  system: \n}",
+    };
+
+    const history = chatToText(sdkShapedChat);
+    assert.match(history, /bash_terminal/, "tool-call requests consume real prompt space and must be retained");
+    assert.ok(history.includes(largeToolResult), "tool results must contribute to prompt-budget estimation");
+    assert.equal(
+      buildPromptBudgetReport(history, "continue", 32_768).overflow,
+      true,
+      "a tool-heavy chat beyond the hard budget must be stopped before LM Studio receives it",
+    );
+  });
+
   it("directives never tell a Harmony model to call `amend`, since it is not in its toolset", async () => {
     // Companion to the amend gating. Withholding the tool but still instructing the model to call it
     // points it at something that does not exist for that family.

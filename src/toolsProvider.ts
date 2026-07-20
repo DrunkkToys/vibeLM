@@ -820,7 +820,8 @@ export function conversationLength(composedLength: number, systemPromptLength: n
 // running plugin. That silently disabled the new-conversation detection (every chat looked identical
 // in size), and any compaction/budget logic keyed off history length.
 //
-// The real API is getLength() / at(i) / ChatMessage.getText()+getRole().
+// The real API is getLength() / at(i) plus ChatMessage's text, role, tool-request and tool-result
+// accessors. Tool payloads are part of LM Studio's real prompt budget even when getText() is empty.
 //
 // The toString() fallback is deliberate and is NOT the old bug: it only runs for objects that do not
 // expose getLength, which in practice means this file's test doubles (`{ toString: () => "..." }`).
@@ -834,9 +835,21 @@ export function chatToText(history: any): string {
       for (let i = 0; i < length; i++) {
         const message = history.at(i);
         const body = typeof message?.getText === "function" ? message.getText() : "";
-        if (!body) continue;
+        const toolCallRequests = typeof message?.getToolCallRequests === "function"
+          ? message.getToolCallRequests()
+          : [];
+        const toolCallResults = typeof message?.getToolCallResults === "function"
+          ? message.getToolCallResults()
+          : [];
+        const parts = [
+          body,
+          toolCallRequests.length > 0 ? `tool-call-requests: ${JSON.stringify(toolCallRequests)}` : "",
+          toolCallResults.length > 0 ? `tool-call-results: ${JSON.stringify(toolCallResults)}` : "",
+        ].filter(Boolean);
+        if (parts.length === 0) continue;
         const role = typeof message?.getRole === "function" ? message.getRole() : "";
-        lines.push(role ? `${role}: ${body}` : body);
+        const rendered = parts.join("\n");
+        lines.push(role ? `${role}: ${rendered}` : rendered);
       }
       return lines.join("\n");
     }
