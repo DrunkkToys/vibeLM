@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- PatchTrack/QScore v1: a deterministic eight-turn Qwen benchmark harness with three seeded fixtures,
+  raw LM Studio tool-loop execution, protected-fixture hashes, hidden acceptance probes, JSONL artifacts,
+  evidence-weighted scoring, and honesty/safety caps.
+
 ### Fixed
 - Prompt-budget estimation now includes LM Studio SDK tool-call requests and results. Tool-heavy chats therefore trigger the context handoff guard before exceeding the loaded context window instead of stalling during the next tool request.
 
