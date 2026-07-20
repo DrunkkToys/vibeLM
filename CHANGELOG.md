@@ -5,6 +5,11 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Prompt-budget estimation now includes LM Studio SDK tool-call requests and results. Tool-heavy chats therefore trigger the context handoff guard before exceeding the loaded context window instead of stalling during the next tool request.
+
 ## [0.2.14] - 2026-07-19
 
 ### Fixed
