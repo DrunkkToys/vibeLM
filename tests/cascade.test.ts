@@ -1574,4 +1574,32 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(unsafe.score, 39, "protected fixture mutation must cap QScore at 39");
     assert.ok(unsafe.caps.includes("protected-fixture-modified"));
   });
+
+  it("QScore preflight enforces exactly one loaded LM Studio model", async () => {
+    const { assertSingleLoadedModel } = await import("../benchmark/qscore/preflight");
+    const target = "qwen3.5-4b";
+    const payload = (loadedKeys: string[]) => ({
+      models: loadedKeys.map((key) => ({
+        key,
+        loaded_instances: [{ id: key }],
+      })),
+    });
+
+    assert.deepEqual(assertSingleLoadedModel(payload([target]), target), {
+      modelKey: target,
+      instanceId: target,
+    });
+    assert.throws(
+      () => assertSingleLoadedModel(payload([]), target),
+      /exactly one loaded model.*found 0/i,
+    );
+    assert.throws(
+      () => assertSingleLoadedModel(payload([target, "another-model"]), target),
+      /exactly one loaded model.*found 2/i,
+    );
+    assert.throws(
+      () => assertSingleLoadedModel(payload(["another-model"]), target),
+      /does not match requested model/i,
+    );
+  });
 });

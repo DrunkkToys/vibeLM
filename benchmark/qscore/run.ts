@@ -7,6 +7,7 @@ import { resolve, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { createPatchTrackFixture, fixtureManifest } from "./fixture";
+import { assertSingleLoadedModel, fetchLoadedModels } from "./preflight";
 import { PATCHTRACK_SPEC, scoreQScoreRun, type QScoreRunRecord } from "./scorer";
 
 const execFileAsync = promisify(execFile);
@@ -120,9 +121,15 @@ const turnPrompts = [
 ];
 
 async function main() {
+  const loaded = assertSingleLoadedModel(await fetchLoadedModels(), selectedModelId);
+  if (loaded.contextLength !== PATCHTRACK_SPEC.primaryContextLength) {
+    throw new Error(
+      `QScore requires context length ${PATCHTRACK_SPEC.primaryContextLength}; found ${loaded.contextLength ?? "unknown"}`,
+    );
+  }
   emit({ type: "manifest", benchmarkVersion: PATCHTRACK_SPEC.version, modelId, engine, seed, contextLength: PATCHTRACK_SPEC.primaryContextLength });
   const client = new LMStudioClient();
-  const model = await client.llm.load(selectedModelId, { config: { contextLength: PATCHTRACK_SPEC.primaryContextLength } });
+  const model = client.llm.model(selectedModelId);
   const chat = Chat.empty();
   const completedTurns: QScoreRunRecord["turns"] = [];
   let totalRounds = 0;
