@@ -1173,6 +1173,13 @@ export function buildPromptBudgetReport(
   };
 }
 
+function shouldHandoffForPromptBudget(report: ReturnType<typeof buildPromptBudgetReport>): boolean {
+  // Rewrite at the proactive rolling threshold, not only after the host has already
+  // assembled an over-context request. The visible LM Studio counter may continue to
+  // show historical turns, but the next model request must be bounded before dispatch.
+  return report.nearLimit || report.overflow;
+}
+
 function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionState): number {
   const recentTurns = session.readRecentTurns(COMPACT_CONTEXT_MAX_RECENT_TURNS, currentSessionId(state));
   const text = recentTurns.map((entry) => {
@@ -3263,7 +3270,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   if (steps && steps.length > 0) {
     if (managedContextPresent) {
       const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-      if (plainReport.overflow) {
+      if (shouldHandoffForPromptBudget(plainReport)) {
         return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step", harmony, t));
       }
       // Continuation: replace stale "follow all steps" instruction with a continue directive
@@ -3273,7 +3280,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       return null;
     }
     const report = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-    if (report.overflow) {
+    if (shouldHandoffForPromptBudget(report)) {
       return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony, t));
     }
     return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, t, harmony));
@@ -3292,7 +3299,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       if (typeof calcResp === "number" || typeof calcResp === "string") {
         const processed = `[Tool executed: calculate → ${calcResp}]`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
-        if (report.overflow) {
+        if (shouldHandoffForPromptBudget(report)) {
           return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
         }
         return recordProcessedPrompt(historyText, processed);
@@ -3311,7 +3318,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
         const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
-        if (report.overflow) {
+        if (shouldHandoffForPromptBudget(report)) {
           return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
         }
         return recordProcessedPrompt(historyText, processed);
@@ -3323,7 +3330,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   }
 
   const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-  if (plainReport.overflow) {
+  if (shouldHandoffForPromptBudget(plainReport)) {
     return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general", harmony, t));
   }
   // Continuation in managed-context session: prevent LLM from re-executing stale instructions.
