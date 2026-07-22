@@ -5,7 +5,7 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.15] - 2026-07-20
 
 ### Added
 - PatchTrack/QScore v1: a deterministic eight-turn Qwen benchmark harness with three seeded fixtures,
@@ -13,7 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence-weighted scoring, and honesty/safety caps.
 
 ### Fixed
-- Prompt-budget estimation now includes LM Studio SDK tool-call requests and results. Tool-heavy chats therefore trigger the context handoff guard before exceeding the loaded context window instead of stalling during the next tool request.
+- Prompt-budget estimation now includes LM Studio SDK tool-call requests and results. Tool-heavy chats
+  therefore trigger the context handoff guard before exceeding the loaded context window instead of
+  stalling during the next tool request.
+- Compact prompt history before context overflow -- the compaction guard now fires before the hosts
+  hard context limit is reached, preventing truncated tool calls.
+- Enforce one loaded model per QScore run to prevent benchmark contamination.
 
 ## [0.2.14] - 2026-07-19
 
@@ -139,7 +144,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifies one whole conversation, not one exchange. `toolsProvider()` no longer forces the bootstrap;
   it reuses the state `preprocessMessage()` already established for the turn.
 
-### Known follow-up (not yet resolved)
 - Live re-testing after the fix above still showed `sessionId` changing across some turns even without a
   process reload. Suspected contributing factors, not yet isolated: `vibe_bridge`'s background tick
   shares the same module-level session state via its own separate `model.act()` call (built from a
@@ -364,6 +368,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
+[0.2.15]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.11...v0.2.12

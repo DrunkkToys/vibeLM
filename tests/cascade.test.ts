@@ -219,6 +219,20 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(autoCompactTrigger <= 12192, `auto-compaction trigger should be ~12K: got ${autoCompactTrigger}`);
   });
 
+  it("hands off before the live prompt reaches the context window", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const history = "x".repeat(32768 * 2);
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+      getModelContextWindow: () => 32768,
+    };
+    const processed = await preprocessMessage("continue the benchmark", ctl);
+    assert.ok(processed, "a near-limit history must be rewritten before the host request is sent");
+    assert.match(processed as string, /Budget warning/i);
+    assert.match(processed as string, /continue the benchmark/);
+  });
+
   it("resolveCompactionTriggerRatio reads the configured percent, clamps it, and defaults to 30%", async () => {
     const { resolveCompactionTriggerRatio } = await import("../src/toolsProvider");
     const ctlWith = (percent: unknown) => ({
