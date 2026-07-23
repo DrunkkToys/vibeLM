@@ -5,6 +5,14 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.16] - 2026-07-20
+
+### Fixed
+- Context rollover prompts now shrink the newest user message with a keep-both-ends algorithm
+  instead of injecting an unbounded string into the handoff, which defeated the rollover guard for
+  pasted logs and large files.
+- Prompt-budget ratio lowered from 50% to 30%, aligned with the existing compaction safety margin.
+
 ## [0.2.15] - 2026-07-20
 
 ### Added
@@ -368,6 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `orchestratorLoop` `finalText` now includes tool results
 - Stack overflow in `requireWorkspace` infinite recursion
 
+[0.2.16]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.15...v0.2.16
 [0.2.15]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/DrunkkToys/vibeLM/compare/v0.2.12...v0.2.13
