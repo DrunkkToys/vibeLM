@@ -22,7 +22,10 @@ const RUNTIME_STATE_PATH = resolve(DATA_DIR, "runtime-state.json");
 const JSONL_CACHE_PATH = resolve(DATA_DIR, "session-log.jsonl");
 
 const DEFAULT_CONTEXT_WINDOW = 8192;
-const PROMPT_BUDGET_RATIO = 0.50;
+// Keep the prompt budget aligned with the existing 30% compaction safety margin. Prompt
+// preprocessors can replace the newest user message but cannot mutate LM Studio's stored chat
+// history, so this is an early rollover threshold rather than a claim that host history was deleted.
+const PROMPT_BUDGET_RATIO = 0.30;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
 // Importance tiers for how much of a tool result is kept verbatim on the turn log. Flat truncation
@@ -1132,7 +1135,10 @@ function formatPromptBudgetHandoff(
   // That path was unreachable while history was read via Chat.toString() (it measured a ~19-char
   // constant, so the budget was never approached), and became reachable the moment history was read
   // correctly, which would have started eating user messages in long sessions.
-  const request = userMessage.trim();
+  // The replacement prompt is the only portion we control. Do not re-inject an unbounded newest
+  // request into it: that defeats the rollover guard for pasted logs/files. Preserve both ends so
+  // the task and its final constraint survive while the disposable middle is removed.
+  const request = shrinkTextAroundCenter(userMessage.trim(), Math.min(4096, estimateCharsFromTokens(Math.max(256, Math.floor(contextWindow / 16)))));
   const carried = request
     ? `\n[The user's latest message still needs an answer. Address it as part of that handoff:]\n${request}`
     : "";
@@ -1140,6 +1146,17 @@ function formatPromptBudgetHandoff(
 [Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
 [Action: preserve code verbatim, summarize only the actionable state, and ${finishInstruction(harmony)}.]${carried}
 [If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
+}
+
+export function shrinkTextAroundCenter(value: string, maxChars: number): string {
+  if (maxChars < 1 || value.length <= maxChars) return value;
+  if (maxChars <= 3) return value.slice(0, maxChars);
+  const marker = "\n…[middle omitted for context safety]…\n";
+  if (maxChars <= marker.length + 2) return `${value.slice(0, 1)}…${value.slice(-1)}`;
+  const available = maxChars - marker.length;
+  const headChars = Math.ceil(available / 2);
+  const tailChars = Math.floor(available / 2);
+  return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
 }
 
 export function buildPromptBudgetReport(
