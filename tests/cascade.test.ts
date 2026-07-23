@@ -1554,6 +1554,21 @@ describe("vibeLM Cascade Integration", () => {
     );
   });
 
+  it("shrinks an oversized rollover request through its middle before it reaches the model", async () => {
+    const { buildPromptBudgetReport, estimateCharsFromTokens, shrinkTextAroundCenter } = await import("../src/toolsProvider") as any;
+    const contextWindow = 32_768;
+    const report = buildPromptBudgetReport("x".repeat(estimateCharsFromTokens(10_000)), "continue", contextWindow, 9_830);
+
+    assert.equal(report.nearLimit, true, "the 30% safety budget must trigger before a 32K chat approaches host OOM territory");
+
+    const original = `BEGIN-REQUIRED\n${"middle ".repeat(20_000)}\nEND-REQUIRED`;
+    const shrunk = shrinkTextAroundCenter(original, 4_096);
+    assert.ok(shrunk.length <= 4_096, "the replacement prompt must have a hard size bound");
+    assert.match(shrunk, /^BEGIN-REQUIRED/, "keep the task-bearing head");
+    assert.match(shrunk, /END-REQUIRED$/, "keep the final constraint");
+    assert.match(shrunk, /middle omitted for context safety/, "drop the nonessential center instead of expanding the handoff");
+  });
+
   it("write_file still rejects a ~-prefixed path that resolves outside the workspace", async () => {
     const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
     const ctl = makeCtl();
