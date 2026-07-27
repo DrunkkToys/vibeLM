@@ -30,8 +30,7 @@ describe("DebugProvider smoke tests", () => {
   it("safety: blocks dangerous commands", () => {
     assert.equal(checkIsDangerousCommand("rm -rf /"), "Refusing: rm -rf /");
     assert.equal(checkIsDangerousCommand("ls -la"), null);
-    // NOTE: fork bomb regex uses \| (escaped pipe) which never matches real fork bombs — known bug
-    // assert.equal(checkIsDangerousCommand(":(){ :|:& };:"), "Refusing: fork bomb");
+    assert.equal(checkIsDangerousCommand(":(){ :|:& };:"), "Refusing: fork bomb");
     assert.equal(checkIsDangerousCommand("mkfs.ext4 /dev/sda"), "Refusing: filesystem format");
     assert.equal(checkIsDangerousCommand("echo hello"), null);
   });
@@ -46,10 +45,10 @@ describe("DebugProvider smoke tests", () => {
 
   it("safety: validates hotfix payloads", () => {
     assert.equal(validateHotfixSafety({ patchType: "js_eval", payload: "1+1" }), null);
-    // dom_mutate dangerous check requires workspacePath — test with one
+    // dom_mutate dangerous check fires regardless of workspacePath
+    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" })!, /dangerous/);
+    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "fetch('https://evil.com')" })!, /dangerous/);
     assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" }, "/workspace")!, /dangerous/);
-    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "fetch('https://evil.com')" }, "/workspace")!, /dangerous/);
-    assert.equal(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" }), null, "no workspacePath = no check");
     assert.match(validateHotfixSafety({ patchType: "env_override", payload: "API_KEY=secret" })!, /sensitive/);
     assert.equal(validateHotfixSafety({ patchType: "env_override", payload: "PORT=3000" }), null);
   });
@@ -147,6 +146,20 @@ describe("DebugProvider smoke tests", () => {
     assert(!result.ok, "must fail when no CDP endpoint is running");
     assert(result.error, "must have an error message");
     assert(!dp.isAttached());
+  });
+
+  it("web: cdpPort parameter is accepted", async () => {
+    resetDebugProviderForTest();
+    const dp = getDebugProvider();
+
+    // Custom port should be used in the error message
+    const result = await dp.attachTarget({
+      targetType: "web",
+      identifier: "http://localhost:99999",
+      cdpPort: 19222,
+    });
+    assert(!result.ok);
+    assert.match(result.error!, /19222/, "error message should mention the custom port");
   });
 
   it("web: attach fails gracefully for unknown target type", async () => {

@@ -49,6 +49,7 @@ export interface AttachParams {
   targetType: TargetType;
   identifier: string;
   autoBreakOnCrash?: boolean;
+  cdpPort?: number;
 }
 
 export interface SafetyBoundary {
@@ -79,14 +80,15 @@ class WebDebugAdapter implements DebugAdapter {
 
   async attach(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
     const url = params.identifier;
+    const port = params.cdpPort ?? 9222;
     let wsUrl: string;
 
     if (url.startsWith("ws://") || url.startsWith("wss://")) {
       wsUrl = url;
     } else {
-      const devtoolsUrl = await this.discoverCDPUrl(url);
+      const devtoolsUrl = await this.discoverCDPUrl(url, port);
       if (!devtoolsUrl) {
-        return { ok: false, error: `Cannot discover CDP endpoint for ${url}. Ensure Chrome is running with --remote-debugging-port=9222` };
+        return { ok: false, error: `Cannot discover CDP endpoint for ${url}. Ensure Chrome is running with --remote-debugging-port=${port}` };
       }
       wsUrl = devtoolsUrl;
     }
@@ -111,6 +113,8 @@ class WebDebugAdapter implements DebugAdapter {
       await this.cdpCommand("Page.enable");
       await this.cdpCommand("Console.enable");
       await this.cdpCommand("Debugger.enable");
+      await this.cdpCommand("DOM.enable");
+      await this.cdpCommand("Network.enable");
       if (params.autoBreakOnCrash) {
         await this.cdpCommand("Debugger.pauseOnExceptions", { state: "uncaught" });
       }
@@ -142,7 +146,7 @@ class WebDebugAdapter implements DebugAdapter {
 
       let networkErrors: string[] = [];
       try {
-        const perf = await this.cdpCommand("Network.getResponseBodyForInterception");
+        const perf = await this.cdpCommand("Network.getPerformanceMetrics");
         networkErrors = extractNetworkErrors(perf);
       } catch {}
 
@@ -250,9 +254,9 @@ class WebDebugAdapter implements DebugAdapter {
           return { ok: true, result: JSON.stringify((result as any)?.result?.value ?? "(void)") };
         }
         case "css_inject": {
-          await this.cdpCommand("CSS.enable");
-          await this.cdpCommand("CSS.setStyleTexts", {
-            edits: [{ styleSheetId: "", range: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0 }, text: patch.payload }],
+          const escaped = patch.payload.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
+          await this.cdpCommand("Runtime.evaluate", {
+            expression: `(function() { var s = document.createElement('style'); s.textContent = \`${escaped}\`; document.head.appendChild(s); })()`,
           });
           return { ok: true };
         }
@@ -283,9 +287,9 @@ class WebDebugAdapter implements DebugAdapter {
 
   // ── Private helpers ──
 
-  private async discoverCDPUrl(pageUrl: string): Promise<string | null> {
+  private async discoverCDPUrl(pageUrl: string, port: number = 9222): Promise<string | null> {
     try {
-      const resp = await fetch("http://localhost:9222/json");
+      const resp = await fetch(`http://localhost:${port}/json`);
       if (!resp.ok) return null;
       const targets: Array<{ webSocketDebuggerUrl: string; url: string }> = await resp.json();
       const match = targets.find((t) => t.url.includes(pageUrl)) || targets[0];
@@ -571,7 +575,7 @@ class MobileDebugAdapter implements DebugAdapter {
     const bundleId = params.identifier;
 
     try {
-      execSync(`adb shell pm list packages ${bundleId}`, { timeout: 5000 });
+      execSync(`adb shell pm path ${bundleId}`, { timeout: 5000, encoding: "utf-8" });
     } catch {
       return { ok: false, error: `No device connected or package ${bundleId} not found. Check adb devices.` };
     }
@@ -641,14 +645,34 @@ class MobileDebugAdapter implements DebugAdapter {
           if (params.coordinates) {
             execSync(`adb shell input tap ${params.coordinates.x} ${params.coordinates.y}`, { timeout: 5000 });
           } else if (params.selector) {
-            execSync(`adb shell uiautomator click ${params.selector}`, { timeout: 5000 });
+            try {
+              const uixml = execSync("adb shell uiautomator dump /dev/stdout", {
+                timeout: 5000,
+                encoding: "utf-8",
+                maxBuffer: 1024 * 1024,
+              });
+              const boundsMatch = uixml.match(new RegExp(`resource-id="${params.selector}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`));
+              if (boundsMatch) {
+                const x = Math.round((parseInt(boundsMatch[1]) + parseInt(boundsMatch[3])) / 2);
+                const y = Math.round((parseInt(boundsMatch[2]) + parseInt(boundsMatch[4])) / 2);
+                execSync(`adb shell input tap ${x} ${y}`, { timeout: 5000 });
+              } else {
+                return { ok: false, error: `Element not found for selector: ${params.selector}` };
+              }
+            } catch (e) {
+              return { ok: false, error: `Selector tap failed: ${e instanceof Error ? e.message : String(e)}` };
+            }
           }
           return { ok: true };
         }
         case "type": {
           if (params.value) {
-            const escaped = params.value.replace(/ /g, "%s").replace(/"/g, "");
-            execSync(`adb shell input text "${escaped}"`, { timeout: 5000 });
+            const escaped = params.value
+              .replace(/\\/g, "\\\\")
+              .replace(/'/g, "'\\''")
+              .replace(/[[\]]/g, "\\$&")
+              .replace(/[(){}|;&<>$`!]/g, "\\$&");
+            execSync(`adb shell input text '${escaped}'`, { timeout: 5000 });
           }
           return { ok: true };
         }
@@ -661,10 +685,20 @@ class MobileDebugAdapter implements DebugAdapter {
         }
         case "key_combination": {
           if (params.value) {
-            const keyMap: Record<string, string> = { enter: "66", back: "4", home: "3", menu: "82", power: "26" };
-            const key = keyMap[params.value.toLowerCase()];
-            if (key) {
-              execSync(`adb shell input keyevent ${key}`, { timeout: 5000 });
+            const keyMap: Record<string, string> = {
+              enter: "66", back: "4", home: "3", menu: "82", power: "26",
+              delete: "67", tab: "61", space: "62", escape: "111",
+              up: "19", down: "20", left: "21", right: "22",
+              pageup: "92", pagedown: "93",
+            };
+            const keys = params.value.split("+").map((k) => k.trim().toLowerCase());
+            for (const key of keys) {
+              const code = keyMap[key];
+              if (code) {
+                execSync(`adb shell input keyevent ${code}`, { timeout: 5000 });
+              } else {
+                return { ok: false, error: `Unknown key: ${key}. Supported: ${Object.keys(keyMap).join(", ")}` };
+              }
             }
           }
           return { ok: true };
@@ -684,10 +718,10 @@ class MobileDebugAdapter implements DebugAdapter {
       case "env_override": {
         try {
           const targetPkg = this.info.identifier;
+          const key = patch.payload.split("=")[0];
+          const value = patch.payload.split("=").slice(1).join("=");
           execSync(
-            `adb shell am broadcast -a debug.setProperty --es key "${
-              patch.payload.split("=")[0]
-            }" --es value "${patch.payload.split("=")[1] || ""}" ${targetPkg}`,
+            `adb shell am broadcast -a debug.setProperty --es key "${key}" --es value "${value}" -p ${targetPkg}`,
             { timeout: 5000 }
           );
           return { ok: true, result: `Environment override attempted: ${patch.payload}` };
@@ -743,7 +777,7 @@ export function checkIsInWorkspace(targetPath: string, workspacePath: string): b
 export function checkIsDangerousCommand(command: string): string | null {
   const dangerous = [
     { pattern: /rm\s+-rf\s+\/\s*$/i, msg: "Refusing: rm -rf /" },
-    { pattern: /:(){ :\|:& };:/, msg: "Refusing: fork bomb" },
+    { pattern: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, msg: "Refusing: fork bomb" },
     { pattern: /mkfs\./i, msg: "Refusing: filesystem format" },
     { pattern: /dd\s+if=.+\s+of=\/dev/i, msg: "Refusing: raw device write" },
     { pattern: /chmod\s+-R\s+0+\s+\//i, msg: "Refusing: permission wipe" },
@@ -776,7 +810,7 @@ export function validateHotfixSafety(
   patch: HotfixPatch,
   workspacePath?: string
 ): string | null {
-  if (patch.patchType === "dom_mutate" && workspacePath) {
+  if (patch.patchType === "dom_mutate") {
     const dangerousPatterns = [
       /document\.cookie/i,
       /fetch\s*\(/i,
