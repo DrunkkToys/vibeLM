@@ -24,43 +24,17 @@ export const configSchematics = createConfigSchematics()
         50,
       )
       .field(
-        "rollingWindowTriggerTokens",
+        "contextLength",
         "numeric",
         {
-          displayName: "Rolling Window Trigger Limit (prompt tokens)",
-          subtitle: "Enter a token count, not characters. Set 0 to auto-derive from the selected model context window minus a safety margin. When the prompt estimate reaches this many tokens, vibeLM treats the session as near limit and can compact or recommend rolling-window behavior.",
+          displayName: "Context Length (tokens)",
+          subtitle: "How many tokens of context the model keeps. When the conversation exceeds this limit, older messages are truncated (cut in the middle). Set to 0 to use the model's default. Requires a model reload to take effect.",
           int: true,
           min: 0,
-          max: 16384,
-          slider: { min: 0, max: 16384, step: 256 },
-        },
-        0,
-      )
-      .field(
-        "maxEffectiveContextTokens",
-        "numeric",
-        {
-          displayName: "Max Effective Context (tokens)",
-          subtitle: "Optional hard cap on the token budget vibeLM plans against. vibeLM already reads the model's actual loaded context length, so leave this at 0 for normal use. Set it only if your machine can't sustain even the configured length (e.g. a large VLM whose KV cache exhausts unified memory) — vibeLM will then compact against this lower ceiling instead.",
-          int: true,
-          min: 0,
-          max: 1048576,
+          max: 262144,
           slider: { min: 0, max: 262144, step: 1024 },
         },
         0,
-      )
-      .field(
-        "compactionTriggerPercent",
-        "numeric",
-        {
-          displayName: "Auto-Compaction Trigger (% of context)",
-          subtitle: "How full the context gets before vibeLM auto-summarizes older history into memory. Lower = compact earlier (more headroom, but compaction is lossy and costs a model call, so it runs more often); higher = keep more live context (better fidelity for long tasks, closer to the limit). Works on top of the actual loaded context window; the Rolling Window and Max Effective Context settings govern warnings/caps, this one governs compaction.",
-          int: true,
-          min: 10,
-          max: 90,
-          slider: { min: 10, max: 90, step: 5 },
-        },
-        30,
       )
       .field(
         "reasoningEffort",

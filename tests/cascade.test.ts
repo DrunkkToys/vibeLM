@@ -17,9 +17,9 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
   writeFileSync(resolve(CONFIG_DIR, "config.json"), JSON.stringify(merged, null, 2));
 }
 
-function makeCtl(options: { maxOrchestratorTurns?: number; rollingWindowTriggerTokens?: number; toolToggles?: Record<string, boolean> } = {}) {
+function makeCtl(options: { maxOrchestratorTurns?: number; toolToggles?: Record<string, boolean> } = {}) {
   const base = { getWorkingDirectory: () => TEST_DIR };
-  if (typeof options.maxOrchestratorTurns !== "number" && typeof options.rollingWindowTriggerTokens !== "number" && !options.toolToggles) {
+  if (typeof options.maxOrchestratorTurns !== "number" && !options.toolToggles) {
     return base as any;
   }
   return {
@@ -27,7 +27,6 @@ function makeCtl(options: { maxOrchestratorTurns?: number; rollingWindowTriggerT
     getPluginConfig: () => ({
       get: (key: string) => {
         if (key === "tools.maxOrchestratorTurns" || key === "maxOrchestratorTurns") return options.maxOrchestratorTurns;
-        if (key === "tools.rollingWindowTriggerTokens" || key === "rollingWindowTriggerTokens" || key === "contextOverflowHeadroomTokens") return options.rollingWindowTriggerTokens;
         if (key.startsWith("tools.") || options.toolToggles) {
           const toolKey = key.startsWith("tools.") ? key.slice("tools.".length) : key;
           if (options.toolToggles && toolKey in options.toolToggles) return options.toolToggles[toolKey];
@@ -183,16 +182,6 @@ describe("vibeLM Cascade Integration", () => {
     log.clear();
   });
 
-  it("effectiveContextWindow caps the reported window against the sustainable ceiling", async () => {
-    const { effectiveContextWindow } = await import("../src/toolsProvider");
-    // cap disabled → trust the reported window
-    assert.equal(effectiveContextWindow(262144, 0), 262144);
-    // cap below reported → clamp to cap (the real crash-avoidance case)
-    assert.equal(effectiveContextWindow(262144, 32768), 32768);
-    // cap above reported → reported wins (never inflate a small model's window)
-    assert.equal(effectiveContextWindow(8192, 32768), 8192);
-  });
-
   it("parseLoadedModelInfo reads the loaded context length, not the model's max ceiling", async () => {
     const { parseLoadedModelInfo } = await import("../src/toolsProvider");
     // Mirrors the live payload: the loaded model's real window (40640) is far below its max (262144).
@@ -211,12 +200,12 @@ describe("vibeLM Cascade Integration", () => {
   it("budget/compaction thresholds computed from the real loaded window fire before overflow", async () => {
     const { parseLoadedModelInfo } = await import("../src/toolsProvider");
     const window = parseLoadedModelInfo({ data: [{ state: "loaded", arch: "qwen3_5", loaded_context_length: 40640 }] } as any).loadedContextLength!;
-    // hardPromptBudgetLimit = window * 0.50; shouldAutoCompactSession trips at window * 0.30.
+    // hardPromptBudgetLimit = window * 0.50; shouldAutoCompactSession trips at window * 0.50.
     const budgetLimit = Math.floor(window * 0.5);
-    const autoCompactTrigger = Math.floor(window * 0.3);
+    const autoCompactTrigger = Math.floor(window * 0.5);
     assert.equal(budgetLimit, 20320, "budget warning should trip at ~20K (half the real 40K window)");
     assert.ok(autoCompactTrigger < window, `auto-compaction (${autoCompactTrigger}) must trip below the real window (${window})`);
-    assert.ok(autoCompactTrigger <= 12192, `auto-compaction trigger should be ~12K: got ${autoCompactTrigger}`);
+    assert.equal(autoCompactTrigger, 20320, "auto-compaction trigger should be ~20K (half the real 40K window)");
   });
 
   it("hands off before the live prompt reaches the context window", async () => {
@@ -231,27 +220,6 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(processed, "a near-limit history must be rewritten before the host request is sent");
     assert.match(processed as string, /Budget warning/i);
     assert.match(processed as string, /continue the benchmark/);
-  });
-
-  it("resolveCompactionTriggerRatio reads the configured percent, clamps it, and defaults to 30%", async () => {
-    const { resolveCompactionTriggerRatio } = await import("../src/toolsProvider");
-    const ctlWith = (percent: unknown) => ({
-      getPluginConfig: () => ({ get: (k: string) => (k === "tools.compactionTriggerPercent" || k === "compactionTriggerPercent" ? percent : undefined) }),
-    } as any);
-    assert.equal(resolveCompactionTriggerRatio(ctlWith(50)), 0.5, "50% → 0.5");
-    assert.equal(resolveCompactionTriggerRatio(ctlWith(95)), 0.9, "clamps above 90%");
-    assert.equal(resolveCompactionTriggerRatio(ctlWith(1)), 0.1, "clamps below 10%");
-    assert.equal(resolveCompactionTriggerRatio({} as any), 0.3, "no config → default 30%");
-    // At a real 40640 window, a higher trigger keeps more live context before compacting.
-    assert.equal(Math.floor(40640 * resolveCompactionTriggerRatio(ctlWith(60))), 24384);
-  });
-
-  it("effectiveContextWindow still clamps further when the optional cap is set", async () => {
-    const { effectiveContextWindow } = await import("../src/toolsProvider");
-    // With cap disabled (default 0) the loaded window passes through untouched.
-    assert.equal(effectiveContextWindow(40640, 0), 40640);
-    // A user-set cap lowers the budget further for machines that can't sustain the loaded length.
-    assert.equal(effectiveContextWindow(40640, 16384), 16384);
   });
 
   it("reasoningDirectiveFor maps effort + arch to each family's native thinking control", async () => {
@@ -1495,18 +1463,18 @@ describe("vibeLM Cascade Integration", () => {
     // exchange must not trip it, and genuinely oversized history must.
     const { buildPromptBudgetReport, estimateCharsFromTokens } = await import("../src/toolsProvider") as any;
     const contextWindow = 131072;
-    const trigger = 12032;
 
     // A realistic exchange: measured live at ~414 chars for one full tool-using turn.
     const ordinary = "user: run the three echo commands\nassistant: one two three\n".repeat(7);
-    const small = buildPromptBudgetReport(ordinary, "what is 2+2?", contextWindow, trigger);
+    const small = buildPromptBudgetReport(ordinary, "what is 2+2?", contextWindow);
     assert.equal(small.nearLimit, false, `an ordinary ${ordinary.length}-char conversation must not be treated as near the limit`);
     assert.equal(small.overflow, false);
 
     // Genuinely large history must still trip it, or the budget guard is useless.
-    const huge = "x".repeat(estimateCharsFromTokens(trigger) + 5000);
-    const big = buildPromptBudgetReport(huge, "continue", contextWindow, trigger);
-    assert.equal(big.nearLimit, true, "history past the configured trigger must be flagged");
+    const defaultTrigger = Math.floor(contextWindow * 0.50);
+    const huge = "x".repeat(estimateCharsFromTokens(defaultTrigger) + 5000);
+    const big = buildPromptBudgetReport(huge, "continue", contextWindow);
+    assert.equal(big.nearLimit, true, "history past the default 50% trigger must be flagged");
   });
 
   it("the budget handoff carries the user's message instead of silently dropping it", async () => {
@@ -1529,12 +1497,6 @@ describe("vibeLM Cascade Integration", () => {
     const bulky = "user: do the thing\nassistant: here is a long answer about the thing\n".repeat(200);
     const ctl: any = {
       getWorkingDirectory: () => TEST_DIR,
-      getPluginConfig: () => ({
-        get: (key: string) =>
-          (key === "tools.rollingWindowTriggerTokens" || key === "rollingWindowTriggerTokens" || key === "contextOverflowHeadroomTokens")
-            ? 300
-            : undefined,
-      }),
       pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => bulky }),
     };
 
@@ -1567,6 +1529,49 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(shrunk, /^BEGIN-REQUIRED/, "keep the task-bearing head");
     assert.match(shrunk, /END-REQUIRED$/, "keep the final constraint");
     assert.match(shrunk, /middle omitted for context safety/, "drop the nonessential center instead of expanding the handoff");
+  });
+
+  it("budget report uses the full loaded context length for its 50% trigger (no effectiveContextWindow cap)", async () => {
+    const { buildPromptBudgetReport } = await import("../src/toolsProvider");
+    // A 262144-token context window implies a 131072-token trigger. Any conversation well below
+    // that must not be flagged — proving the full context length is used, not a smaller cap.
+    const contextWindow = 262_144;
+    const small = buildPromptBudgetReport("user: hi\nassistant: hello\n", "what is 2+2?", contextWindow);
+    assert.equal(small.nearLimit, false, "a short conversation must not be near limit on a 262K context window");
+  });
+
+  it("auto-compaction and budget warning both trigger at 50% of the context window", async () => {
+    // shouldAutoCompactSession is internal, but its trigger is derived from contextWindow * 0.50 — the
+    // same ratio that buildPromptBudgetReport uses. Test the behavior through the exported budget API.
+    const { buildPromptBudgetReport, estimateCharsFromTokens } = await import("../src/toolsProvider") as any;
+    const contextWindow = 4096;
+    const trigger50 = Math.floor(contextWindow * 0.50); // 2048 tokens
+
+    // Just under 50%: no near-limit flag.
+    const justUnder = "x".repeat(estimateCharsFromTokens(trigger50) - 200);
+    const under = buildPromptBudgetReport(justUnder, "continue", contextWindow);
+    assert.equal(under.nearLimit, false, "history just under 50% must not trigger near-limit");
+
+    // Just over 50%: near-limit flag fires.
+    const justOver = "x".repeat(estimateCharsFromTokens(trigger50) + 200);
+    const over = buildPromptBudgetReport(justOver, "continue", contextWindow);
+    assert.equal(over.nearLimit, true, "history at or above 50% must trigger near-limit");
+  });
+
+  it("buildPromptBudgetReport uses 0.50 of context window as default trigger", async () => {
+    const { buildPromptBudgetReport } = await import("../src/toolsProvider");
+    const contextWindow = 4096;
+    const defaultTrigger = Math.floor(contextWindow * 0.50); // 2048
+
+    // Just under the default trigger: nearLimit should be false.
+    const justUnder = "x".repeat(defaultTrigger * 4 - 100); // chars, ~tokens - 25
+    const under = buildPromptBudgetReport(justUnder, "continue", contextWindow);
+    assert.equal(under.nearLimit, false, "history just under 50% of context window must not be near limit");
+
+    // At the default trigger: nearLimit should be true.
+    const atTrigger = "x".repeat(defaultTrigger * 4 + 100); // chars, ~tokens + 25
+    const over = buildPromptBudgetReport(atTrigger, "continue", contextWindow);
+    assert.equal(over.nearLimit, true, "history at or above 50% of context window must be near limit");
   });
 
   it("write_file still rejects a ~-prefixed path that resolves outside the workspace", async () => {
