@@ -48,11 +48,7 @@ const COMPACT_CONTEXT_MAX_RECENT_TURNS = 80;
 const COMPACT_CONTEXT_DEFAULT_MAX_TOKENS = 500;
 const COMPACT_CONTEXT_SAFETY_MARGIN = 256;
 const DEFAULT_MAX_ORCHESTRATOR_TURNS = 50;
-const DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS = 3000;
-// Secondary safety net on top of reading the real loaded context length: an optional hard cap on the
-// window vibeLM budgets against, for machines that can't sustain even the configured length. Default 0
-// = trust the loaded window; users raise it via tools.maxEffectiveContextTokens when they need it.
-const DEFAULT_MAX_EFFECTIVE_CONTEXT_TOKENS = 0;
+
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = "off";
 // vibe_bridge ticks are a standalone model.act() call outside the main orchestrator, so they
 // don't inherit maxOrchestratorTurns. Without their own cap, a model stuck reasoning without
@@ -115,7 +111,7 @@ function checkBashCommandSafety(command: string): string | null {
 }
 type MemoryScope = "session" | "workspace" | "research" | "all";
 let activeMaxOrchestratorTurns = DEFAULT_MAX_ORCHESTRATOR_TURNS;
-let activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
+
 
 type ContextWindowCacheEntry = {
   modelKey: string;
@@ -238,19 +234,8 @@ async function getReportedContextWindow(ctl?: any): Promise<number> {
   return DEFAULT_CONTEXT_WINDOW;
 }
 
-// Clamp the reported window to the token budget the machine can actually sustain. cap <= 0 disables.
-export function effectiveContextWindow(reported: number, cap: number): number {
-  if (typeof cap === "number" && cap > 0) {
-    return Math.min(reported, cap);
-  }
-  return reported;
-}
-
-// Every budgeting/compaction decision routes through here, so capping here makes the whole guardrail
-// (hardPromptBudgetLimit, rolling window, shouldAutoCompactSession) fire against the effective window.
 async function getContextWindow(ctl?: any): Promise<number> {
-  const reported = await getReportedContextWindow(ctl);
-  return effectiveContextWindow(reported, resolveMaxEffectiveContextTokens(ctl));
+  return getReportedContextWindow(ctl);
 }
 
 const BINARY_EXTS = new Set([
@@ -341,23 +326,7 @@ function resolveMaxOrchestratorTurns(ctl?: any): number {
   return DEFAULT_MAX_ORCHESTRATOR_TURNS;
 }
 
-function resolveMaxEffectiveContextTokens(ctl?: any): number {
-  const rawValue = readPluginConfigValue(ctl, ["tools.maxEffectiveContextTokens", "maxEffectiveContextTokens"]);
-  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
-    return Math.max(0, Math.floor(rawValue));
-  }
-  return DEFAULT_MAX_EFFECTIVE_CONTEXT_TOKENS;
-}
 
-// The auto-compaction trigger, as a fraction of the context window. Exposed as a percentage
-// (tools.compactionTriggerPercent) and clamped to a sane 10–90% band.
-export function resolveCompactionTriggerRatio(ctl?: any): number {
-  const rawValue = readPluginConfigValue(ctl, ["tools.compactionTriggerPercent", "compactionTriggerPercent"]);
-  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
-    return Math.max(10, Math.min(90, Math.floor(rawValue))) / 100;
-  }
-  return COMPACT_CONTEXT_TRIGGER_RATIO;
-}
 
 function resolveMaxThinkingSteps(ctl?: any): number {
   const rawValue = readPluginConfigValue(ctl, ["tools.maxThinkingSteps", "maxThinkingSteps"]);
@@ -487,21 +456,7 @@ export function resolveBridgeTickMaxTokens(arch: string): number | undefined {
   return ALWAYS_REASONING_ARCH_PATTERN.test(arch) ? ALWAYS_REASONING_TICK_MAX_TOKENS : undefined;
 }
 
-function resolveConfiguredRollingWindowTriggerTokens(ctl?: any): number {
-  const rawValue = readPluginConfigValue(ctl, ["tools.rollingWindowTriggerTokens", "rollingWindowTriggerTokens", "contextOverflowHeadroomTokens"]);
-  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
-    return Math.max(0, Math.min(16384, Math.floor(rawValue)));
-  }
-  return DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
-}
 
-function resolveRollingWindowTriggerTokens(contextWindow: number, configuredTokens: number): number {
-  const hardLimitTokens = hardPromptBudgetLimit(contextWindow);
-  if (configuredTokens <= 0) {
-    return hardLimitTokens;
-  }
-  return Math.max(1, Math.min(configuredTokens, hardLimitTokens));
-}
 
 function resolveEnabledToolNames(ctl?: any): string[] {
   const pluginEnabledTools: string[] = [];
@@ -1164,7 +1119,7 @@ export function buildPromptBudgetReport(
   historyText: string,
   rewrittenText: string,
   contextWindow: number,
-  rollingWindowTriggerTokens: number = hardPromptBudgetLimit(contextWindow),
+  rollingWindowTriggerTokens: number = Math.floor(contextWindow * 0.50),
 ): {
   estimatedTokens: number;
   hardLimitTokens: number;
@@ -1872,7 +1827,7 @@ function shouldAutoCompactSession(
   session: SessionLog,
   state: SessionState,
   contextWindow: number,
-  triggerRatio: number = COMPACT_CONTEXT_TRIGGER_RATIO,
+  triggerRatio: number = 0.50,
 ): boolean {
   if (state.turnCounter < COMPACT_CONTEXT_TRIGGER_TURNS) return false;
   if (state.turnCounter - state.lastCompactionTurn < COMPACT_CONTEXT_MIN_GAP_TURNS) return false;
@@ -2057,7 +2012,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         );
       }
 
-      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx), resolveCompactionTriggerRatio(ctx))) {
+      if (name !== "compact_context" && shouldAutoCompactSession(log, state, await getContextWindow(ctx))) {
         const compact = await compactSessionContext(log, state, {
           saveToMemory: true,
           includeCode: true,
@@ -2103,6 +2058,22 @@ export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashComman
 
 export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
   _bridgeClient = client ?? null;
+  // Enforce user-configured context length by reloading the model if needed.
+  const configuredContextLength = readPluginConfigValue(ctl, ["tools.contextLength", "contextLength"]);
+  if (typeof configuredContextLength === "number" && configuredContextLength > 0 && _bridgeClient) {
+    try {
+      const loadedModels = await _bridgeClient.llm.listLoaded();
+      for (const model of loadedModels) {
+        const info = await model.getModelInfo();
+        if (info && typeof (info as any).contextLength === "number" && (info as any).contextLength !== configuredContextLength) {
+          console.log(`[AgenticTools] Reloading model ${model.identifier} with contextLength=${configuredContextLength} (was ${(info as any).contextLength})`);
+          await _bridgeClient.llm.load(model.identifier, { config: { contextLength: configuredContextLength } });
+        }
+      }
+    } catch (err) {
+      console.error("[AgenticTools] Failed to enforce contextLength:", err);
+    }
+  }
   // No force here: ToolsProviderController has no pullHistory() (unlike PromptPreprocessorController),
   // so a forced bootstrap can never read real history and always falls back to a fresh session — wiping
   // sessionId/turnCounter on every single call. toolsProvider() runs once per turn, so that discarded
@@ -2113,7 +2084,6 @@ export async function toolsProvider(ctl: ToolsProviderController, client?: LMStu
   const sessionState = await bootstrapSessionState(ctl);
   activeSessionState = sessionState;
   activeMaxOrchestratorTurns = resolveMaxOrchestratorTurns(ctl);
-  activeRollingWindowTriggerTokens = DEFAULT_ROLLING_WINDOW_TRIGGER_TOKENS;
 
   const setWorkspaceTool = wrapTool(tool({
     name: "set_workspace",
@@ -2186,9 +2156,7 @@ EXAMPLE: get_config()`,
       const workspace = requireWorkspace(ctl);
       const promptEstimate = estimateRecentSessionPromptTokens(session, sessionState);
       const contextWindow = await getContextWindow(ctl);
-      const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl);
-      const effectiveRollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
-      activeRollingWindowTriggerTokens = effectiveRollingWindowTriggerTokens;
+      const effectiveRollingWindowTriggerTokens = Math.floor(contextWindow * 0.50);
       return ok({
         workspace,
         sessionId: currentSessionId(sessionState),
@@ -2200,7 +2168,6 @@ EXAMPLE: get_config()`,
         totalTurnsLogged: session.totalTurnsLogged(),
         sessionWorkingDirectory: ctl.getWorkingDirectory(),
         maxOrchestratorTurns: activeMaxOrchestratorTurns,
-        rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
         rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
         rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
         promptBudget: {
@@ -2208,7 +2175,6 @@ EXAMPLE: get_config()`,
           hardLimitTokens: hardPromptBudgetLimit(contextWindow),
           estimatedTokens: promptEstimate,
           safetyMargin: COMPACT_CONTEXT_SAFETY_MARGIN,
-          rollingWindowTriggerTokensConfigured: configuredRollingWindowTriggerTokens,
           rollingWindowTriggerTokens: effectiveRollingWindowTriggerTokens,
           rollingWindowTriggerCharsApprox: estimateCharsFromTokens(effectiveRollingWindowTriggerTokens),
           risk: promptEstimate >= hardPromptBudgetLimit(contextWindow) ? "high" : promptEstimate >= Math.floor(hardPromptBudgetLimit(contextWindow) * 0.85) ? "medium" : "low",
@@ -3307,8 +3273,7 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   const contextWindow = await getContextWindow(ctl as any);
   // Harmony families don't get the `amend` tool, so directives below must not tell them to call it.
   const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
-  const configuredRollingWindowTriggerTokens = resolveConfiguredRollingWindowTriggerTokens(ctl as any);
-  const rollingWindowTriggerTokens = resolveRollingWindowTriggerTokens(contextWindow, configuredRollingWindowTriggerTokens);
+  const rollingWindowTriggerTokens = Math.floor(contextWindow * 0.50);
   const historyText = await getHistoryText(ctl);
   syncRuntimeState(historyText, activeSessionState);
   const normalizedHistoryText = normalizeManagedContextHistory(historyText);
