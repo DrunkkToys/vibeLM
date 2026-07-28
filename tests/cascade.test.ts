@@ -1664,3 +1664,113 @@ describe("vibeLM Cascade Integration", () => {
     );
   });
 });
+
+describe("debug tools", () => {
+  before(() => {
+    if (!existsSync(CONFIG_DIR)) {
+      mkdirSync(CONFIG_DIR, { recursive: true });
+    }
+    if (!existsSync(resolve(CONFIG_DIR, "session-log.jsonl"))) {
+      writeFileSync(resolve(CONFIG_DIR, "session-log.jsonl"), "");
+    }
+  });
+
+  it("are hidden by default", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({}));
+    const names = tools.map((t: any) => t.name);
+    assert(!names.includes("debug_attach_target"));
+    assert(!names.includes("debug_capture_state"));
+    assert(!names.includes("debug_execute_interaction"));
+    assert(!names.includes("debug_apply_hotfix"));
+  });
+
+  it("are exposed when toggled on", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: {
+        debug_attach_target: true,
+        debug_capture_state: true,
+        debug_execute_interaction: true,
+        debug_apply_hotfix: true,
+      },
+    }));
+    const names = tools.map((t: any) => t.name);
+    assert(names.includes("debug_attach_target"));
+    assert(names.includes("debug_capture_state"));
+    assert(names.includes("debug_execute_interaction"));
+    assert(names.includes("debug_apply_hotfix"));
+  });
+
+  it("debug_attach_target implementation returns error when no target", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_attach_target: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_attach_target");
+    assert(tool, "tool must exist");
+    const result = await tool.implementation({ targetType: "web", identifier: "http://localhost:9999" });
+    assert(result.error, "should return an error when not connected");
+  });
+
+  it("debug_attach_target has correct parameters", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_attach_target: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_attach_target");
+    assert(tool);
+    assert.match(tool.description, /debug_attach_target/);
+  });
+
+  it("debug_capture_state implementation returns error when no target attached", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_capture_state: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_capture_state");
+    assert(tool);
+    const result = await tool.implementation({ includeDOM: true, logTailLines: 50 });
+    assert(result.error, "should return error when no target attached");
+  });
+
+  it("debug_execute_interaction fails safely when no target", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_execute_interaction: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_execute_interaction");
+    assert(tool);
+    const result = await tool.implementation({ action: "click", coordinates: { x: 100, y: 100 } });
+    assert(result.error, "should return error when no target attached");
+  });
+
+  it("debug_apply_hotfix fails safely when no target", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_apply_hotfix: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_apply_hotfix");
+    assert(tool);
+    const result = await tool.implementation({ patchType: "js_eval", payload: "console.log('test')" });
+    assert(result.error, "should return error when no target attached");
+  });
+
+  it("all four debug tools have descriptions", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: {
+        debug_attach_target: true,
+        debug_capture_state: true,
+        debug_execute_interaction: true,
+        debug_apply_hotfix: true,
+      },
+    }));
+    for (const name of ["debug_attach_target", "debug_capture_state", "debug_execute_interaction", "debug_apply_hotfix"]) {
+      const tool = tools.find((t: any) => t.name === name);
+      assert(tool, `${name} must exist`);
+      assert(tool.description, `${name} must have a description`);
+      assert(tool.description.length > 10, `${name} description must be substantive`);
+    }
+  });
+});

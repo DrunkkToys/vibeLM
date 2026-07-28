@@ -198,6 +198,30 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
     subtitle: "Enable reading the current plan and step statuses.",
     defaultEnabled: true,
   },
+  {
+    name: "debug_attach_target",
+    displayName: "Debug: Attach Target",
+    subtitle: "Enable attaching debugger to web URL, desktop PID, or mobile bundle ID.",
+    defaultEnabled: false,
+  },
+  {
+    name: "debug_capture_state",
+    displayName: "Debug: Capture State",
+    subtitle: "Enable capturing diagnostic state: screenshot, component tree, logs, errors.",
+    defaultEnabled: false,
+  },
+  {
+    name: "debug_execute_interaction",
+    displayName: "Debug: Execute Interaction",
+    subtitle: "Enable performing UI actions: click, type, scroll, focus, key combos.",
+    defaultEnabled: false,
+  },
+  {
+    name: "debug_apply_hotfix",
+    displayName: "Debug: Apply Hotfix",
+    subtitle: "Enable live code/CSS/DOM patches to verify fixes at runtime.",
+    defaultEnabled: false,
+  },
 ];
 
 export const DEFAULT_ENABLED_TOOL_NAMES = TOOL_TOGGLES.filter((tool) => tool.defaultEnabled).map((tool) => tool.name);

@@ -9,6 +9,7 @@ import * as math from "mathjs";
 import { SessionLog, type MemoryEntry, type SearchMemoryResult, type TurnEntry } from "./sessionLog";
 import { configSchematics, DEFAULT_VIBE_BRIDGE_PROMPT, DEFAULT_VIBE_BRIDGE_INTERVAL, DEFAULT_VIBE_BRIDGE_MAX_DURATION } from "./config";
 import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
+import { getDebugProvider } from "./debugProvider";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
@@ -3145,6 +3146,78 @@ The default prompt can be configured in tool settings.`,
     };
   }
 
+  const debugAttachTargetTool = wrapTool(tool({
+    name: "debug_attach_target",
+    description: text`Attaches the debugger to a target: web URL (CDP), desktop process (PID or binary path), or mobile app (iOS bundle ID or Android bundle ID).
+USE WHEN: you need to start debugging a live application.
+EXAMPLE: debug_attach_target({ targetType: "web", identifier: "http://localhost:3000" })
+NOTE: Web targets need Chrome with --remote-debugging-port=9222. Desktop targets accept a PID or binary path. Mobile auto-detects iOS simulator vs Android ADB.
+DEBUGGING LOOP: After attaching, use debug_capture_state to capture the current state, then debug_execute_interaction to interact, then debug_apply_hotfix to test fixes. Always re-capture state after applying a hotfix to verify the fix worked.`,
+    parameters: {
+      targetType: z.enum(["web", "desktop", "mobile"]).describe("Target type: web (browser URL), desktop (PID/binary), or mobile (iOS/Android bundle ID)"),
+      identifier: z.string().describe("Web URL, PID, binary path, or bundle ID"),
+      autoBreakOnCrash: z.boolean().optional().describe("Auto-pause on uncaught exceptions (web only)"),
+      cdpPort: z.number().optional().describe("Custom Chrome DevTools Protocol port (default: 9222)"),
+    },
+    implementation: async ({ targetType, identifier, autoBreakOnCrash, cdpPort }) => {
+      const dp = getDebugProvider();
+      return dp.attachTarget({ targetType: targetType as any, identifier, autoBreakOnCrash, cdpPort });
+    },
+  }), "debug_attach_target");
+
+  const debugCaptureStateTool = wrapTool(tool({
+    name: "debug_capture_state",
+    description: text`Captures the current diagnostic state of the attached debug target: screenshot, component tree (DOM/accessibility), console/logs, and network errors.
+USE WHEN: you need to inspect what the application is showing or what errors have occurred.
+EXAMPLE: debug_capture_state({ logTailLines: 100 })
+NOTE: Requires an active debug target (call debug_attach_target first).
+DEBUGGING LOOP: This is step 1 of the debugging cycle. After capturing state, analyze the logs and component tree to identify faults. Then use debug_execute_interaction to reproduce the issue, and debug_apply_hotfix to test your fix. Always re-capture state after applying a hotfix to verify the fix worked.`,
+    parameters: {
+      includeDOM: z.boolean().optional().default(true).describe("Include DOM/accessibility tree in snapshot"),
+      logTailLines: z.number().int().min(1).max(500).optional().default(50).describe("Number of recent log lines to include"),
+    },
+    implementation: async ({ includeDOM, logTailLines }) => {
+      const dp = getDebugProvider();
+      return dp.captureState({ includeDOM, logTailLines });
+    },
+  }), "debug_capture_state");
+
+  const debugExecuteInteractionTool = wrapTool(tool({
+    name: "debug_execute_interaction",
+    description: text`Performs a UI action on the attached debug target: click, type text, scroll, focus, or send key combinations.
+USE WHEN: you need to interact with the application under debug — clicking buttons, filling forms, scrolling.
+EXAMPLE: debug_execute_interaction({ action: "click", selector: "#submit-btn" })
+NOTE: Requires an active debug target. Coordinates override selectors if both are provided.
+DEBUGGING LOOP: This is step 2 of the debugging cycle. After capturing state (step 1), use this tool to reproduce the issue or test interactions. Then use debug_apply_hotfix (step 3) to test your fix. Always re-capture state after applying a hotfix to verify the fix worked.`,
+    parameters: {
+      action: z.enum(["click", "type", "scroll", "focus", "key_combination"]).describe("Interaction action to perform"),
+      selector: z.string().optional().describe("CSS selector (web), resource-id (Android), or element name"),
+      coordinates: z.object({ x: z.number(), y: z.number() }).optional().describe("Pixel coordinates for click/scroll"),
+      value: z.string().optional().describe("Text to type or key combination (e.g. 'Ctrl+S', 'home', 'volumeup')"),
+    },
+    implementation: async ({ action, selector, coordinates, value }) => {
+      const dp = getDebugProvider();
+      return dp.executeInteraction({ action: action as any, selector, coordinates, value });
+    },
+  }), "debug_execute_interaction");
+
+  const debugApplyHotfixTool = wrapTool(tool({
+    name: "debug_apply_hotfix",
+    description: text`Applies a live hotfix to the attached debug target: evaluate JS, inject CSS, mutate DOM, or override environment variables.
+USE WHEN: you want to test a potential fix at runtime before writing it to source files.
+EXAMPLE: debug_apply_hotfix({ patchType: "css_inject", payload: "body { background: red; }" })
+NOTE: Requires an active debug target. DOM mutations and JS evals are sandboxed against dangerous operations.
+DEBUGGING LOOP: This is step 3 of the debugging cycle. After capturing state (step 1) and reproducing the issue (step 2), apply your fix here. Then re-capture state to verify the fix worked. If verified, write the fix to your workspace files.`,
+    parameters: {
+      patchType: z.enum(["js_eval", "css_inject", "dom_mutate", "env_override"]).describe("Type of hotfix to apply"),
+      payload: z.string().describe("The code, CSS, mutation script, or env override (key=value)"),
+    },
+    implementation: async ({ patchType, payload }) => {
+      const dp = getDebugProvider();
+      return dp.applyHotfix({ patchType: patchType as any, payload });
+    },
+  }), "debug_apply_hotfix");
+
   const ALL_TOOL_MAP: Record<string, any> = {
     set_workspace: setWorkspaceTool,
     explore_workspace: exploreWorkspaceTool,
@@ -3179,6 +3252,10 @@ The default prompt can be configured in tool settings.`,
     update_plan_step: updatePlanStepTool,
     get_plan: getPlanTool,
     vibe_bridge: vibeBridgeTool,
+    debug_attach_target: debugAttachTargetTool,
+    debug_capture_state: debugCaptureStateTool,
+    debug_execute_interaction: debugExecuteInteractionTool,
+    debug_apply_hotfix: debugApplyHotfixTool,
   };
 
   // `amend` exists so families with no native "I'm done" signal can hand a final answer back
