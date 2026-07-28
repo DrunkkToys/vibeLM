@@ -1,15 +1,15 @@
 import { WebSocket } from "ws";
 import { spawn, type ChildProcess } from "child_process";
 import { execSync } from "child_process";
-import { existsSync, readFileSync } from "fs";
-import { resolve } from "path";
+import { existsSync, readFileSync, statSync } from "fs";
+import { resolve, dirname } from "path";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type TargetType = "web" | "desktop" | "mobile";
 export type InteractionAction = "click" | "type" | "scroll" | "focus" | "key_combination";
 export type PatchType = "js_eval" | "css_inject" | "dom_mutate" | "env_override";
-export type PlatformOS = "darwin" | "win32" | "linux" | "android";
+export type PlatformOS = "darwin" | "win32" | "linux" | "android" | "ios";
 
 export interface DebugTargetInfo {
   targetType: TargetType;
@@ -354,6 +354,51 @@ class DesktopDebugAdapter implements DebugAdapter {
     return this.attachToProcess(pid);
   }
 
+  async attachDebugger(): Promise<{ ok: boolean; error?: string; output?: string }> {
+    if (!this.info?.pid) return { ok: false, error: "No process attached" };
+    const os = process.platform;
+    try {
+      if (os === "darwin") {
+        const output = execSync(
+          `lldb -p ${this.info.pid} -o "bt" -o "quit"`,
+          { timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+        );
+        this.logBuffer.push(`[lldb] Backtrace captured for PID ${this.info.pid}`);
+        return { ok: true, output };
+      } else {
+        const output = execSync(
+          `gdb -batch -ex "thread apply all bt" -p ${this.info.pid}`,
+          { timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+        );
+        this.logBuffer.push(`[gdb] Backtrace captured for PID ${this.info.pid}`);
+        return { ok: true, output };
+      }
+    } catch (e) {
+      return { ok: false, error: `Debugger attach failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  async captureCrashInfo(): Promise<{ ok: boolean; output?: string; error?: string }> {
+    if (!this.info?.pid) return { ok: false, error: "No process attached" };
+    try {
+      if (process.platform === "darwin") {
+        const output = execSync(
+          `log show --predicate 'processID == ${this.info.pid}' --style compact --last 1m 2>/dev/null | tail -50`,
+          { timeout: 5000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+        );
+        return { ok: true, output };
+      } else {
+        const output = execSync(
+          `dmesg | tail -50`,
+          { timeout: 5000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+        );
+        return { ok: true, output };
+      }
+    } catch (e) {
+      return { ok: false, error: `Crash info unavailable: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
   private async spawnTarget(binaryPath: string): Promise<{ ok: boolean; error?: string }> {
     if (!existsSync(binaryPath)) {
       return { ok: false, error: `Binary not found: ${binaryPath}` };
@@ -446,8 +491,73 @@ class DesktopDebugAdapter implements DebugAdapter {
 
   private async readAccessibilityTree(): Promise<unknown[]> {
     const os = process.platform;
+    const pid = this.info?.pid;
     try {
-      if (os === "darwin") {
+      if (os === "darwin" && pid) {
+        const swiftScript = `
+import AppKit
+
+func traverse(element: AXUIElement, depth: Int) -> [String: Any] {
+    var attrs: [String: Any] = ["role": "", "title": "", "value": "", "children": []]
+    var role: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+    attrs["role"] = (role as? String) ?? ""
+
+    var title: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title)
+    attrs["title"] = (title as? String) ?? ""
+
+    var desc: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &desc)
+    attrs["description"] = (desc as? String) ?? ""
+
+    var value: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
+    if let v = value { attrs["value"] = "\(v)" }
+
+    var pos: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &pos)
+    if let p = pos {
+        var pt = CGPoint.zero
+        AXValueGetValue(p as! AXValue, .cgPoint, &pt)
+        attrs["position"] = ["x": Int(pt.x), "y": Int(pt.y)]
+    }
+
+    var size: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size)
+    if let s = size {
+        var sz = CGSize.zero
+        AXValueGetValue(s as! AXValue, .cgSize, &sz)
+        attrs["size"] = ["width": Int(sz.width), "height": Int(sz.height)]
+    }
+
+    if depth < 10 {
+        var children: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children)
+        if let childArray = children as? [AXUIElement] {
+            attrs["children"] = childArray.map { traverse(element: $0, depth: depth + 1) }
+        }
+    }
+    return attrs
+}
+
+let app = NSRunningApplication(processIdentifier: ${pid})
+let appElement = AXUIElementCreateApplication(${pid})
+let tree = traverse(element: appElement, depth: 0)
+
+let jsonData = try! JSONSerialization.data(withJSONObject: tree)
+print(String(data: jsonData, encoding: .utf8)!)
+`;
+        const output = execSync(
+          `echo ${JSON.stringify(swiftScript)} | swift -`,
+          { timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+        );
+        try {
+          return [JSON.parse(output.trim())];
+        } catch {
+          return [{ platform: "macOS", raw: output.trim().slice(0, 5000) }];
+        }
+      } else if (os === "darwin") {
         const output = execSync(
           `osascript -e 'tell application "System Events" to get name of every process'`,
           { timeout: 5000, encoding: "utf-8" }
@@ -559,34 +669,55 @@ function pressCode(key: string): string {
   return map[key.toLowerCase()] || "0";
 }
 
-// ─── Mobile ADB Adapter (Android) ─────────────────────────────────────────────
+// ─── Mobile Adapter (Android ADB + iOS simctl) ─────────────────────────────
 
 class MobileDebugAdapter implements DebugAdapter {
   private info: DebugTargetInfo | null = null;
   private logBuffer: string[] = [];
+  private platform: "android" | "ios" | null = null;
+  private udid: string | null = null;
 
   async attach(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
+    const bundleId = params.identifier;
+
+    // Try iOS first (if simctl is available)
+    if (process.platform === "darwin") {
+      try {
+        const devices = execSync("xcrun simctl list devices booted -j", {
+          timeout: 5000,
+          encoding: "utf-8",
+          maxBuffer: 1024 * 1024,
+        });
+        const parsed = JSON.parse(devices);
+        const bootedDevices = Object.values(parsed.devices || {}).flat().filter((d: any) => d.state === "Booted");
+        if (bootedDevices.length > 0) {
+          this.udid = (bootedDevices[0] as any).udid;
+          try {
+            execSync(`xcrun simctl get_app_container ${this.udid} ${bundleId}`, { timeout: 5000, encoding: "utf-8" });
+            this.platform = "ios";
+            this.info = { targetType: "mobile", identifier: bundleId, platform: "ios", attachedAt: new Date().toISOString() };
+            this.logBuffer.push(`[iOS] Attached to ${bundleId} on simulator ${this.udid}`);
+            return { ok: true };
+          } catch {}
+        }
+      } catch {}
+    }
+
+    // Fall back to Android ADB
     try {
       execSync("adb devices", { timeout: 5000, encoding: "utf-8" });
     } catch {
-      return { ok: false, error: "adb not found or no device connected. Install Android platform tools and connect a device." };
+      return { ok: false, error: "No mobile runtime available. Install Xcode CLI tools (iOS) or Android platform-tools (ADB)." };
     }
-
-    const bundleId = params.identifier;
 
     try {
       execSync(`adb shell pm path ${bundleId}`, { timeout: 5000, encoding: "utf-8" });
     } catch {
-      return { ok: false, error: `No device connected or package ${bundleId} not found. Check adb devices.` };
+      return { ok: false, error: `Package ${bundleId} not found. Check adb devices and bundle ID.` };
     }
 
-    this.info = {
-      targetType: "mobile",
-      identifier: bundleId,
-      platform: "android",
-      attachedAt: new Date().toISOString(),
-    };
-
+    this.platform = "android";
+    this.info = { targetType: "mobile", identifier: bundleId, platform: "android", attachedAt: new Date().toISOString() };
     this.logBuffer.push(`[ADB] Attached to ${bundleId}`);
     return { ok: true };
   }
@@ -601,10 +732,32 @@ class MobileDebugAdapter implements DebugAdapter {
     try {
       const tail = options.logTailLines ?? 50;
 
+      if (this.platform === "ios") {
+        let logs: string[] = [];
+        try {
+          const logOutput = execSync(
+            `log show --predicate 'processImagePath CONTAINS "${this.info.identifier}"' --style compact --last 30s 2>/dev/null | tail -${tail}`,
+            { timeout: 5000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
+          );
+          logs = logOutput.split("\n").filter(Boolean);
+        } catch { logs = this.logBuffer.slice(-tail); }
+
+        let componentTree: unknown[] | undefined;
+        if (options.includeDOM !== false && this.udid) {
+          try {
+            const xml = execSync(`xcrun simctl accessibility ${this.udid} snapshot 2>/dev/null`, {
+              timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024,
+            });
+            componentTree = [{ iosAccessibility: xml.slice(0, 5000) }];
+          } catch { componentTree = [{ iosAccessibility: "unavailable" }]; }
+        }
+
+        return { ok: true, data: { componentTree, logs, networkErrors: [], timestamp: new Date().toISOString() } };
+      }
+
+      // Android
       const logcatOutput = execSync(`adb logcat -d -t ${tail} *:E`, {
-        timeout: 5000,
-        encoding: "utf-8",
-        maxBuffer: 1024 * 1024,
+        timeout: 5000, encoding: "utf-8", maxBuffer: 1024 * 1024,
       });
       const logs = logcatOutput.split("\n").slice(-tail);
 
@@ -612,25 +765,13 @@ class MobileDebugAdapter implements DebugAdapter {
       if (options.includeDOM !== false) {
         try {
           const uixml = execSync("adb shell uiautomator dump /dev/tmp/ui.xml && adb shell cat /dev/tmp/ui.xml", {
-            timeout: 10000,
-            encoding: "utf-8",
-            maxBuffer: 1024 * 1024,
+            timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024,
           });
           componentTree = [{ uiautomatorXml: uixml.slice(0, 5000) }];
-        } catch {
-          componentTree = [{ uiautomator: "unavailable" }];
-        }
+        } catch { componentTree = [{ uiautomator: "unavailable" }]; }
       }
 
-      return {
-        ok: true,
-        data: {
-          componentTree,
-          logs,
-          networkErrors: [],
-          timestamp: new Date().toISOString(),
-        },
-      };
+      return { ok: true, data: { componentTree, logs, networkErrors: [], timestamp: new Date().toISOString() } };
     } catch (e) {
       return { ok: false, error: `Mobile state capture failed: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -639,6 +780,54 @@ class MobileDebugAdapter implements DebugAdapter {
   async executeInteraction(params: InteractionParams): Promise<{ ok: boolean; error?: string }> {
     if (!this.info) return { ok: false, error: "No target attached" };
 
+    try {
+      if (this.platform === "ios") {
+        return this.executeIOSInteraction(params);
+      }
+      return this.executeAndroidInteraction(params);
+    } catch (e) {
+      return { ok: false, error: `Mobile interaction failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  private async executeIOSInteraction(params: InteractionParams): Promise<{ ok: boolean; error?: string }> {
+    if (!this.udid) return { ok: false, error: "No simulator UDID" };
+
+    switch (params.action) {
+      case "click": {
+        if (params.coordinates) {
+          execSync(`xcrun simctl tap ${this.udid} ${params.coordinates.x} ${params.coordinates.y}`, { timeout: 5000 });
+        }
+        return { ok: true };
+      }
+      case "type": {
+        if (params.value) {
+          const escaped = params.value.replace(/'/g, "'\\''");
+          execSync(`xcrun simctl spawn ${this.udid} input text '${escaped}'`, { timeout: 5000 });
+        }
+        return { ok: true };
+      }
+      case "key_combination": {
+        if (params.value) {
+          const key = params.value.split("+").pop()?.trim().toLowerCase();
+          if (key === "home") {
+            execSync(`xcrun simctl spawn ${this.udid} input keyevent 3`, { timeout: 5000 });
+          } else if (key === "lock" || key === "power") {
+            execSync(`xcrun simctl spawn ${this.udid} input keyevent 26`, { timeout: 5000 });
+          } else if (key === "volumeup") {
+            execSync(`xcrun simctl spawn ${this.udid} input keyevent 24`, { timeout: 5000 });
+          } else if (key === "volumedown") {
+            execSync(`xcrun simctl spawn ${this.udid} input keyevent 25`, { timeout: 5000 });
+          }
+        }
+        return { ok: true };
+      }
+      default:
+        return { ok: false, error: `Action ${params.action} not supported on iOS` };
+    }
+  }
+
+  private async executeAndroidInteraction(params: InteractionParams): Promise<{ ok: boolean; error?: string }> {
     try {
       switch (params.action) {
         case "click": {
@@ -714,6 +903,25 @@ class MobileDebugAdapter implements DebugAdapter {
   async applyHotfix(patch: HotfixPatch): Promise<{ ok: boolean; error?: string; result?: string }> {
     if (!this.info) return { ok: false, error: "No target attached" };
 
+    if (this.platform === "ios") {
+      switch (patch.patchType) {
+        case "env_override": {
+          try {
+            const targetPkg = this.info.identifier;
+            const key = patch.payload.split("=")[0];
+            const value = patch.payload.split("=").slice(1).join("=");
+            execSync(`defaults write ${targetPkg}.${key} ${value}`, { timeout: 5000 });
+            return { ok: true, result: `iOS env override attempted: ${patch.payload}` };
+          } catch (e) {
+            return { ok: false, error: `iOS env_override failed: ${e instanceof Error ? e.message : String(e)}` };
+          }
+        }
+        default:
+          return { ok: false, error: `Patch type ${patch.patchType} not supported for iOS targets` };
+      }
+    }
+
+    // Android
     switch (patch.patchType) {
       case "env_override": {
         try {
@@ -921,6 +1129,48 @@ export class DebugProvider {
 
   isAttached(): boolean {
     return this.currentAdapter?.isAttached() ?? false;
+  }
+
+  async verifyWorkspaceBeforeWrite(workspacePath: string): Promise<{ ok: boolean; error?: string; output?: string }> {
+    if (!existsSync(workspacePath)) {
+      return { ok: false, error: `Workspace path does not exist: ${workspacePath}` };
+    }
+
+    let testCommand: string | null = null;
+
+    const packageJsonPath = resolve(workspacePath, "package.json");
+    if (existsSync(packageJsonPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
+        if (pkg.scripts?.test && !pkg.scripts.test.includes('echo "Error: no test specified"')) {
+          testCommand = "npm test";
+        }
+      } catch {}
+    }
+
+    if (!testCommand && existsSync(resolve(workspacePath, "Cargo.toml"))) {
+      testCommand = "cargo test -- --quiet";
+    }
+
+    if (!testCommand && existsSync(resolve(workspacePath, "go.mod"))) {
+      testCommand = "go test ./...";
+    }
+
+    if (!testCommand) {
+      return { ok: true, output: "No test runner detected — skipping verification" };
+    }
+
+    try {
+      const output = execSync(testCommand, {
+        cwd: workspacePath,
+        timeout: 60000,
+        encoding: "utf-8",
+        maxBuffer: 1024 * 1024,
+      });
+      return { ok: true, output };
+    } catch (e) {
+      return { ok: false, error: `Tests failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
   }
 }
 
