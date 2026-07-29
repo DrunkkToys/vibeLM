@@ -10,6 +10,8 @@ import { SessionLog, type MemoryEntry, type SearchMemoryResult, type TurnEntry }
 import { configSchematics, DEFAULT_VIBE_BRIDGE_PROMPT, DEFAULT_VIBE_BRIDGE_INTERVAL, DEFAULT_VIBE_BRIDGE_MAX_DURATION } from "./config";
 import { DEFAULT_ENABLED_TOOL_NAMES, TOOL_TOGGLES } from "./toolSettings";
 import { getDebugProvider } from "./debugProvider";
+import { extractContent } from "./webFetch";
+import { webSearch } from "./webSearch";
 
 const LMSTUDIO_API_PORT = process.env.LMSTUDIO_API_PORT || "1234";
 const API_BASE = `http://localhost:${LMSTUDIO_API_PORT}`;
@@ -2030,22 +2032,6 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
   };
 }
 
-async function webSearch(query: string, maxResults: number = 5): Promise<Array<{ title: string; url: string; snippet: string }>> {
-  const config = readConfigSync();
-  const endpoint = (config as any).searchEndpoint || process.env.AGENTIC_SEARCH_ENDPOINT || "http://localhost:8394/search";
-  const url = `${endpoint}?q=${encodeURIComponent(query)}&format=json`;
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 15000);
-  let resp: Response;
-  try {
-    resp = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "AgenticTools/1.0" } });
-  } catch { clearTimeout(t); return []; }
-  clearTimeout(t);
-  if (!resp.ok) return [];
-  const data = await resp.json() as { results?: Array<{ title: string; url: string; snippet: string }> };
-  return (data.results || []).slice(0, maxResults);
-}
-
 function ok(data: unknown) {
   return { ok: true, data };
 }
@@ -2058,22 +2044,6 @@ export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashComman
 
 export async function toolsProvider(ctl: ToolsProviderController, client?: LMStudioClient | null) {
   _bridgeClient = client ?? null;
-  // Enforce user-configured context length by reloading the model if needed.
-  const configuredContextLength = readPluginConfigValue(ctl, ["tools.contextLength", "contextLength"]);
-  if (typeof configuredContextLength === "number" && configuredContextLength > 0 && _bridgeClient) {
-    try {
-      const loadedModels = await _bridgeClient.llm.listLoaded();
-      for (const model of loadedModels) {
-        const info = await model.getModelInfo();
-        if (info && typeof (info as any).contextLength === "number" && (info as any).contextLength !== configuredContextLength) {
-          console.log(`[AgenticTools] Reloading model ${model.identifier} with contextLength=${configuredContextLength} (was ${(info as any).contextLength})`);
-          await _bridgeClient.llm.load(model.identifier, { config: { contextLength: configuredContextLength } });
-        }
-      }
-    } catch (err) {
-      console.error("[AgenticTools] Failed to enforce contextLength:", err);
-    }
-  }
   // No force here: ToolsProviderController has no pullHistory() (unlike PromptPreprocessorController),
   // so a forced bootstrap can never read real history and always falls back to a fresh session — wiping
   // sessionId/turnCounter on every single call. toolsProvider() runs once per turn, so that discarded
@@ -2190,24 +2160,37 @@ EXAMPLE: get_config()`,
 
   const webFetchTool = wrapTool(tool({
     name: "web_fetch",
-    description: text`Fetches a URL and returns text content (max 500KB).
+    description: text`Fetches a URL and returns CLEAN extracted text (HTML stripped, boilerplate removed).
 USE WHEN: you need to read the actual content of a webpage. Call web_search first to find the URL.
-EXAMPLE: web_fetch({ url: "https://example.com", maxChars: 50000 })
-NOTE: Only returns text content. JavaScript-rendered content may not be captured.`,
+EXAMPLE: web_fetch({ url: "https://example.com", maxChars: 30000 })
+RETURNS: Clean markdown-like text with title, description, and main content only. Scripts, nav, ads, footers stripped.`,
     parameters: {
       url: z.string().url().describe("The URL to fetch"),
-      maxChars: z.number().int().min(100).max(500000).optional().default(50000).describe("Max chars (default 50000)"),
+      maxChars: z.number().int().min(100).max(200000).optional().default(30000).describe("Max chars of clean text (default 30000)"),
     },
     implementation: async ({ url, maxChars }) => {
       try {
         const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 15000);
-        const resp = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "LMStudio-AgenticTools/1.0" } });
+        const t = setTimeout(() => ctrl.abort(), 20000);
+        const resp = await fetch(url, {
+          signal: ctrl.signal,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,text/plain,application/json",
+          },
+        });
         clearTimeout(t);
         if (!resp.ok) return fail(`HTTP ${resp.status}`);
-        const text = await resp.text();
-        if (text.length > maxChars) return ok({ content: text.slice(0, maxChars), truncated: true, originalLength: text.length });
-        return ok({ content: text });
+        const contentType = resp.headers.get("content-type") || "";
+        const raw = await resp.text();
+
+        if (contentType.includes("text/plain") || contentType.includes("application/json")) {
+          if (raw.length > maxChars) return ok({ content: raw.slice(0, maxChars), truncated: true, originalLength: raw.length });
+          return ok({ content: raw, originalLength: raw.length });
+        }
+
+        const extracted = extractContent(raw, maxChars);
+        return ok(extracted);
       } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
     },
   }), "web_fetch");
@@ -2271,7 +2254,7 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
       if (!atTurnCap) {
         const plan = activeSessionState.plan;
         const untouched = plan?.steps.filter((s) => s.status === "pending") ?? [];
-        if (untouched.length > 0) {
+        if (untouched.length > 0 && activeSessionState.turnCounter < 3) {
           return {
             ok: false,
             error: `Plan "${plan!.goal}" still has ${untouched.length} untouched step(s), starting with "${untouched[0].description}". Execute it with your available tools (bash_terminal, file tools, etc.) and call update_plan_step, or call update_plan_step with status "blocked" and a note explaining why before calling amend.`,
@@ -2606,10 +2589,10 @@ NOTE: The working directory is the workspace root. Timeout defaults to 30s, max 
 
   const webSearchTool = wrapTool(tool({
     name: "web_search",
-    description: text`Searches the web and returns results with titles, snippets, and URLs.
+    description: text`Searches the web with multi-backend fallback (SearXNG, DuckDuckGo, Brave).
 USE WHEN: you need to find information on the internet, look up documentation, or research a topic.
 EXAMPLE: web_search({ query: "typescript decorators example", maxResults: 5 })
-NOTE: Call this first, then use web_fetch on the most relevant URLs to get full content.`,
+RETURNS: Deduplicated results with titles, snippets, and URLs. Auto-falls back if primary engine is down.`,
     parameters: {
       query: z.string().min(1).max(500).describe("Search query"),
       maxResults: z.number().int().min(1).max(10).optional().default(5).describe("Max results (default 5)"),
