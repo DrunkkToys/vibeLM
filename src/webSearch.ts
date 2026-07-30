@@ -16,12 +16,12 @@ export async function webSearch(query: string, maxResults: number = 5): Promise<
       headers: { "User-Agent": "AgenticTools/2.0" },
     });
     if (!resp.ok) return [];
-    const data = await resp.json() as { results?: Array<{ title: string; url: string; snippet: string }> };
+    const data = await resp.json() as { results?: Array<{ title: string; url: string; snippet: string; engine?: string }> };
     return (data.results || []).slice(0, maxResults).map(r => ({
       title: clean(r.title),
       url: r.url,
       snippet: clean(r.snippet),
-      engine: "searxng",
+      engine: r.engine || "unknown",
     }));
   } catch {
     return [];

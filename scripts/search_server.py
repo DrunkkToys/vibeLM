@@ -5,6 +5,7 @@ Endpoint: http://localhost:8394/search?q=...&format=json
 No API keys. No DuckDuckGo. No SearXNG. Just Bing RSS + XML."""
 
 import http.server
+import html
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -13,6 +14,35 @@ import urllib.request
 import ssl
 
 PORT = 8394
+
+def duckduckgo_search(query, max_results=5):
+    """Search DuckDuckGo's HTML endpoint before using the lower-relevance Bing fallback."""
+    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        page = urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()).read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+    pattern = re.compile(
+        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+        r'<(?:a|div)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    results = []
+    for href, raw_title, raw_snippet in pattern.findall(page):
+        redirect = html.unescape(href)
+        parsed = urllib.parse.urlparse(redirect)
+        target = urllib.parse.parse_qs(parsed.query).get("uddg", [redirect])[0]
+        title = re.sub(r"<[^>]+>", "", html.unescape(raw_title)).strip()
+        snippet = re.sub(r"<[^>]+>", "", html.unescape(raw_snippet)).strip()
+        if title and target:
+            results.append({"title": title, "url": target, "snippet": snippet[:300], "engine": "duckduckgo"})
+        if len(results) >= max_results:
+            break
+    return {"results": results}
+
 
 def bing_search(query, max_results=5):
     url = f"https://www.bing.com/search?format=rss&q={urllib.parse.quote(query)}&count={max_results}"
@@ -33,7 +63,7 @@ def bing_search(query, max_results=5):
             link = item.findtext("link", "").strip()
             desc = item.findtext("description", "").strip()
             if title and link:
-                results.append({"title": title, "url": link, "snippet": desc[:300]})
+                results.append({"title": title, "url": link, "snippet": desc[:300], "engine": "bing-rss"})
             if len(results) >= max_results:
                 break
         return {"results": results}
@@ -50,7 +80,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not query:
                 self.send_json({"results": [], "error": "missing q parameter"})
                 return
-            data = bing_search(query)
+            data = duckduckgo_search(query)
+            if not data["results"]:
+                data = bing_search(query)
             self.send_json(data)
         else:
             self.send_json({"error": "not found", "usage": "GET /search?q=...&format=json"})
