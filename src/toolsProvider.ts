@@ -31,6 +31,11 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 const PROMPT_BUDGET_RATIO = 0.30;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
+// A fetched document must never consume most of the model's context by itself. This is an
+// estimate rather than tokenizer-exact accounting, but it is deliberately conservative and is
+// enforced on the value returned to LM Studio, not just on the session-log copy.
+const DEFAULT_WEB_FETCH_MAX_TOKENS = 2048;
+const MAX_WEB_FETCH_TOKENS = 4096;
 // Importance tiers for how much of a tool result is kept verbatim on the turn log. Flat truncation
 // treated a 2 KB file read the same as a one-line failed probe; tiering keeps more of what carries
 // information (reads/searches) and less of the noise we already distil into a fact (failures).
@@ -1065,6 +1070,28 @@ export function estimateCharsFromTokens(tokens: number): number {
   return Math.max(1, tokens * 4);
 }
 
+export function capWebFetchContentToTokenBudget<T extends { content: string; truncated?: boolean; sourceUrl?: string }>(
+  result: T,
+  maxTokens = DEFAULT_WEB_FETCH_MAX_TOKENS,
+): T & { truncated: boolean; tokenBudget: number; omittedEstimatedTokens?: number } {
+  const tokenBudget = Math.min(MAX_WEB_FETCH_TOKENS, Math.max(128, Math.floor(maxTokens)));
+  const maxChars = estimateCharsFromTokens(tokenBudget);
+  if (result.content.length <= maxChars) return { ...result, truncated: Boolean(result.truncated), tokenBudget };
+
+  const marker = `\n\n[web_fetch truncated to fit the tool-result token budget; source: ${result.sourceUrl || "the requested URL"}. Fetch a more specific URL or request a focused follow-up.]\n\n`;
+  const available = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(available * 0.7);
+  const tailChars = available - headChars;
+  const omittedChars = result.content.length - available;
+  return {
+    ...result,
+    content: `${result.content.slice(0, headChars)}${marker}${result.content.slice(-tailChars)}`,
+    truncated: true,
+    tokenBudget,
+    omittedEstimatedTokens: estimateTokens("x".repeat(omittedChars)),
+  };
+}
+
 function hardPromptBudgetLimit(contextWindow: number): number {
   return Math.max(512, Math.floor(contextWindow * PROMPT_BUDGET_RATIO));
 }
@@ -1077,44 +1104,6 @@ export function finishInstruction(harmony: boolean): string {
   return harmony
     ? "reply directly with the best available handoff"
     : "call amend with the best available handoff";
-}
-
-function formatPromptBudgetHandoff(
-  contextWindow: number,
-  estimatedTokens: number,
-  mode: "workspace" | "multi-step" | "general",
-  harmony = false,
-  userMessage = "",
-): string {
-  // The returned string REPLACES the user's message (see recordProcessedPrompt's callers), so it has
-  // to carry that message forward. Without this the user's turn is silently dropped: reproduced live
-  // by lowering the trigger to 300 tokens and asking "now also tell me what day of the week it is" —
-  // the model answered with a summary of the previous echo commands and never addressed the question.
-  // That path was unreachable while history was read via Chat.toString() (it measured a ~19-char
-  // constant, so the budget was never approached), and became reachable the moment history was read
-  // correctly, which would have started eating user messages in long sessions.
-  // The replacement prompt is the only portion we control. Do not re-inject an unbounded newest
-  // request into it: that defeats the rollover guard for pasted logs/files. Preserve both ends so
-  // the task and its final constraint survive while the disposable middle is removed.
-  const request = shrinkTextAroundCenter(userMessage.trim(), Math.min(4096, estimateCharsFromTokens(Math.max(256, Math.floor(contextWindow / 16)))));
-  const carried = request
-    ? `\n[The user's latest message still needs an answer. Address it as part of that handoff:]\n${request}`
-    : "";
-  return `${MANAGED_CONTEXT_MARKER}
-[Budget warning: estimated ${estimatedTokens}/${contextWindow} tokens with a ${COMPACT_CONTEXT_SAFETY_MARGIN}-token safety margin.]
-[Action: preserve code verbatim, summarize only the actionable state, and ${finishInstruction(harmony)}.]${carried}
-[If the user wants a clean slate, tell them to start a new chat and paste the summary.]`;
-}
-
-export function shrinkTextAroundCenter(value: string, maxChars: number): string {
-  if (maxChars < 1 || value.length <= maxChars) return value;
-  if (maxChars <= 3) return value.slice(0, maxChars);
-  const marker = "\n…[middle omitted for context safety]…\n";
-  if (maxChars <= marker.length + 2) return `${value.slice(0, 1)}…${value.slice(-1)}`;
-  const available = maxChars - marker.length;
-  const headChars = Math.ceil(available / 2);
-  const tailChars = Math.floor(available / 2);
-  return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
 }
 
 export function buildPromptBudgetReport(
@@ -1146,13 +1135,6 @@ export function buildPromptBudgetReport(
     overflow: estimatedTokens > hardLimitTokens,
     nearLimit: estimatedTokens >= rollingWindowTriggerTokens,
   };
-}
-
-function shouldHandoffForPromptBudget(report: ReturnType<typeof buildPromptBudgetReport>): boolean {
-  // Rewrite at the proactive rolling threshold, not only after the host has already
-  // assembled an over-context request. The visible LM Studio counter may continue to
-  // show historical turns, but the next model request must be bounded before dispatch.
-  return report.nearLimit || report.overflow;
 }
 
 function estimateRecentSessionPromptTokens(session: SessionLog, state: SessionState): number {
@@ -2184,13 +2166,14 @@ EXAMPLE: get_config()`,
     name: "web_fetch",
     description: text`Fetches a URL and returns CLEAN extracted text (HTML stripped, boilerplate removed).
 USE WHEN: you need to read the actual content of a webpage. Call web_search first to find the URL.
-EXAMPLE: web_fetch({ url: "https://example.com", maxChars: 30000 })
-RETURNS: Clean markdown-like text with title, description, and main content only. Scripts, nav, ads, footers stripped.`,
+EXAMPLE: web_fetch({ url: "https://example.com", maxTokens: 2048 })
+RETURNS: Clean markdown-like text with title, description, and main content only. Scripts, nav, ads, footers stripped. Results are capped by tokens so one page cannot fill the chat context.`,
     parameters: {
       url: z.string().url().describe("The URL to fetch"),
-      maxChars: z.number().int().min(100).max(200000).optional().default(30000).describe("Max chars of clean text (default 30000)"),
+      maxTokens: z.number().int().min(128).max(MAX_WEB_FETCH_TOKENS).optional().default(DEFAULT_WEB_FETCH_MAX_TOKENS).describe("Maximum estimated tokens returned to the model (default 2048, maximum 4096)"),
+      maxChars: z.number().int().min(100).max(200000).optional().describe("Legacy optional character cap. When supplied, it can only reduce the token-budgeted result."),
     },
-    implementation: async ({ url, maxChars }) => {
+    implementation: async ({ url, maxTokens, maxChars }) => {
       try {
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 20000);
@@ -2205,14 +2188,20 @@ RETURNS: Clean markdown-like text with title, description, and main content only
         if (!resp.ok) return fail(`HTTP ${resp.status}`);
         const contentType = resp.headers.get("content-type") || "";
         const raw = await resp.text();
+        const tokenCharBudget = estimateCharsFromTokens(maxTokens);
+        const extractionCharBudget = typeof maxChars === "number" ? Math.min(maxChars, tokenCharBudget) : tokenCharBudget;
 
         if (contentType.includes("text/plain") || contentType.includes("application/json")) {
-          if (raw.length > maxChars) return ok({ content: raw.slice(0, maxChars), truncated: true, originalLength: raw.length });
-          return ok({ content: raw, originalLength: raw.length });
+          return ok(capWebFetchContentToTokenBudget({
+            content: raw.length > extractionCharBudget ? raw.slice(0, extractionCharBudget) : raw,
+            truncated: raw.length > extractionCharBudget,
+            originalLength: raw.length,
+            sourceUrl: url,
+          }, maxTokens));
         }
 
-        const extracted = extractContent(raw, maxChars);
-        return ok(extracted);
+        const extracted = extractContent(raw, extractionCharBudget);
+        return ok(capWebFetchContentToTokenBudget({ ...extracted, sourceUrl: url }, maxTokens));
       } catch (e) { return fail(String(e instanceof Error ? e.message : e)); }
     },
   }), "web_fetch");
@@ -3275,13 +3264,10 @@ DEBUGGING LOOP: This is step 3 of the debugging cycle. After capturing state (st
 async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorController): Promise<string | null> {
   const t = text.trim();
   await bootstrapSessionState(ctl as any);
-  const contextWindow = await getContextWindow(ctl as any);
   // Harmony families don't get the `amend` tool, so directives below must not tell them to call it.
   const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
-  const rollingWindowTriggerTokens = Math.floor(contextWindow * 0.50);
   const historyText = await getHistoryText(ctl);
   syncRuntimeState(historyText, activeSessionState);
-  const normalizedHistoryText = normalizeManagedContextHistory(historyText);
   const hasBlocksInHistory = hasManagedContext(historyText);
   const hasStoredBlocks = activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0;
   const managedContextPresent = hasBlocksInHistory || hasStoredBlocks;
@@ -3333,19 +3319,11 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   const steps = t.match(/^\d+\.\s/gm);
   if (steps && steps.length > 0) {
     if (managedContextPresent) {
-      const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-      if (shouldHandoffForPromptBudget(plainReport)) {
-        return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "multi-step", harmony, t));
-      }
       // Continuation: replace stale "follow all steps" instruction with a continue directive
       if (CONTINUATION_PATTERN.test(t)) {
         return recordProcessedPrompt(historyText, compactContinueInstruction(t));
       }
       return null;
-    }
-    const report = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-    if (shouldHandoffForPromptBudget(report)) {
-      return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "multi-step", harmony, t));
     }
     return recordProcessedPrompt(historyText, compactTaskReminder(steps.length, t, harmony));
   }
@@ -3362,10 +3340,6 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       const calcResp = await import("mathjs").then(m => m.evaluate(calcExpression));
       if (typeof calcResp === "number" || typeof calcResp === "string") {
         const processed = `[Tool executed: calculate → ${calcResp}]`;
-        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
-        if (shouldHandoffForPromptBudget(report)) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
-        }
         return recordProcessedPrompt(historyText, processed);
       }
     } catch {}
@@ -3381,10 +3355,6 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       if (results.length > 0) {
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`);
         const processed = `[Tool executed: web_search →\n${lines.join("\n")}]\n\n${t}`;
-        const report = buildPromptBudgetReport(normalizedHistoryText, processed, contextWindow, rollingWindowTriggerTokens);
-        if (shouldHandoffForPromptBudget(report)) {
-          return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, report.estimatedTokens, "general", harmony, t));
-        }
         return recordProcessedPrompt(historyText, processed);
       }
       return recordProcessedPrompt(historyText, `[Tool executed: web_search → no results found]`);
@@ -3393,10 +3363,6 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
     }
   }
 
-  const plainReport = buildPromptBudgetReport(normalizedHistoryText, t, contextWindow, rollingWindowTriggerTokens);
-  if (shouldHandoffForPromptBudget(plainReport)) {
-    return recordProcessedPrompt(historyText, formatPromptBudgetHandoff(contextWindow, plainReport.estimatedTokens, "general", harmony, t));
-  }
   // Continuation in managed-context session: prevent LLM from re-executing stale instructions.
   // (Rehydration of persisted managedContextBlocks after a context roll happens unconditionally,
   // one layer up in the preprocessMessage wrapper below — it no longer depends on CONTINUATION_PATTERN.)
