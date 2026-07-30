@@ -278,6 +278,30 @@ describe("toolResultForModel", () => {
   });
 });
 
+describe("web_fetch token budget", () => {
+  it("caps a huge fetched document before it can enter the model context", async () => {
+    const { capWebFetchContentToTokenBudget, estimateCharsFromTokens } = await import("../src/toolsProvider");
+    const source = `BEGIN${"x".repeat(100_000)}END`;
+    const capped = capWebFetchContentToTokenBudget({ content: source, truncated: false, sourceUrl: "https://example.com/report" }, 2048);
+
+    assert.ok(capped.content.length <= estimateCharsFromTokens(2048), "returned content must fit the requested token budget");
+    assert.match(capped.content, /web_fetch truncated to fit the tool-result token budget/);
+    assert.match(capped.content, /source: https:\/\/example\.com\/report/);
+    assert.match(capped.content, /^BEGIN/);
+    assert.match(capped.content, /END$/);
+    assert.equal(capped.truncated, true);
+    assert.ok((capped.omittedEstimatedTokens ?? 0) > 20_000, "the response reports the omitted scale");
+  });
+
+  it("does not alter a small fetched document", async () => {
+    const { capWebFetchContentToTokenBudget } = await import("../src/toolsProvider");
+    const result = capWebFetchContentToTokenBudget({ content: "small result", truncated: false, sourceUrl: "https://example.com" }, 2048);
+    assert.equal(result.content, "small result");
+    assert.equal(result.truncated, false);
+    assert.equal(result.omittedEstimatedTokens, undefined);
+  });
+});
+
 ;
 
 

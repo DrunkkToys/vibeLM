@@ -208,7 +208,7 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(autoCompactTrigger, 20320, "auto-compaction trigger should be ~20K (half the real 40K window)");
   });
 
-  it("hands off before the live prompt reaches the context window", async () => {
+  it("leaves an over-limit prompt to LM Studio's native rolling window", async () => {
     const { preprocessMessage } = await import("../src/toolsProvider");
     const history = "x".repeat(32768 * 2);
     const ctl: any = {
@@ -217,9 +217,7 @@ describe("vibeLM Cascade Integration", () => {
       getModelContextWindow: () => 32768,
     };
     const processed = await preprocessMessage("continue the benchmark", ctl);
-    assert.ok(processed, "a near-limit history must be rewritten before the host request is sent");
-    assert.match(processed as string, /Budget warning/i);
-    assert.match(processed as string, /continue the benchmark/);
+    assert.equal(processed, null, "vibeLM must not replace the user turn before native rollingWindow can run");
   });
 
   it("reasoningDirectiveFor maps effort + arch to each family's native thinking control", async () => {
@@ -1477,20 +1475,10 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(big.nearLimit, true, "history past the default 50% trigger must be flagged");
   });
 
-  it("the budget handoff carries the user's message instead of silently dropping it", async () => {
-    // Live regression, found by lowering the rolling-window trigger to 300 tokens: asking "now also
-    // tell me what day of the week it is" got a summary of the previous echo commands and no answer.
-    // The handoff directive REPLACES the user's message (recordProcessedPrompt's return value becomes
-    // the prompt), and it never included that message, so the turn was lost.
-    //
-    // This path was unreachable while history was read via Chat.toString() — the budget was never
-    // approached against a ~19-char constant — and became reachable the moment history was read
-    // correctly, so it would have started eating user turns in long sessions.
+  it("never replaces an over-budget user turn with vibeLM's handoff, leaving native rollingWindow in control", async () => {
     const { preprocessMessage, resolveSessionStateFromHistory, setLoadedModelInfoOverride } = await import("../src/toolsProvider");
     const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
     if (existsSync(rsPath)) rmSync(rsPath);
-    // `overflow` is measured against the hard budget derived from the model's context window (not the
-    // configurable rolling-window trigger), so shrink the window rather than the trigger.
     setLoadedModelInfoOverride({ arch: "qwen3_5", loadedContextLength: 2000 });
 
     // A conversation comfortably past that hard budget.
@@ -1501,34 +1489,16 @@ describe("vibeLM Cascade Integration", () => {
     };
 
     await resolveSessionStateFromHistory(ctl, true);
-    // The budget handoff is reachable from the multi-step branch (a numbered-list message) and the
-    // web_search branch, not from an ordinary follow-up — so the message has to be a numbered list
-    // for this path to be exercised at all.
     const question = "1. list the files\n2. summarize them\n3. write the summary to notes.md";
     const processed = await preprocessMessage(question, ctl);
 
-    assert.ok(processed, "an over-budget turn must still produce a prompt");
+    assert.ok(processed, "the ordinary multi-step directive must still be produced");
     const text = typeof processed === "string" ? processed : (processed as any).getText?.() ?? "";
-    assert.match(text, /Budget warning/, "guard: this test is only meaningful if the budget path actually fired");
+    assert.doesNotMatch(text, /\[Budget warning:/i);
     assert.ok(
       text.includes(question),
-      "the user's actual message must survive the budget handoff — dropping it is how a long session silently loses turns",
+      "the user's actual message must pass to LM Studio unchanged so its native rolling window can cut the middle on overflow",
     );
-  });
-
-  it("shrinks an oversized rollover request through its middle before it reaches the model", async () => {
-    const { buildPromptBudgetReport, estimateCharsFromTokens, shrinkTextAroundCenter } = await import("../src/toolsProvider") as any;
-    const contextWindow = 32_768;
-    const report = buildPromptBudgetReport("x".repeat(estimateCharsFromTokens(10_000)), "continue", contextWindow, 9_830);
-
-    assert.equal(report.nearLimit, true, "the 30% safety budget must trigger before a 32K chat approaches host OOM territory");
-
-    const original = `BEGIN-REQUIRED\n${"middle ".repeat(20_000)}\nEND-REQUIRED`;
-    const shrunk = shrinkTextAroundCenter(original, 4_096);
-    assert.ok(shrunk.length <= 4_096, "the replacement prompt must have a hard size bound");
-    assert.match(shrunk, /^BEGIN-REQUIRED/, "keep the task-bearing head");
-    assert.match(shrunk, /END-REQUIRED$/, "keep the final constraint");
-    assert.match(shrunk, /middle omitted for context safety/, "drop the nonessential center instead of expanding the handoff");
   });
 
   it("budget report uses the full loaded context length for its 50% trigger (no effectiveContextWindow cap)", async () => {
