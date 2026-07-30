@@ -217,6 +217,20 @@ describe("webSearch", () => {
     assert.deepEqual(results, []);
   });
 
+  it("preserves the backend name returned by the local search proxy", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      results: [{ title: "Kimi Linear", url: "https://arxiv.org/abs/2510.26692", snippet: "paper", engine: "duckduckgo" }],
+    }));
+    try {
+      const { webSearch } = await import("../src/toolsProvider");
+      const results = await webSearch("Kimi Delta Attention", 5);
+      assert.equal(results[0].engine, "duckduckgo");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("returns empty array when fetch returns non-ok status", async () => {
     globalThis.fetch = async () => new Response("", { status: 500 });
     const { webSearch } = await import("../src/toolsProvider");
@@ -249,6 +263,18 @@ describe("webSearch", () => {
     const { webSearch } = await import("../src/toolsProvider");
     const results = await webSearch("test", 5);
     assert.deepEqual(results, []);
+  });
+});
+
+describe("toolResultForModel", () => {
+  it("converts expected failures only at the live LM Studio tool boundary", async () => {
+    const { toolResultForModel } = await import("../src/toolsProvider");
+    const failure = { ok: false, error: "Path not found" };
+    assert.equal(toolResultForModel(failure), failure, "internal callers retain structured failures");
+    const liveResult = toolResultForModel(failure, { status: () => undefined });
+    assert.equal(typeof liveResult, "string");
+    assert.match(liveResult as string, /Tool failed: Path not found/);
+    assert.match(liveResult as string, /Continue the conversation/i);
   });
 });
 

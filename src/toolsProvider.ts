@@ -1948,19 +1948,19 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
 
       if (maxTurns > 0 && name !== "amend" && state.turnCounter > maxTurns) {
         const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
-        return {
+        return toolResultForModel({
           ok: false,
           error: `Max turns (${maxTurns}) exceeded. ${finishInstruction(harmony)}.`,
-        };
+        }, ctx);
       }
 
       const looped = detectRepeatedToolSignature(state, name, toolSignature(name, args), coarseToolSignature(name, args));
       if (looped) {
         const harmony = usesHarmonyFinalChannel(await getLoadedModelArch());
-        return {
+        return toolResultForModel({
           ok: false,
           error: `Loop detected: tool "${looped}" has been called repeatedly without making progress (same call or same command probed with different arguments). Stop retrying the same approach — the earlier results already tell you what you need. Change strategy, or ${finishInstruction(harmony)}.`,
-        };
+        }, ctx);
       }
 
       console.log(`[AgenticTools] [turn ${state.turnCounter}] Tool: ${name}`);
@@ -2027,7 +2027,11 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
       }
 
       syncRuntimeState(undefined, state);
-      return result;
+      // LM Studio treats a rejected tool promise as a terminal tool-call error. Never let an
+      // expected operational failure (missing file, network outage, denied command, etc.) take
+      // that path: the model must receive a normal result so it can explain the failure or try a
+      // different tool. Keep `result` unchanged above for the guard, session log, and memory.
+      return toolResultForModel(result, ctx);
     },
   };
 }
@@ -2038,6 +2042,24 @@ function ok(data: unknown) {
 
 function fail(msg: string) {
   return { ok: false, error: msg };
+}
+
+/**
+ * Convert expected tool failures into ordinary, actionable tool output at the LM Studio boundary.
+ * Internally we retain `{ ok: false }` so outcome classification and loop prevention still work.
+ */
+export function toolResultForModel(result: unknown, toolCallContext?: unknown): unknown {
+  // Unit callers and background helpers use the structured result to inspect `ok`/`error`.
+  // The live SDK provides `status()` for every real model tool call; only that boundary needs the
+  // non-terminal text form that keeps LM Studio generating after an expected tool failure.
+  if (!toolCallContext || typeof (toolCallContext as { status?: unknown }).status !== "function") return result;
+  if (result && typeof result === "object" && (result as { ok?: unknown }).ok === false) {
+    const error = typeof (result as { error?: unknown }).error === "string"
+      ? (result as { error: string }).error
+      : "The tool could not complete the requested operation.";
+    return `Tool failed: ${error}\nContinue the conversation: explain the failure or choose a different tool/approach. Do not stop solely because this tool failed.`;
+  }
+  return result;
 }
 
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashCommandSafety };
