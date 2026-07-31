@@ -1,8 +1,9 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 const TEST_DIR = resolve(tmpdir(), `vibelm-cascade-test-${Date.now()}`);
 const CONFIG_DIR = resolve(tmpdir(), `vibelm-cascade-data-${Date.now()}`);
@@ -62,6 +63,23 @@ describe("vibeLM Cascade Integration", () => {
     // test would otherwise leak forward into tests that expect no plan/no managed-context yet.
     const rsPath = resolve(CONFIG_DIR, "runtime-state.json");
     if (existsSync(rsPath)) rmSync(rsPath);
+  });
+
+  it("returns an actionable normal result to LM Studio when a tool fails", async () => {
+    const { toolResultForModel } = await import("../src/toolsProvider");
+    const result = toolResultForModel({ ok: false, error: "Path not found: /missing" }, { status: () => undefined });
+    assert.equal(typeof result, "string");
+    assert.match(result as string, /Tool failed: Path not found: \/missing/);
+    assert.match(result as string, /Continue the conversation/i);
+  });
+
+  it("blocks LM Studio Hub publishing unless this exact commit has the matching release tag", () => {
+    const result = spawnSync(process.execPath, ["scripts/verify-hub-release.mjs"], {
+      cwd: resolve(import.meta.dirname, ".."),
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0, "an untagged development commit must not be publishable to Hub");
+    assert.match(`${result.stdout}\n${result.stderr}`, /release tag|tagged commit/i);
   });
 
   after(() => {
@@ -137,6 +155,24 @@ describe("vibeLM Cascade Integration", () => {
     assert.match(String(result.error), /passive handoff/i);
   });
 
+  it("lets amend escape an untouched plan after three tool turns instead of looping forever", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl = makeCtl({ maxOrchestratorTurns: 50 });
+    await resolveSessionStateFromHistory(ctl, true);
+    const tools = await toolsProvider(ctl);
+    const createPlan = tools.find((t: any) => t.name === "create_plan");
+    const getPlan = tools.find((t: any) => t.name === "get_plan");
+    const amend = tools.find((t: any) => t.name === "amend");
+    assert.ok(createPlan && getPlan && amend, "plan and amend tools must be present");
+
+    await createPlan.implementation({ goal: "Investigate the issue", steps: ["Gather evidence"] });
+    const blocked = await amend.implementation({ text: "I need to report the blocker." });
+    assert.ok(!blocked?.ok, "amend must still reject an untouched plan during the first two turns");
+    await getPlan.implementation({});
+    const escaped = await amend.implementation({ text: "I need to report the blocker." });
+    assert.ok(escaped?.ok, "amend must allow a bounded escape after three tool turns");
+  });
+
   it("should allow amend when at turn cap even for passive text", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 2 }));
@@ -159,6 +195,42 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(!toolNames.includes("generate_uuid"), "disabled generate_uuid should not be exposed");
     assert.ok(!toolNames.includes("generate_password"), "disabled generate_password should not be exposed");
     assert.ok(toolNames.includes("amend"), "amend must remain exposed");
+  });
+
+  it("keeps disabled tools out of the unattended vibe_bridge capability set", async () => {
+    const { resolveBridgeTickToolNames } = await import("../src/toolsProvider");
+    const enabled = resolveBridgeTickToolNames(["vibe_bridge", "read_file", "get_plan"]);
+    assert.deepEqual(enabled, ["read_file", "get_plan"]);
+    assert.ok(!enabled.includes("write_file"), "a disabled write_file tool must never be available to a bridge tick");
+  });
+
+  it("redacts SSH credentials before persisting a tool turn", async () => {
+    const { sanitizeToolArgsForLog } = await import("../src/toolsProvider");
+    const serialized = JSON.stringify(sanitizeToolArgsForLog({
+      host: "server.example",
+      password: "do-not-persist-me",
+      nested: { apiToken: "also-secret" },
+    }));
+    assert.doesNotMatch(serialized, /do-not-persist-me|also-secret/);
+    assert.match(serialized, /\[REDACTED\]/);
+  });
+
+  it("rejects file writes through a workspace symlink that points outside", async () => {
+    const outside = resolve(TEST_DIR, "..", `vibelm-outside-${Date.now()}`);
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, resolve(TEST_DIR, "outside-link"));
+    try {
+      const { toolsProvider } = await import("../src/toolsProvider");
+      const tools = await toolsProvider(makeCtl());
+      const writeFile = tools.find((tool: any) => tool.name === "write_file");
+      const result = await writeFile.implementation({ filePath: "outside-link/escaped.txt", content: "nope" });
+      assert.ok(!result.ok);
+      assert.match(result.error, /outside the workspace/);
+      assert.ok(!existsSync(resolve(outside, "escaped.txt")));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+      rmSync(resolve(TEST_DIR, "outside-link"), { force: true });
+    }
   });
 
   it("should export configSchematics", () => {

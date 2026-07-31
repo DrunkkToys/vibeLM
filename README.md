@@ -101,7 +101,7 @@ In LM Studio plugin settings (`tools.*`):
 | `tools.vibe_bridge_interval` | number | `600` | Seconds between injections |
 | `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
 
-Each keep-alive tick can call a curated set of tools (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at `Max Thinking Steps` prediction rounds (default 8, configurable via `tools.maxThinkingSteps`) and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
+Each keep-alive tick can call only the curated tools that are also explicitly enabled in plugin settings (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at `Max Thinking Steps` prediction rounds (default 8, configurable via `tools.maxThinkingSteps`) and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
 
 ## How It Works
 
@@ -169,15 +169,17 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full release history.
 ## Publishing
 
 - GitHub Releases: push a tag like `v0.1.0`. The release workflow should build, test, and attach a plugin artifact.
-- LM Studio community: run `lms push` from the plugin directory after logging in to LM Studio.
+- LM Studio community: only publish an intentional, tagged release with `npm run publish:hub`. It refuses a dirty tree, a version without its matching `vX.Y.Z` tag, or a tag that does not point to the current commit. Do not call `lms push` directly.
 - The manifest name stays `vibe-lm` because LM Studio expects kebab-case.
 - If you need an organization publish target, change the `owner` field in `manifest.json` before pushing.
 
 ## Security
 
-- File tools are sandboxed to the configured workspace.
+- File tools are sandboxed to the configured workspace, including symlink-aware containment checks.
 - Traversal paths like `../` are rejected.
 - Binary files are blocked from `read_file`.
 - `calculate` uses `mathjs`, not raw code execution.
+- Persistent turn logs redact secret-bearing argument fields such as passwords, tokens, and API keys.
+- Debug hotfixes are CSS-only. Arbitrary JavaScript evaluation and DOM mutation are intentionally unavailable.
 - `bash_terminal` runs with user-level permissions, through your login shell (`$SHELL -ilc`) so it
   sees the same `PATH` a real terminal would — including anything added by nvm, Homebrew, asdf, etc.

@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "lms dev",
-    "push": "lms push",
+    "push": "npm run publish:hub",
+    "publish:hub": "node scripts/verify-hub-release.mjs && lms push",
     "build": "tsc",
     "build:prod": "./build.sh",
     "test": "node --import tsx --test tests/*.test.ts",

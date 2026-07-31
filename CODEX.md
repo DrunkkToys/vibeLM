@@ -36,7 +36,7 @@ docs: update README
 
 ### Releasing
 - Publishing happens by pushing a `vX.Y.Z` tag (not by merging). The tag triggers `release.yml` → GitHub Release + npm publish.
-- LM Studio Hub publish self-skips on hosted runners (no `lms` CLI); do it manually with `lms push` if needed.
+- LM Studio Hub publish self-skips on hosted runners (no `lms` CLI); after a tagged release, use `npm run publish:hub` if needed. Never call `lms push` directly: the wrapper verifies the version tag points to the exact clean commit.
 
 ## Skills
 
