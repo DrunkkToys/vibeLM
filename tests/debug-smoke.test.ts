@@ -44,13 +44,13 @@ describe("DebugProvider smoke tests", () => {
   });
 
   it("safety: validates hotfix payloads", () => {
-    assert.equal(validateHotfixSafety({ patchType: "js_eval", payload: "1+1" }), null);
-    // dom_mutate dangerous check fires regardless of workspacePath
-    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" })!, /dangerous/);
-    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "fetch('https://evil.com')" })!, /dangerous/);
-    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" }, "/workspace")!, /dangerous/);
-    assert.match(validateHotfixSafety({ patchType: "env_override", payload: "API_KEY=secret" })!, /sensitive/);
-    assert.equal(validateHotfixSafety({ patchType: "env_override", payload: "PORT=3000" }), null);
+    assert.match(validateHotfixSafety({ patchType: "js_eval", payload: "1+1" })!, /not supported/);
+    // Arbitrary DOM mutation is deliberately unavailable rather than protected by a bypassable denylist.
+    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" })!, /not supported/);
+    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "fetch('https://evil.com')" })!, /not supported/);
+    assert.match(validateHotfixSafety({ patchType: "dom_mutate", payload: "document.cookie" }, "/workspace")!, /not supported/);
+    assert.match(validateHotfixSafety({ patchType: "env_override", payload: "API_KEY=secret" })!, /not supported/);
+    assert.match(validateHotfixSafety({ patchType: "env_override", payload: "PORT=3000" })!, /not supported/);
   });
 
   it("desktop: spawn a process, capture logs, then detach", async () => {

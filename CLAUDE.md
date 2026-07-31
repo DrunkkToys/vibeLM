@@ -2,6 +2,14 @@
 
 ## Rules
 
+### Authorization Boundary — Mandatory
+
+- Treat requests to **inspect, check, diagnose, review, test, or report** as read-only. Do not infer permission to change anything.
+- Make a change only after the user explicitly authorizes that exact class of change. If a proposed fix needs another action, explain it and obtain approval first.
+- Without explicit authorization, never start, stop, restart, install, uninstall, enable, disable, move, or edit an LM Studio app, plugin, model, process, conversation, chat setting, server, or any file under `~/.lmstudio`.
+- Without explicit authorization, never create branches, commits, tags, releases, pull requests, pushes, publishes, or change versioning/release configuration.
+- Before every external or persistent mutation, state the target and effect. Never bundle unrelated changes into a fix.
+
 1. **Always run tests before committing** — `npm test`
 2. **Always run build before pushing** — `./build.sh`
 3. **Never commit broken code** — fix errors first
@@ -35,4 +43,4 @@ Reusable workflows live in `.claude/skills/`. Prefer them over improvising:
 
 - Publishing happens by pushing a `v*` tag, not by merging. `release.yml` handles GitHub Release + npm (`NPM_TOKEN`).
 - `main` requires 1 approving review; on this solo repo that means an **admin merge** (`gh pr merge <#> --merge --admin`). An agent's `--admin` is blocked by the safety classifier — surface the command for the human rather than working around it.
-- The **LM Studio Hub** publish step self-skips on hosted runners (no `lms` CLI). Real hub publish needs a self-hosted runner or a manual `lms push` from the desktop app.
+- The **LM Studio Hub** publish step self-skips on hosted runners (no `lms` CLI). After a tagged release, use `npm run publish:hub` from the desktop app. Never call `lms push` directly: the wrapper verifies the version tag points to the exact clean commit.

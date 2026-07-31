@@ -1,6 +1,6 @@
 import { WebSocket } from "ws";
 import { spawn, type ChildProcess } from "child_process";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve, dirname } from "path";
 
@@ -247,11 +247,7 @@ class WebDebugAdapter implements DebugAdapter {
     try {
       switch (patch.patchType) {
         case "js_eval": {
-          const result = await this.cdpCommand("Runtime.evaluate", {
-            expression: patch.payload,
-            returnByValue: true,
-          });
-          return { ok: true, result: JSON.stringify((result as any)?.result?.value ?? "(void)") };
+          return { ok: false, error: "js_eval is not supported: arbitrary JavaScript is not a safe debug hotfix boundary." };
         }
         case "css_inject": {
           const escaped = patch.payload.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
@@ -261,11 +257,7 @@ class WebDebugAdapter implements DebugAdapter {
           return { ok: true };
         }
         case "dom_mutate": {
-          const result = await this.cdpCommand("Runtime.evaluate", {
-            expression: `(function() { ${patch.payload} })()`,
-            returnByValue: true,
-          });
-          return { ok: true, result: JSON.stringify((result as any)?.result?.value ?? "(void)") };
+          return { ok: false, error: "dom_mutate is not supported: use a source change or a CSS-only hotfix." };
         }
         case "env_override": {
           return { ok: false, error: "env_override not supported for web targets" };
@@ -513,7 +505,7 @@ func traverse(element: AXUIElement, depth: Int) -> [String: Any] {
 
     var value: CFTypeRef?
     AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
-    if let v = value { attrs["value"] = "\(v)" }
+    if let v = value { attrs["value"] = "\\(v)" }
 
     var pos: CFTypeRef?
     AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &pos)
@@ -548,10 +540,12 @@ let tree = traverse(element: appElement, depth: 0)
 let jsonData = try! JSONSerialization.data(withJSONObject: tree)
 print(String(data: jsonData, encoding: .utf8)!)
 `;
-        const output = execSync(
-          `echo ${JSON.stringify(swiftScript)} | swift -`,
-          { timeout: 10000, encoding: "utf-8", maxBuffer: 1024 * 1024 }
-        );
+        const output = execFileSync("swift", ["-"], {
+          input: swiftScript,
+          timeout: 10000,
+          encoding: "utf-8",
+          maxBuffer: 1024 * 1024,
+        });
         try {
           return [JSON.parse(output.trim())];
         } catch {
@@ -679,6 +673,9 @@ class MobileDebugAdapter implements DebugAdapter {
 
   async attach(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
     const bundleId = params.identifier;
+    if (!/^[A-Za-z0-9._-]+$/.test(bundleId)) {
+      return { ok: false, error: "Invalid mobile bundle identifier" };
+    }
 
     // Try iOS first (if simctl is available)
     if (process.platform === "darwin") {
@@ -902,44 +899,7 @@ class MobileDebugAdapter implements DebugAdapter {
 
   async applyHotfix(patch: HotfixPatch): Promise<{ ok: boolean; error?: string; result?: string }> {
     if (!this.info) return { ok: false, error: "No target attached" };
-
-    if (this.platform === "ios") {
-      switch (patch.patchType) {
-        case "env_override": {
-          try {
-            const targetPkg = this.info.identifier;
-            const key = patch.payload.split("=")[0];
-            const value = patch.payload.split("=").slice(1).join("=");
-            execSync(`defaults write ${targetPkg}.${key} ${value}`, { timeout: 5000 });
-            return { ok: true, result: `iOS env override attempted: ${patch.payload}` };
-          } catch (e) {
-            return { ok: false, error: `iOS env_override failed: ${e instanceof Error ? e.message : String(e)}` };
-          }
-        }
-        default:
-          return { ok: false, error: `Patch type ${patch.patchType} not supported for iOS targets` };
-      }
-    }
-
-    // Android
-    switch (patch.patchType) {
-      case "env_override": {
-        try {
-          const targetPkg = this.info.identifier;
-          const key = patch.payload.split("=")[0];
-          const value = patch.payload.split("=").slice(1).join("=");
-          execSync(
-            `adb shell am broadcast -a debug.setProperty --es key "${key}" --es value "${value}" -p ${targetPkg}`,
-            { timeout: 5000 }
-          );
-          return { ok: true, result: `Environment override attempted: ${patch.payload}` };
-        } catch (e) {
-          return { ok: false, error: `env_override failed: ${e instanceof Error ? e.message : String(e)}` };
-        }
-      }
-      default:
-        return { ok: false, error: `Patch type ${patch.patchType} not supported for mobile targets` };
-    }
+    return { ok: false, error: `Patch type ${patch.patchType} is not supported for mobile targets; use a source change instead.` };
   }
 
   getInfo(): DebugTargetInfo | null {
@@ -1018,26 +978,11 @@ export function validateHotfixSafety(
   patch: HotfixPatch,
   workspacePath?: string
 ): string | null {
-  if (patch.patchType === "dom_mutate") {
-    const dangerousPatterns = [
-      /document\.cookie/i,
-      /fetch\s*\(/i,
-      /XMLHttpRequest/i,
-      /localStorage\.clear/i,
-      /indexedDB\.deleteDatabase/i,
-    ];
-    for (const p of dangerousPatterns) {
-      if (p.test(patch.payload)) {
-        return `Hotfix payload contains potentially dangerous operation: ${p.source}`;
-      }
-    }
+  if (patch.patchType === "js_eval" || patch.patchType === "dom_mutate") {
+    return `${patch.patchType} is not supported: arbitrary JavaScript is not a safe debug hotfix boundary.`;
   }
-  if (patch.patchType === "env_override" && patch.payload.includes("=")) {
-    const key = patch.payload.split("=")[0].trim();
-    const sensitive = ["API_KEY", "SECRET", "PASSWORD", "TOKEN", "CREDENTIAL"];
-    if (sensitive.some((s) => key.toUpperCase().includes(s))) {
-      return `Refusing to override sensitive environment variable: ${key}`;
-    }
+  if (patch.patchType === "env_override") {
+    return "env_override is not supported: use an explicit, user-managed runtime configuration change instead.";
   }
   return null;
 }

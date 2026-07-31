@@ -1,7 +1,7 @@
 import { text, tool, Chat, LMStudioClient, type PromptPreprocessorController, type ToolsProviderController } from "@lmstudio/sdk";
 import { z } from "zod";
 import { writeFile, appendFile, unlink, mkdir, rm } from "fs/promises";
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync, mkdirSync, writeFileSync } from "fs";
 import { resolve, dirname, relative, extname } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
@@ -536,12 +536,45 @@ function sandboxPath(workspace: string, requestedPath: string): string {
     requestedPath === "~" || requestedPath.startsWith("~/")
       ? resolve(homedir(), requestedPath.slice(2))
       : requestedPath;
-  const resolved = resolve(workspace, expandedPath);
-  const rel = relative(workspace, resolved);
+  const canonicalWorkspace = realpathSync(workspace);
+  const resolved = resolve(canonicalWorkspace, expandedPath);
+  const rel = relative(canonicalWorkspace, resolved);
   if (rel.startsWith("..") || resolve(rel) === rel) {
     throw new Error(`Path "${requestedPath}" is outside the workspace "${workspace}"`);
   }
+
+  // `resolve` only checks the lexical path. Follow the nearest existing ancestor so a symlink
+  // inside the workspace cannot redirect reads or writes outside it. lstat catches dangling final
+  // symlinks too: existsSync returns false for them, but writeFile would still follow one.
+  let existing = resolved;
+  while (true) {
+    try {
+      lstatSync(existing);
+      break;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) throw new Error(`Path "${requestedPath}" is outside the workspace "${workspace}"`);
+      existing = parent;
+    }
+  }
+  const canonicalExisting = realpathSync(existing);
+  const existingRel = relative(canonicalWorkspace, canonicalExisting);
+  if (existingRel.startsWith("..") || resolve(existingRel) === existingRel) {
+    throw new Error(`Path "${requestedPath}" is outside the workspace "${workspace}"`);
+  }
   return resolved;
+}
+
+const SENSITIVE_ARG_KEY = /(?:password|passphrase|secret|token|api[_-]?key|credential|authorization)/i;
+
+/** Strip credentials from durable turn logs while retaining enough context to diagnose a call. */
+export function sanitizeToolArgsForLog(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeToolArgsForLog);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, nested]) => [
+    key,
+    SENSITIVE_ARG_KEY.test(key) ? "[REDACTED]" : sanitizeToolArgsForLog(nested),
+  ]));
 }
 
 let globalSessionLog: SessionLog | null = null;
@@ -1969,7 +2002,7 @@ function wrapTool(toolDef: any, name: string, sessionState: SessionState = activ
         turn: state.turnCounter,
         role: "tool",
         content: name,
-        toolCalls: [{ name, args: JSON.stringify(args), result: serializedResult }],
+        toolCalls: [{ name, args: JSON.stringify(sanitizeToolArgsForLog(args)), result: serializedResult }],
       };
       log.startTurn(turnEntry);
       // Distil the call into a compact, deduplicable fact rather than dumping the raw result blob.
@@ -2042,6 +2075,18 @@ export function toolResultForModel(result: unknown, toolCallContext?: unknown): 
     return `Tool failed: ${error}\nContinue the conversation: explain the failure or choose a different tool/approach. Do not stop solely because this tool failed.`;
   }
   return result;
+}
+
+const BRIDGE_TICK_TOOL_NAMES = [
+  "explore_workspace", "list_files", "read_file", "write_file", "append_file",
+  "search_files", "save_memory", "search_memory", "web_fetch", "web_search",
+  "create_plan", "update_plan_step", "get_plan",
+] as const;
+
+/** The autonomous runner may only receive tools explicitly enabled for the interactive session. */
+export function resolveBridgeTickToolNames(enabledNames: readonly string[]): string[] {
+  const enabled = new Set(enabledNames);
+  return BRIDGE_TICK_TOOL_NAMES.filter((name) => enabled.has(name));
 }
 
 export { webSearch, binaryExtCheck, pickBestModel, VLM_PATTERNS, checkBashCommandSafety };
@@ -2996,11 +3041,15 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         // create_plan IS included (unlike before): a tick that finds an empty plan.steps had no way
         // to fix that itself, since plans were previously only ever created from the interactive
         // channel — leaving an unattended session permanently stuck with no steps to work from.
-        const bridgeTickTools = [
-          exploreWorkspaceTool, listFilesTool, readFileTool, writeFileTool, appendFileTool,
-          searchFilesTool, saveMemoryTool, searchMemoryTool, webFetchTool, webSearchTool,
-          createPlanTool, updatePlanStepTool, getPlanTool,
-        ];
+        const bridgeToolMap: Record<string, any> = {
+          explore_workspace: exploreWorkspaceTool, list_files: listFilesTool, read_file: readFileTool,
+          write_file: writeFileTool, append_file: appendFileTool, search_files: searchFilesTool,
+          save_memory: saveMemoryTool, search_memory: searchMemoryTool, web_fetch: webFetchTool,
+          web_search: webSearchTool, create_plan: createPlanTool, update_plan_step: updatePlanStepTool,
+          get_plan: getPlanTool,
+        };
+        const bridgeTickTools = resolveBridgeTickToolNames(resolveEnabledToolNames(ctl))
+          .map((name) => bridgeToolMap[name]);
         const bridgeTickMaxTokens = resolveBridgeTickMaxTokens(await getLoadedModelArch());
         await model.act(chat, bridgeTickTools, {
           maxPredictionRounds: resolveMaxThinkingSteps(ctl),
