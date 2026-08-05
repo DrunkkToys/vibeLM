@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
 import { spawn, type ChildProcess } from "child_process";
 import { execSync, execFileSync } from "child_process";
+import { createHash } from "crypto";
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve, dirname } from "path";
 
@@ -103,6 +104,8 @@ class WebDebugAdapter implements DebugAdapter {
     }
 
     try {
+      // Never abandon a live socket by overwriting the reference.
+      if (this.ws) this.cleanup();
       this.ws = new WebSocket(wsUrl);
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("WebSocket connection timeout")), 5000);
@@ -269,8 +272,23 @@ class WebDebugAdapter implements DebugAdapter {
         }
         case "css_inject": {
           const escaped = patch.payload.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
+          // Key the injected <style> by its content so re-applying the same
+          // hotfix updates that element in place instead of appending another
+          // node every time. Re-capturing state and re-applying is the normal
+          // debugging rhythm, so the naive append grew the DOM without bound.
+          // Distinct payloads still get their own element and still compose.
+          const key = createHash("sha1").update(patch.payload).digest("hex").slice(0, 16);
           await this.cdpCommand("Runtime.evaluate", {
-            expression: `(function() { var s = document.createElement('style'); s.textContent = \`${escaped}\`; document.head.appendChild(s); })()`,
+            expression: `(function() {
+              var k = ${JSON.stringify(key)};
+              var s = document.querySelector('style[data-vibelm-hotfix="' + k + '"]');
+              if (!s) {
+                s = document.createElement('style');
+                s.setAttribute('data-vibelm-hotfix', k);
+                document.head.appendChild(s);
+              }
+              s.textContent = \`${escaped}\`;
+            })()`,
           });
           return { ok: true };
         }
@@ -1052,6 +1070,8 @@ export class DebugProvider {
   private adapters: Map<TargetType, DebugAdapter>;
   private currentAdapter: DebugAdapter | null = null;
   private safetyBoundary: SafetyBoundary = {};
+  /** Serializes attachTarget so overlapping calls cannot race on the socket. */
+  private attachChain: Promise<void> = Promise.resolve();
 
   constructor() {
     this.adapters = new Map<TargetType, DebugAdapter>([
@@ -1069,7 +1089,20 @@ export class DebugProvider {
     this.safetyBoundary = boundary;
   }
 
+  /**
+   * Attaches run one at a time. Two overlapping attachTarget calls used to race
+   * on the adapter's socket and both fail, leaving nothing attached — easy to
+   * hit when a model emits two tool calls in the same round.
+   */
   async attachTarget(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
+    const run = this.attachChain
+      .catch(() => {})
+      .then(() => this.attachTargetSerialized(params));
+    this.attachChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  private async attachTargetSerialized(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
     if (this.currentAdapter?.isAttached()) {
       await this.currentAdapter.detach();
     }

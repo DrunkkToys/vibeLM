@@ -144,6 +144,36 @@ describe("debug loop against a live CDP target", { skip: LIVE ? false : "set VIB
     );
   });
 
+  it("A5b: re-applying the same css_inject does not accumulate style nodes", async () => {
+    const dp = getDebugProvider();
+    const countStyles = () => target.page.evaluate(() => document.querySelectorAll("style").length);
+
+    const payload = "#result { outline: 3px solid magenta; }";
+    await dp.applyHotfix({ patchType: "css_inject", payload });
+    const afterFirst = await countStyles();
+
+    // Capture -> re-apply is the normal debugging rhythm, so the same hotfix
+    // landing several times must update in place rather than grow the DOM.
+    for (let i = 0; i < 4; i++) {
+      const res = await dp.applyHotfix({ patchType: "css_inject", payload });
+      assert.equal(res.ok, true, `repeat ${i} must succeed: ${res.error}`);
+    }
+
+    assert.equal(
+      await countStyles(),
+      afterFirst,
+      "re-applying an identical hotfix must not append another <style> element"
+    );
+
+    // A genuinely different hotfix still gets its own element.
+    await dp.applyHotfix({ patchType: "css_inject", payload: "#clicks { font-style: italic; }" });
+    assert.equal(
+      await countStyles(),
+      afterFirst + 1,
+      "a distinct hotfix must still compose as its own <style> element"
+    );
+  });
+
   it("A6: re-capture after the hotfix reflects the new state", async () => {
     const dp = getDebugProvider();
     const res = await dp.captureState({ includeDOM: true });
@@ -174,6 +204,28 @@ describe("debug loop against a live CDP target", { skip: LIVE ? false : "set VIB
     const after = await dp.captureState();
     assert.equal(after.ok, false, "capture after detach must fail rather than hang");
     assert.match(after.error!, /no.*target/i);
+  });
+
+  it("A8b: overlapping attachTarget calls are serialized, not raced", async () => {
+    resetDebugProviderForTest();
+    const dp = getDebugProvider();
+
+    // A model can emit two tool calls in one round. These used to race on the
+    // adapter's socket and BOTH fail, leaving nothing attached.
+    const [first, second] = await Promise.all([
+      dp.attachTarget({ targetType: "web", identifier: target.url, cdpPort: CDP_PORT }),
+      dp.attachTarget({ targetType: "web", identifier: target.url, cdpPort: CDP_PORT }),
+    ]);
+
+    assert.equal(first.ok, true, `first concurrent attach must succeed: ${first.error}`);
+    assert.equal(second.ok, true, `second concurrent attach must succeed: ${second.error}`);
+    assert.equal(dp.isAttached(), true, "provider must be attached after concurrent attaches");
+
+    // The surviving connection has to be usable, not merely present.
+    const cap = await dp.captureState({ includeDOM: false });
+    assert.equal(cap.ok, true, `capture after concurrent attach must work: ${cap.error}`);
+
+    await dp.detachTarget();
   });
 
   it("A9: commands against a dead target fail fast instead of hanging", async () => {
