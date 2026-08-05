@@ -71,6 +71,15 @@ interface DebugAdapter {
 
 // ─── CDP WebSocket Adapter (Web / Browser) ───────────────────────────────────
 
+/** Upper bound on any single CDP round-trip, so a dead target cannot wedge a loop. */
+const CDP_COMMAND_TIMEOUT_MS = 10_000;
+
+/**
+ * Cap on retained console/exception lines. A chatty page left attached for a
+ * long autonomous session would otherwise grow this buffer without limit.
+ */
+const MAX_LOG_BUFFER = 1000;
+
 class WebDebugAdapter implements DebugAdapter {
   private ws: WebSocket | null = null;
   private info: DebugTargetInfo | null = null;
@@ -102,6 +111,11 @@ class WebDebugAdapter implements DebugAdapter {
         this.ws!.on("message", (data: Buffer) => this.handleMessage(data.toString()));
       });
 
+      // Once connected, a socket that drops must fail in-flight commands rather
+      // than leaving them pending forever.
+      this.ws.on("close", () => this.failPending("CDP connection closed by target"));
+      this.ws.on("error", (e: Error) => this.failPending(`CDP connection error: ${e.message}`));
+
       const version = await this.cdpCommand("Browser.getVersion");
       this.info = {
         targetType: "web",
@@ -111,6 +125,10 @@ class WebDebugAdapter implements DebugAdapter {
       };
 
       await this.cdpCommand("Page.enable");
+      // Runtime must be enabled or Runtime.consoleAPICalled and
+      // Runtime.exceptionThrown never arrive, leaving captureState blind to
+      // every console message and uncaught error on the page.
+      await this.cdpCommand("Runtime.enable");
       await this.cdpCommand("Console.enable");
       await this.cdpCommand("Debugger.enable");
       await this.cdpCommand("DOM.enable");
@@ -295,9 +313,35 @@ class WebDebugAdapter implements DebugAdapter {
     return new Promise((resolve, reject) => {
       if (!this.ws) return reject(new Error("No WebSocket connection"));
       const id = ++this.messageId;
-      this.pendingResponses.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+
+      // Without a deadline a command against a target that died mid-session
+      // never settles, which would wedge an unattended debugging loop forever.
+      const timer = setTimeout(() => {
+        this.pendingResponses.delete(id);
+        reject(new Error(`CDP command ${method} timed out after ${CDP_COMMAND_TIMEOUT_MS}ms`));
+      }, CDP_COMMAND_TIMEOUT_MS);
+
+      this.pendingResponses.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+
+      try {
+        this.ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+      } catch (e) {
+        clearTimeout(timer);
+        this.pendingResponses.delete(id);
+        reject(new Error(`CDP send failed: ${e instanceof Error ? e.message : String(e)}`));
+      }
     });
+  }
+
+  /** Reject every in-flight command; used when the socket dies or we detach. */
+  private failPending(reason: string) {
+    for (const [, p] of this.pendingResponses) {
+      try { p.reject(new Error(reason)); } catch {}
+    }
+    this.pendingResponses.clear();
   }
 
   private handleMessage(data: string) {
@@ -315,8 +359,23 @@ class WebDebugAdapter implements DebugAdapter {
       if (msg.method === "Console.messageAdded") {
         this.logBuffer.push(`[console] ${JSON.stringify(msg.params?.message?.text ?? msg)}`);
       }
+      // Console.messageAdded is deprecated and Chrome no longer emits it for
+      // ordinary console.* calls; Runtime.consoleAPICalled is the live channel.
+      if (msg.method === "Runtime.consoleAPICalled") {
+        const level = msg.params?.type ?? "log";
+        const text = (msg.params?.args ?? [])
+          .map((a: any) => a?.value ?? a?.description ?? a?.unserializableValue ?? "")
+          .filter((s: string) => s !== "")
+          .join(" ");
+        this.logBuffer.push(`[console:${level}] ${text || JSON.stringify(msg.params ?? {})}`);
+      }
       if (msg.method === "Runtime.exceptionThrown") {
-        this.logBuffer.push(`[exception] ${JSON.stringify(msg.params?.exceptionDetails ?? msg)}`);
+        const d = msg.params?.exceptionDetails;
+        const text = d?.exception?.description ?? d?.text ?? JSON.stringify(d ?? msg);
+        this.logBuffer.push(`[exception] ${text}`);
+      }
+      if (this.logBuffer.length > MAX_LOG_BUFFER) {
+        this.logBuffer.splice(0, this.logBuffer.length - MAX_LOG_BUFFER);
       }
     } catch {}
   }
@@ -326,7 +385,7 @@ class WebDebugAdapter implements DebugAdapter {
       try { this.ws.close(); } catch {}
       this.ws = null;
     }
-    this.pendingResponses.clear();
+    this.failPending("CDP connection closed");
   }
 }
 
