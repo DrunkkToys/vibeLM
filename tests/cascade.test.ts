@@ -1749,6 +1749,60 @@ describe("debug tools", () => {
     assert(names.includes("debug_apply_hotfix"));
   });
 
+  it("are never handed to the unattended autonomous runner, even when fully enabled", async () => {
+    const { resolveBridgeTickToolNames } = await import("../src/toolsProvider");
+    // Simulate the most permissive interactive session possible: every debug
+    // tool switched on. The bridge tick allowlist must still withhold them —
+    // these tools drive the user's machine (CDP, lldb, macOS accessibility)
+    // and must not fire while nobody is watching, same rule as bash_terminal.
+    const tickTools = resolveBridgeTickToolNames([
+      "read_file", "write_file", "create_plan",
+      "debug_attach_target", "debug_capture_state",
+      "debug_execute_interaction", "debug_apply_hotfix",
+      "bash_terminal", "ssh_exec", "delete_file",
+    ]);
+
+    for (const forbidden of [
+      "debug_attach_target", "debug_capture_state",
+      "debug_execute_interaction", "debug_apply_hotfix",
+      "bash_terminal", "ssh_exec", "delete_file",
+    ]) {
+      assert(
+        !tickTools.includes(forbidden),
+        `${forbidden} must not be reachable from an unattended vibe_bridge tick`
+      );
+    }
+    // The benign tools still come through, so this is a real filter and not an
+    // empty result masking the assertion above.
+    assert(tickTools.includes("read_file"));
+    assert(tickTools.includes("create_plan"));
+  });
+
+  it("debug_apply_hotfix only accepts the patch type it can actually perform", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const tools = await toolsProvider(makeCtl({
+      toolToggles: { debug_apply_hotfix: true },
+    }));
+    const tool = tools.find((t: any) => t.name === "debug_apply_hotfix");
+    assert(tool, "tool must exist");
+
+    // css_inject is the only patch type the web adapter implements.
+    assert.doesNotThrow(
+      () => tool.checkParameters({ patchType: "css_inject", payload: "body{color:red}" }),
+      "css_inject must be accepted"
+    );
+
+    // js_eval, dom_mutate and env_override are unconditionally refused by
+    // validateHotfixSafety, so advertising them to the model only produces
+    // guaranteed-failing tool calls. The schema must reject them outright.
+    for (const dead of ["js_eval", "dom_mutate", "env_override"]) {
+      assert.throws(
+        () => tool.checkParameters({ patchType: dead, payload: "x" }),
+        `${dead} must be rejected by the schema, not offered and then refused`
+      );
+    }
+  });
+
   it("debug_attach_target implementation returns error when no target", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl({

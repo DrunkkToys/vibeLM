@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
 import { spawn, type ChildProcess } from "child_process";
 import { execSync, execFileSync } from "child_process";
+import { createHash } from "crypto";
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve, dirname } from "path";
 
@@ -71,6 +72,15 @@ interface DebugAdapter {
 
 // ─── CDP WebSocket Adapter (Web / Browser) ───────────────────────────────────
 
+/** Upper bound on any single CDP round-trip, so a dead target cannot wedge a loop. */
+const CDP_COMMAND_TIMEOUT_MS = 10_000;
+
+/**
+ * Cap on retained console/exception lines. A chatty page left attached for a
+ * long autonomous session would otherwise grow this buffer without limit.
+ */
+const MAX_LOG_BUFFER = 1000;
+
 class WebDebugAdapter implements DebugAdapter {
   private ws: WebSocket | null = null;
   private info: DebugTargetInfo | null = null;
@@ -94,6 +104,8 @@ class WebDebugAdapter implements DebugAdapter {
     }
 
     try {
+      // Never abandon a live socket by overwriting the reference.
+      if (this.ws) this.cleanup();
       this.ws = new WebSocket(wsUrl);
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("WebSocket connection timeout")), 5000);
@@ -101,6 +113,11 @@ class WebDebugAdapter implements DebugAdapter {
         this.ws!.on("error", (e: Error) => { clearTimeout(t); reject(e); });
         this.ws!.on("message", (data: Buffer) => this.handleMessage(data.toString()));
       });
+
+      // Once connected, a socket that drops must fail in-flight commands rather
+      // than leaving them pending forever.
+      this.ws.on("close", () => this.failPending("CDP connection closed by target"));
+      this.ws.on("error", (e: Error) => this.failPending(`CDP connection error: ${e.message}`));
 
       const version = await this.cdpCommand("Browser.getVersion");
       this.info = {
@@ -111,6 +128,10 @@ class WebDebugAdapter implements DebugAdapter {
       };
 
       await this.cdpCommand("Page.enable");
+      // Runtime must be enabled or Runtime.consoleAPICalled and
+      // Runtime.exceptionThrown never arrive, leaving captureState blind to
+      // every console message and uncaught error on the page.
+      await this.cdpCommand("Runtime.enable");
       await this.cdpCommand("Console.enable");
       await this.cdpCommand("Debugger.enable");
       await this.cdpCommand("DOM.enable");
@@ -251,8 +272,23 @@ class WebDebugAdapter implements DebugAdapter {
         }
         case "css_inject": {
           const escaped = patch.payload.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$");
+          // Key the injected <style> by its content so re-applying the same
+          // hotfix updates that element in place instead of appending another
+          // node every time. Re-capturing state and re-applying is the normal
+          // debugging rhythm, so the naive append grew the DOM without bound.
+          // Distinct payloads still get their own element and still compose.
+          const key = createHash("sha1").update(patch.payload).digest("hex").slice(0, 16);
           await this.cdpCommand("Runtime.evaluate", {
-            expression: `(function() { var s = document.createElement('style'); s.textContent = \`${escaped}\`; document.head.appendChild(s); })()`,
+            expression: `(function() {
+              var k = ${JSON.stringify(key)};
+              var s = document.querySelector('style[data-vibelm-hotfix="' + k + '"]');
+              if (!s) {
+                s = document.createElement('style');
+                s.setAttribute('data-vibelm-hotfix', k);
+                document.head.appendChild(s);
+              }
+              s.textContent = \`${escaped}\`;
+            })()`,
           });
           return { ok: true };
         }
@@ -295,9 +331,35 @@ class WebDebugAdapter implements DebugAdapter {
     return new Promise((resolve, reject) => {
       if (!this.ws) return reject(new Error("No WebSocket connection"));
       const id = ++this.messageId;
-      this.pendingResponses.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+
+      // Without a deadline a command against a target that died mid-session
+      // never settles, which would wedge an unattended debugging loop forever.
+      const timer = setTimeout(() => {
+        this.pendingResponses.delete(id);
+        reject(new Error(`CDP command ${method} timed out after ${CDP_COMMAND_TIMEOUT_MS}ms`));
+      }, CDP_COMMAND_TIMEOUT_MS);
+
+      this.pendingResponses.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+
+      try {
+        this.ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+      } catch (e) {
+        clearTimeout(timer);
+        this.pendingResponses.delete(id);
+        reject(new Error(`CDP send failed: ${e instanceof Error ? e.message : String(e)}`));
+      }
     });
+  }
+
+  /** Reject every in-flight command; used when the socket dies or we detach. */
+  private failPending(reason: string) {
+    for (const [, p] of this.pendingResponses) {
+      try { p.reject(new Error(reason)); } catch {}
+    }
+    this.pendingResponses.clear();
   }
 
   private handleMessage(data: string) {
@@ -315,8 +377,23 @@ class WebDebugAdapter implements DebugAdapter {
       if (msg.method === "Console.messageAdded") {
         this.logBuffer.push(`[console] ${JSON.stringify(msg.params?.message?.text ?? msg)}`);
       }
+      // Console.messageAdded is deprecated and Chrome no longer emits it for
+      // ordinary console.* calls; Runtime.consoleAPICalled is the live channel.
+      if (msg.method === "Runtime.consoleAPICalled") {
+        const level = msg.params?.type ?? "log";
+        const text = (msg.params?.args ?? [])
+          .map((a: any) => a?.value ?? a?.description ?? a?.unserializableValue ?? "")
+          .filter((s: string) => s !== "")
+          .join(" ");
+        this.logBuffer.push(`[console:${level}] ${text || JSON.stringify(msg.params ?? {})}`);
+      }
       if (msg.method === "Runtime.exceptionThrown") {
-        this.logBuffer.push(`[exception] ${JSON.stringify(msg.params?.exceptionDetails ?? msg)}`);
+        const d = msg.params?.exceptionDetails;
+        const text = d?.exception?.description ?? d?.text ?? JSON.stringify(d ?? msg);
+        this.logBuffer.push(`[exception] ${text}`);
+      }
+      if (this.logBuffer.length > MAX_LOG_BUFFER) {
+        this.logBuffer.splice(0, this.logBuffer.length - MAX_LOG_BUFFER);
       }
     } catch {}
   }
@@ -326,7 +403,7 @@ class WebDebugAdapter implements DebugAdapter {
       try { this.ws.close(); } catch {}
       this.ws = null;
     }
-    this.pendingResponses.clear();
+    this.failPending("CDP connection closed");
   }
 }
 
@@ -993,6 +1070,8 @@ export class DebugProvider {
   private adapters: Map<TargetType, DebugAdapter>;
   private currentAdapter: DebugAdapter | null = null;
   private safetyBoundary: SafetyBoundary = {};
+  /** Serializes attachTarget so overlapping calls cannot race on the socket. */
+  private attachChain: Promise<void> = Promise.resolve();
 
   constructor() {
     this.adapters = new Map<TargetType, DebugAdapter>([
@@ -1010,7 +1089,20 @@ export class DebugProvider {
     this.safetyBoundary = boundary;
   }
 
+  /**
+   * Attaches run one at a time. Two overlapping attachTarget calls used to race
+   * on the adapter's socket and both fail, leaving nothing attached — easy to
+   * hit when a model emits two tool calls in the same round.
+   */
   async attachTarget(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
+    const run = this.attachChain
+      .catch(() => {})
+      .then(() => this.attachTargetSerialized(params));
+    this.attachChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  private async attachTargetSerialized(params: AttachParams): Promise<{ ok: boolean; error?: string }> {
     if (this.currentAdapter?.isAttached()) {
       await this.currentAdapter.detach();
     }

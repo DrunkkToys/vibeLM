@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>vibeLM debug fixture</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 2rem; }
+    /* FAULT 2: the result panel is unreachable via interaction alone.
+       Only a css_inject hotfix can reveal it. */
+    #result { display: none; padding: 1rem; border: 2px solid green; }
+    #clicks { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1 id="heading">Buggy App</h1>
+
+  <label for="username">Username</label>
+  <input id="username" type="text" value="">
+
+  <button id="submit-btn">Submit</button>
+  <button id="safe-btn">Safe</button>
+
+  <p>clicks: <span id="clicks">0</span></p>
+
+  <div id="result">RESULT VISIBLE</div>
+
+  <script>
+    // FAULT 1: the submit handler throws, producing a console error that
+    // debug_capture_state must surface. The click side effect (#clicks) is
+    // incremented BEFORE the throw so an interaction is still observable.
+    document.getElementById('submit-btn').addEventListener('click', function () {
+      var n = document.getElementById('clicks');
+      n.textContent = String(Number(n.textContent) + 1);
+      throw new Error('VIBELM_FIXTURE_SUBMIT_FAILURE');
+    });
+
+    document.getElementById('safe-btn').addEventListener('click', function () {
+      var n = document.getElementById('clicks');
+      n.textContent = String(Number(n.textContent) + 1);
+    });
+
+    // Deterministic console output the capture must contain.
+    console.log('VIBELM_FIXTURE_BOOT');
+    console.error('VIBELM_FIXTURE_STARTUP_ERROR');
+
+    // FAULT 4: a request to a dead endpoint -> network failure to capture.
+    fetch('http://127.0.0.1:1/vibelm-dead-endpoint')
+      .catch(function () { console.error('VIBELM_FIXTURE_FETCH_FAILED'); });
+  </script>
+</body>
+</html>
