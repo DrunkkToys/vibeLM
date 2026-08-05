@@ -3212,14 +3212,14 @@ DEBUGGING LOOP: This is step 2 of the debugging cycle. After capturing state (st
 
   const debugApplyHotfixTool = wrapTool(tool({
     name: "debug_apply_hotfix",
-    description: text`Applies a live hotfix to the attached debug target: evaluate JS, inject CSS, mutate DOM, or override environment variables.
-USE WHEN: you want to test a potential fix at runtime before writing it to source files.
-EXAMPLE: debug_apply_hotfix({ patchType: "css_inject", payload: "body { background: red; }" })
-NOTE: Requires an active debug target. DOM mutations and JS evals are sandboxed against dangerous operations.
+    description: text`Applies a live CSS hotfix to the attached debug target.
+USE WHEN: you want to test a styling or layout fix at runtime before writing it to source files.
+EXAMPLE: debug_apply_hotfix({ patchType: "css_inject", payload: "#result { display: block !important; }" })
+NOTE: Requires an active debug target. CSS injection is the ONLY runtime hotfix available. Running arbitrary JavaScript, mutating the DOM directly, and overriding environment variables are deliberately not supported — for those, edit the source file with write_file and reload the target instead.
 DEBUGGING LOOP: This is step 3 of the debugging cycle. After capturing state (step 1) and reproducing the issue (step 2), apply your fix here. Then re-capture state to verify the fix worked. If verified, write the fix to your workspace files.`,
     parameters: {
-      patchType: z.enum(["js_eval", "css_inject", "dom_mutate", "env_override"]).describe("Type of hotfix to apply"),
-      payload: z.string().describe("The code, CSS, mutation script, or env override (key=value)"),
+      patchType: z.enum(["css_inject"]).describe("Type of hotfix to apply. Only css_inject is supported."),
+      payload: z.string().describe("The CSS to inject, e.g. \"#result { display: block !important; }\""),
     },
     implementation: async ({ patchType, payload }) => {
       const dp = getDebugProvider();
