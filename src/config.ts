@@ -28,7 +28,7 @@ export const configSchematics = createConfigSchematics()
         "numeric",
         {
           displayName: "Context Length (tokens)",
-          subtitle: "How many tokens of context the model keeps. When the conversation exceeds this limit, older messages are truncated (cut in the middle). Set to 0 to use the model's default. Requires a model reload to take effect.",
+          subtitle: "Token budget used to decide when the session is running out of room. As it fills, the agent is told to call compact_context to summarize and shed history before the model hard-fails. Clamped to the loaded model's actual context length, so setting it higher than the model supports has no effect. Set to 0 to use the model's own context length.",
           int: true,
           min: 0,
           max: 262144,
