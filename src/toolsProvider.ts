@@ -862,9 +862,34 @@ export function chatToText(history: any): string {
   }
 }
 
+// Has anything already answered in this conversation? Only assistant/tool turns count — a chat whose
+// entire history is the user's first message cannot be a mid-conversation roll, however long that
+// message happens to be.
+//
+// Fails safe to true (= "not a fresh chat"), so an SDK whose message shape we can't read keeps the
+// previous carry-forward behavior rather than silently discarding a live plan.
+export function historyHasPriorAssistantTurns(history: any): boolean {
+  try {
+    if (typeof history?.getLength !== "function" || typeof history?.at !== "function") return true;
+    const length = history.getLength();
+    for (let i = 0; i < length; i++) {
+      const message = history.at(i);
+      const role = typeof message?.getRole === "function" ? message.getRole() : undefined;
+      if (role === "assistant" || role === "tool") return true;
+      // Role may be unavailable; tool traffic is equally proof that a turn already ran.
+      const requests = typeof message?.getToolCallRequests === "function" ? message.getToolCallRequests() : [];
+      const results = typeof message?.getToolCallResults === "function" ? message.getToolCallResults() : [];
+      if ((requests?.length ?? 0) > 0 || (results?.length ?? 0) > 0) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 async function readHistoryParts(
   ctl?: PromptPreprocessorController | ToolsProviderController,
-): Promise<{ text: string; systemPromptLength: number } | null> {
+): Promise<{ text: string; systemPromptLength: number; hasPriorAssistantTurns: boolean } | null> {
   try {
     const history = await (ctl as any)?.pullHistory?.();
     if (!history) return null;
@@ -872,6 +897,7 @@ async function readHistoryParts(
     return {
       text: composeHistoryText(systemPrompt, chatToText(history)),
       systemPromptLength: normalizeHistoryText(systemPrompt).length,
+      hasPriorAssistantTurns: historyHasPriorAssistantTurns(history),
     };
   } catch {
     return null;
@@ -894,10 +920,24 @@ export function looksLikeDifferentConversation(
   previousConversationChars: number,
   incomingConversationChars: number,
   incomingHistoryText: string,
+  // Defaults to true (= "a turn already ran here"), so callers that cannot supply the signal keep
+  // the original size-only behavior.
+  incomingHasPriorAssistantTurns: boolean = true,
 ): boolean {
+  // vibeLM re-injects its marker whenever it compacts or rolls, so the marker surviving in history
+  // means "same conversation, just rolled". Checked first: it outranks every other signal.
+  if (hasManagedContext(incomingHistoryText)) return false;
+  // Structural certainty beats the size heuristic below. A turn whose history contains no assistant
+  // or tool message is the opening turn of a fresh chat — a roll or a mid-conversation restart always
+  // leaves earlier turns behind. The size ratio cannot see this and gets it wrong in both directions:
+  // it needs the PREVIOUS conversation to exceed MIN_SUBSTANTIAL_HISTORY_CHARS, so a short previous
+  // chat disables the check entirely, and a long opening message clears the 30% threshold anyway.
+  // Reproduced live twice: a 3-step "catalogue the test files" plan was carried into a new chat that
+  // asked only "what is 17 multiplied by 23?", and the model read three test files instead.
+  if (!incomingHasPriorAssistantTurns) return true;
   if (previousConversationChars <= MIN_SUBSTANTIAL_HISTORY_CHARS) return false;
   if (incomingConversationChars >= previousConversationChars * NEW_CONVERSATION_LENGTH_RATIO) return false;
-  return !hasManagedContext(incomingHistoryText);
+  return true;
 }
 
 async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsProviderController, force = false): Promise<SessionState> {
@@ -916,7 +956,7 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
     if (parts) {
       const previous = activeSessionState.lastSeenConversationChars;
       const incoming = conversationLength(parts.text.length, parts.systemPromptLength);
-      if (looksLikeDifferentConversation(previous, incoming, parts.text)) {
+      if (looksLikeDifferentConversation(previous, incoming, parts.text, parts.hasPriorAssistantTurns)) {
         activeSessionState = createSessionState();
         activeSessionState.historyFingerprint = fingerprintHistoryText(parts.text);
         activeSessionState.historyTextLength = parts.text.length;
@@ -1029,8 +1069,22 @@ async function bootstrapSessionState(ctl?: PromptPreprocessorController | ToolsP
             persisted?.systemPromptLength ?? 0,
           );
           const newConversation = conversationLength(historyText.length, systemPromptLength);
-          const looksLikeGenuinelyNewConversation = oldConversation > MIN_SUBSTANTIAL_HISTORY_CHARS
-            && newConversation < oldConversation * NEW_CONVERSATION_LENGTH_RATIO;
+          // The size ratio alone is not sufficient, because it infers conversation identity from
+          // message length. A long opening message in a new chat, following a SHORT previous chat,
+          // clears the threshold and reads as "same conversation". Reproduced live: a 622-char first
+          // prompt against a persisted 1531-char conversation (0.3 * 1531 = 459 < 622) carried a
+          // three-step plan from an unrelated earlier chat into the new one, and the model executed
+          // that plan — re-reading the same three files — instead of the request in front of it.
+          //
+          // Structure settles what size cannot. A turn whose history holds no assistant or tool
+          // message is the opening turn of a fresh chat: a host-side roll or a mid-conversation
+          // restart always leaves earlier turns behind, or vibeLM's own managed-context marker.
+          // Both conditions are required, mirroring looksLikeDifferentConversation above.
+          const firstTurnOfFreshChat = !historyParts?.hasPriorAssistantTurns
+            && !historyText.includes(MANAGED_CONTEXT_MARKER);
+          const looksLikeGenuinelyNewConversation = firstTurnOfFreshChat
+            || (oldConversation > MIN_SUBSTANTIAL_HISTORY_CHARS
+              && newConversation < oldConversation * NEW_CONVERSATION_LENGTH_RATIO);
           const completedPersistedPlan = isCompletedPlan(persisted?.plan);
           if (persisted && !completedPersistedPlan && !looksLikeGenuinelyNewConversation && ((persisted.managedContextBlocks?.length ?? 0) > 0 || planWorthCarryingForward(persisted.plan))) {
             // The raw history no longer matches what we last saw — either the process restarted
