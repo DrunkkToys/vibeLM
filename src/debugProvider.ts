@@ -19,16 +19,40 @@ export interface DebugTargetInfo {
   platform: PlatformOS;
   attachedAt: string;
   windowBounds?: { x: number; y: number; width: number; height: number };
+  /** Web targets: the URL actually attached to, which may differ from `identifier`. */
+  resolvedUrl?: string;
+  /** Web targets: the page title actually attached to. */
+  resolvedTitle?: string;
+}
+
+/** Shape of an entry from a CDP endpoint's /json listing. */
+interface CDPTargetInfo {
+  type?: string;
+  title?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+}
+
+function safeDecode(s: string): string {
+  try { return decodeURIComponent(s); } catch { return s; }
 }
 
 export interface CaptureOptions {
   includeDOM?: boolean;
   logTailLines?: number;
+  /** Screenshots are opt-in: on a real app they are far too large by default. */
+  includeScreenshot?: boolean;
+  /** How deep to walk the DOM. -1 means the whole tree and is rarely usable. */
+  domDepth?: number;
 }
 
 export interface DebugSnapshot {
   screenshot?: string;
   componentTree?: unknown[];
+  /** Compact JSON description of the page: title, url, headings, controls, text. */
+  summary?: string;
+  /** Explains anything that was omitted for size, and what to do instead. */
+  notes?: string[];
   logs: string[];
   networkErrors: string[];
   timestamp: string;
@@ -81,6 +105,20 @@ const CDP_COMMAND_TIMEOUT_MS = 10_000;
  */
 const MAX_LOG_BUFFER = 1000;
 
+/**
+ * Size ceilings for a capture. Measured against LM Studio's own renderer: a
+ * full PNG screenshot was 691,500 base64 chars (~173k tokens) and the complete
+ * DOM was 1,215,075 chars (~304k tokens), against a 17,318-token model context.
+ * Returning either unbounded makes debug_capture_state unusable on any real
+ * application, so both are capped and the tool explains what it dropped.
+ */
+const MAX_DOM_CHARS = 60_000;
+const MAX_SCREENSHOT_CHARS = 120_000;
+const DEFAULT_DOM_DEPTH = 4;
+const SCREENSHOT_QUALITY = 40;
+/** Tried largest-first; the first size that fits under the cap is returned. */
+const SCREENSHOT_SCALES = [1, 0.6, 0.35, 0.2];
+
 class WebDebugAdapter implements DebugAdapter {
   private ws: WebSocket | null = null;
   private info: DebugTargetInfo | null = null;
@@ -93,14 +131,19 @@ class WebDebugAdapter implements DebugAdapter {
     const port = params.cdpPort ?? 9222;
     let wsUrl: string;
 
+    let resolved: CDPTargetInfo | undefined;
     if (url.startsWith("ws://") || url.startsWith("wss://")) {
       wsUrl = url;
     } else {
-      const devtoolsUrl = await this.discoverCDPUrl(url, port);
-      if (!devtoolsUrl) {
-        return { ok: false, error: `Cannot discover CDP endpoint for ${url}. Ensure Chrome is running with --remote-debugging-port=${port}` };
+      const r = await this.resolveCDPTarget(url, port);
+      if (!r.target) {
+        return {
+          ok: false,
+          error: r.error ?? `Cannot discover CDP endpoint for ${url}. Ensure the app is running with --remote-debugging-port=${port}`,
+        };
       }
-      wsUrl = devtoolsUrl;
+      resolved = r.target;
+      wsUrl = r.target.webSocketDebuggerUrl!;
     }
 
     try {
@@ -123,6 +166,10 @@ class WebDebugAdapter implements DebugAdapter {
       this.info = {
         targetType: "web",
         identifier: url,
+        // Report what we ACTUALLY attached to, so a mismatch is visible rather
+        // than hidden behind the identifier the caller asked for.
+        resolvedUrl: resolved?.url,
+        resolvedTitle: resolved?.title,
         platform: process.platform as PlatformOS,
         attachedAt: new Date().toISOString(),
       };
@@ -159,10 +206,38 @@ class WebDebugAdapter implements DebugAdapter {
     try {
       const logs = this.logBuffer.slice(-(options.logTailLines ?? 50));
 
+      // Everything below is size-bounded on purpose. A capture of a real
+      // application is enormous — measured against LM Studio's own window, a
+      // full-page PNG is ~691k base64 chars (~173k tokens) and the full DOM is
+      // ~1.2M chars (~304k tokens). Either one alone dwarfs a typical local
+      // model's context, so an unbounded capture does not merely waste tokens,
+      // it makes the tool unusable.
+      const notes: string[] = [];
+
       let componentTree: unknown[] | undefined;
       if (options.includeDOM !== false) {
-        const doc = await this.cdpCommand("DOM.getDocument", { depth: -1 });
-        componentTree = [doc];
+        // Try the requested depth, then progressively shallower. On a real app
+        // the full tree measured ~303k chars at depth 4, so a fixed depth means
+        // the DOM is simply never returned; stepping down yields a usable tree.
+        const requested = options.domDepth ?? DEFAULT_DOM_DEPTH;
+        const depths = [requested, 3, 2, 1].filter((d, i, a) => d <= requested && a.indexOf(d) === i);
+        let lastSize = 0;
+        for (const depth of depths) {
+          const doc = await this.cdpCommand("DOM.getDocument", { depth });
+          const json = JSON.stringify(doc);
+          lastSize = json.length;
+          if (json.length <= MAX_DOM_CHARS) {
+            componentTree = [doc];
+            if (depth < requested) notes.push(`DOM returned at depth ${depth} instead of ${requested} to fit the size limit.`);
+            break;
+          }
+        }
+        if (!componentTree) {
+          notes.push(
+            `DOM omitted: ${lastSize} chars even at depth 1, over the ${MAX_DOM_CHARS} limit. ` +
+            `Use the summary below, or debug_execute_interaction with a CSS selector, instead of reading the whole tree.`
+          );
+        }
       }
 
       let networkErrors: string[] = [];
@@ -171,17 +246,70 @@ class WebDebugAdapter implements DebugAdapter {
         networkErrors = extractNetworkErrors(perf);
       } catch {}
 
-      let screenshotBase64: string | undefined;
+      // A compact, always-cheap description of the page. This is what makes the
+      // tool useful when the screenshot and DOM are too big to return.
+      let summary: string | undefined;
       try {
-        const shot = await this.cdpCommand("Page.captureScreenshot", { format: "png" });
-        screenshotBase64 = (shot as any)?.data;
+        const r = await this.cdpCommand("Runtime.evaluate", {
+          expression: `JSON.stringify({
+            title: document.title,
+            url: location.href,
+            elements: document.querySelectorAll('*').length,
+            headings: Array.from(document.querySelectorAll('h1,h2,h3')).slice(0,10).map(function(e){return e.textContent.trim().slice(0,80)}),
+            buttons: Array.from(document.querySelectorAll('button,[role=button]')).slice(0,20).map(function(e){return (e.textContent||e.getAttribute('aria-label')||'').trim().slice(0,40)}).filter(Boolean),
+            inputs: Array.from(document.querySelectorAll('input,textarea,select')).slice(0,20).map(function(e){return e.tagName.toLowerCase()+(e.id?'#'+e.id:'')}),
+            text: document.body ? document.body.innerText.slice(0,1500) : ''
+          })`,
+          returnByValue: true,
+        });
+        summary = (r as any)?.result?.value;
       } catch {}
+
+      // Screenshots are opt-in. When asked for, downscale and JPEG-compress so
+      // the result stays within a size a model can actually receive.
+      let screenshotBase64: string | undefined;
+      if (options.includeScreenshot === true) {
+        try {
+          // Compression alone is not enough: a real app window at JPEG quality
+          // 40 measured ~229k chars, still far past the cap. Downscale via the
+          // capture clip so a usable image is actually returned, and step the
+          // scale down rather than silently giving back nothing.
+          const metrics = await this.cdpCommand("Page.getLayoutMetrics").catch(() => null);
+          const css = (metrics as any)?.cssVisualViewport ?? (metrics as any)?.layoutViewport ?? {};
+          const width = Math.max(1, Math.round(css.clientWidth ?? css.width ?? 1280));
+          const height = Math.max(1, Math.round(css.clientHeight ?? css.height ?? 800));
+
+          for (const scale of SCREENSHOT_SCALES) {
+            const shot = await this.cdpCommand("Page.captureScreenshot", {
+              format: "jpeg",
+              quality: SCREENSHOT_QUALITY,
+              captureBeyondViewport: false,
+              clip: { x: 0, y: 0, width, height, scale },
+            });
+            const data = (shot as any)?.data as string | undefined;
+            if (!data) break;
+            if (data.length <= MAX_SCREENSHOT_CHARS) {
+              screenshotBase64 = data;
+              if (scale < 1) notes.push(`Screenshot downscaled to ${Math.round(scale * 100)}% to fit the size limit.`);
+              break;
+            }
+            if (scale === SCREENSHOT_SCALES[SCREENSHOT_SCALES.length - 1]) {
+              notes.push(
+                `Screenshot omitted: still ${data.length} chars at ${Math.round(scale * 100)}% scale, over the ${MAX_SCREENSHOT_CHARS} limit. ` +
+                `The page summary below describes the state instead.`
+              );
+            }
+          }
+        } catch {}
+      }
 
       return {
         ok: true,
         data: {
           screenshot: screenshotBase64,
           componentTree,
+          summary,
+          notes: notes.length ? notes : undefined,
           logs,
           networkErrors,
           timestamp: new Date().toISOString(),
@@ -192,6 +320,39 @@ class WebDebugAdapter implements DebugAdapter {
     }
   }
 
+  /**
+   * Runs `body` against the element matched by `selector`, and reports failure
+   * when nothing matches.
+   *
+   * The previous implementation used `document.querySelector(sel)?.click()` and
+   * always returned ok, so an interaction against a selector that does not
+   * exist looked identical to one that worked. A model then proceeds as if the
+   * button were pressed. A no-op must be reported as a no-op.
+   */
+  private async selectorAction(
+    selector: string,
+    body: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.cdpCommand("Runtime.evaluate", {
+      expression: `(function(){
+        var el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return "__NOT_FOUND__";
+        ${body}
+      })()`,
+      returnByValue: true,
+    });
+    const value = (r as any)?.result?.value;
+    const thrown = (r as any)?.exceptionDetails;
+    if (thrown) {
+      const msg = thrown?.exception?.description ?? thrown?.text ?? "unknown error";
+      return { ok: false, error: `Interaction on "${selector}" threw: ${String(msg).slice(0, 200)}` };
+    }
+    if (value === "__NOT_FOUND__") {
+      return { ok: false, error: `No element matches selector "${selector}" on the attached page.` };
+    }
+    return { ok: true };
+  }
+
   async executeInteraction(params: InteractionParams): Promise<{ ok: boolean; error?: string }> {
     if (!this.ws) return { ok: false, error: "No target attached" };
 
@@ -199,9 +360,11 @@ class WebDebugAdapter implements DebugAdapter {
       switch (params.action) {
         case "click": {
           if (params.selector) {
-            await this.cdpCommand("Runtime.evaluate", {
-              expression: `document.querySelector(${JSON.stringify(params.selector)})?.click()`,
-            });
+            const found = await this.selectorAction(
+              params.selector,
+              `el.click(); return true;`
+            );
+            if (!found.ok) return found;
           } else if (params.coordinates) {
             await this.cdpCommand("Input.dispatchMouseEvent", {
               type: "mousePressed",
@@ -222,9 +385,14 @@ class WebDebugAdapter implements DebugAdapter {
         }
         case "type": {
           if (params.selector) {
-            await this.cdpCommand("Runtime.evaluate", {
-              expression: `(() => { const el = document.querySelector(${JSON.stringify(params.selector)}); if (el) { el.value = ${JSON.stringify(params.value ?? "")}; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } })()`,
-            });
+            const r = await this.selectorAction(
+              params.selector,
+              `el.value = ${JSON.stringify(params.value ?? "")};
+               el.dispatchEvent(new Event('input', { bubbles: true }));
+               el.dispatchEvent(new Event('change', { bubbles: true }));
+               return true;`
+            );
+            if (!r.ok) return r;
           }
           break;
         }
@@ -238,9 +406,8 @@ class WebDebugAdapter implements DebugAdapter {
         }
         case "focus": {
           if (params.selector) {
-            await this.cdpCommand("Runtime.evaluate", {
-              expression: `document.querySelector(${JSON.stringify(params.selector)})?.focus()`,
-            });
+            const r = await this.selectorAction(params.selector, `el.focus(); return true;`);
+            if (!r.ok) return r;
           }
           break;
         }
@@ -315,16 +482,61 @@ class WebDebugAdapter implements DebugAdapter {
 
   // ── Private helpers ──
 
-  private async discoverCDPUrl(pageUrl: string, port: number = 9222): Promise<string | null> {
+  /**
+   * Resolves which CDP target to attach to.
+   *
+   * There is deliberately no "just take the first one" fallback. Silently
+   * attaching to an arbitrary target means a later hotfix or click lands in a
+   * different application than the user named, with getTargetInfo() still
+   * reporting the requested identifier — a wrong-target mutation with no
+   * visible symptom. If nothing matches, this fails and says what IS available.
+   */
+  private async resolveCDPTarget(
+    identifier: string,
+    port: number = 9222
+  ): Promise<{ target?: CDPTargetInfo; error?: string }> {
+    let targets: CDPTargetInfo[];
     try {
       const resp = await fetch(`http://localhost:${port}/json`);
-      if (!resp.ok) return null;
-      const targets: Array<{ webSocketDebuggerUrl: string; url: string }> = await resp.json();
-      const match = targets.find((t) => t.url.includes(pageUrl)) || targets[0];
-      return match?.webSocketDebuggerUrl || null;
-    } catch {
-      return null;
+      if (!resp.ok) return { error: `CDP endpoint on port ${port} returned HTTP ${resp.status}` };
+      targets = (await resp.json()) as CDPTargetInfo[];
+    } catch (e) {
+      return { error: `Cannot reach CDP endpoint on port ${port}: ${e instanceof Error ? e.message : String(e)}` };
     }
+
+    const pages = (targets ?? []).filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    if (!pages.length) return { error: `No debuggable page targets on port ${port}.` };
+
+    const needle = identifier.trim().toLowerCase();
+    const describe = () =>
+      pages.map((p) => `  - "${p.title ?? "(untitled)"}"  ${p.url ?? ""}`).join("\n");
+
+    // An empty identifier is only unambiguous when there is exactly one page.
+    if (!needle) {
+      if (pages.length === 1) return { target: pages[0] };
+      return { error: `Multiple page targets on port ${port}; name one:\n${describe()}` };
+    }
+
+    const matches = pages.filter((p) => {
+      const url = (p.url ?? "").toLowerCase();
+      const decoded = safeDecode(url);
+      const title = (p.title ?? "").toLowerCase();
+      return url.includes(needle) || decoded.includes(needle) || title.includes(needle);
+    });
+
+    if (matches.length === 1) return { target: matches[0] };
+    if (matches.length === 0) {
+      return { error: `No CDP target matches "${identifier}" on port ${port}. Available targets:\n${describe()}` };
+    }
+
+    // Several matched. Ambiguity only matters when the candidates are actually
+    // different pages — an app with two identical windows is not a wrong-target
+    // risk, and refusing there would block a legitimate attach the caller has
+    // no way to disambiguate.
+    const distinct = new Set(matches.map((m) => `${m.title ?? ""}|${m.url ?? ""}`));
+    if (distinct.size === 1) return { target: matches[0] };
+
+    return { error: `"${identifier}" matches ${matches.length} different targets on port ${port}; be more specific:\n${describe()}` };
   }
 
   private cdpCommand(method: string, params?: unknown): Promise<unknown> {
@@ -488,7 +700,15 @@ class DesktopDebugAdapter implements DebugAdapter {
       this.process.on("exit", (code) => {
         this.logBuffer.push(`[process] Exited with code ${code}`);
         if (code !== 0) this.crashed = true;
+        // Release the stdio pipes. Without this a short-lived target leaves its
+        // streams referenced by the event loop, so the host process (the plugin
+        // inside LM Studio, or the test runner) never becomes idle and hangs
+        // even after all work is finished.
+        this.releaseProcessHandles();
       });
+
+      // The debug target must never keep its host alive.
+      this.process.unref();
 
       this.info = {
         targetType: "desktop",
@@ -523,9 +743,20 @@ class DesktopDebugAdapter implements DebugAdapter {
     return { ok: true };
   }
 
+  /** Detach stdio and remove listeners so nothing keeps the event loop alive. */
+  private releaseProcessHandles(): void {
+    const p = this.process;
+    if (!p) return;
+    try { p.stdout?.removeAllListeners(); p.stdout?.destroy(); } catch {}
+    try { p.stderr?.removeAllListeners(); p.stderr?.destroy(); } catch {}
+    try { p.stdin?.end(); p.stdin?.destroy(); } catch {}
+    try { p.unref(); } catch {}
+  }
+
   async detach(): Promise<void> {
     if (this.process) {
-      this.process.kill("SIGTERM");
+      this.releaseProcessHandles();
+      try { this.process.kill("SIGTERM"); } catch {}
       this.process = null;
     }
     this.info = null;

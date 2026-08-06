@@ -29,6 +29,10 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 // preprocessors can replace the newest user message but cannot mutate LM Studio's stored chat
 // history, so this is an early rollover threshold rather than a claim that host history was deleted.
 const PROMPT_BUDGET_RATIO = 0.30;
+/** Warn at this fraction of the hard prompt budget, while acting is still possible. */
+const CONTEXT_PRESSURE_TRIGGER_RATIO = 0.75;
+/** Per-entry cap on the bridge handover buffer, so one long paste cannot dominate it. */
+const BRIDGE_HANDOVER_ENTRY_CHARS = 4000;
 const MAX_TOOL_RESULT_CHARS = 500;
 const MAX_NON_CODE_RESULT_CHARS = 300;
 // A fetched document must never consume most of the model's context by itself. This is an
@@ -2992,7 +2996,17 @@ USE WHEN: the user asks to update a memory YOU CANNOT. Tell them to use save_mem
         // Step 1: Summarize handover context
         let handover = "";
         if (_bridgeHandover.length > 0) {
-          const buffer = _bridgeHandover.join("\n\n");
+          // _bridgeHandover is capped at 5 ENTRIES but not by size, and each
+          // entry is a whole user message of arbitrary length. Feeding the raw
+          // join into model.complete blew the context and failed the tick
+          // outright ("Context size has been exceeded", observed live). Clamp
+          // to a budget derived from the real window, keeping the newest text.
+          const tickWindow = await getContextWindow(ctl as any);
+          const budget = headBudgetChars(tickWindow);
+          let buffer = _bridgeHandover.join("\n\n");
+          if (buffer.length > budget) {
+            buffer = `[earlier handover truncated]\n` + buffer.slice(-budget);
+          }
           const summarizePrompt = `Summarize this conversation in 2-3 concise sentences, focusing on what the user was working on and any open questions:\n\n${buffer}`;
           const result = await model.complete(summarizePrompt, { maxTokens: 200 });
           handover = stripModelArtifacts(result.content.trim());
@@ -3176,18 +3190,20 @@ DEBUGGING LOOP: After attaching, use debug_capture_state to capture the current 
 
   const debugCaptureStateTool = wrapTool(tool({
     name: "debug_capture_state",
-    description: text`Captures the current diagnostic state of the attached debug target: screenshot, component tree (DOM/accessibility), console/logs, and network errors.
+    description: text`Captures the current diagnostic state of the attached debug target: a compact page summary (title, url, headings, buttons, inputs, visible text), console/logs, network errors, and optionally the DOM tree or a screenshot.
 USE WHEN: you need to inspect what the application is showing or what errors have occurred.
 EXAMPLE: debug_capture_state({ logTailLines: 100 })
-NOTE: Requires an active debug target (call debug_attach_target first).
+NOTE: Requires an active debug target (call debug_attach_target first). The summary is always returned and is small. The DOM and screenshot are size-capped and may be omitted on large applications — when that happens the "notes" field says so and the summary still describes the page. Do not ask for a screenshot unless you actually need pixels.
 DEBUGGING LOOP: This is step 1 of the debugging cycle. After capturing state, analyze the logs and component tree to identify faults. Then use debug_execute_interaction to reproduce the issue, and debug_apply_hotfix to test your fix. Always re-capture state after applying a hotfix to verify the fix worked.`,
     parameters: {
-      includeDOM: z.boolean().optional().default(true).describe("Include DOM/accessibility tree in snapshot"),
+      includeDOM: z.boolean().optional().default(true).describe("Include DOM/accessibility tree in snapshot. Turn OFF on large apps."),
       logTailLines: z.number().int().min(1).max(500).optional().default(50).describe("Number of recent log lines to include"),
+      includeScreenshot: z.boolean().optional().default(false).describe("Include a screenshot. Off by default: on a real app it is far too large for most context windows."),
+      domDepth: z.number().int().min(1).max(20).optional().default(4).describe("How deep to walk the DOM. Keep small; the full tree rarely fits in context."),
     },
-    implementation: async ({ includeDOM, logTailLines }) => {
+    implementation: async ({ includeDOM, logTailLines, includeScreenshot, domDepth }) => {
       const dp = getDebugProvider();
-      return dp.captureState({ includeDOM, logTailLines });
+      return dp.captureState({ includeDOM, logTailLines, includeScreenshot, domDepth });
     },
   }), "debug_capture_state");
 
@@ -3321,9 +3337,15 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   const hasStoredBlocks = activeSessionState.resumedFromPersistedState && activeSessionState.managedContextBlocks.length > 0;
   const managedContextPresent = hasBlocksInHistory || hasStoredBlocks;
 
-  // Capture user message for handover context (rolling window of last 5)
+  // Capture user message for handover context (rolling window of last 5).
+  // Bound each entry as well as the count: five long pastes previously produced
+  // a summarize prompt large enough to fail the tick with a context error.
   if (t.length > 0) {
-    _bridgeHandover.push(t);
+    _bridgeHandover.push(
+      t.length > BRIDGE_HANDOVER_ENTRY_CHARS
+        ? `${t.slice(0, BRIDGE_HANDOVER_ENTRY_CHARS)}\n[truncated ${t.length - BRIDGE_HANDOVER_ENTRY_CHARS} chars]`
+        : t,
+    );
     if (_bridgeHandover.length > 5) {
       _bridgeHandover = _bridgeHandover.slice(-5);
     }
@@ -3432,7 +3454,85 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
       `[Latest user request — prioritize this over recapping completed work: "${t}"]\n[Goal recorded: "${plan.goal}". Before using any other tool, call create_plan({ goal: "${plan.goal}", steps: [...] }) to break this request into concrete steps, THEN execute each step with your other tools. Do not skip straight to other tools without a plan.]`,
     );
   }
+
+  // Context pressure. buildPromptBudgetReport already computes overflow/nearLimit
+  // but nothing ever read it — the budget machinery was exercised only by its own
+  // tests, so a long session ran until LM Studio hard-failed with "Context size
+  // has been exceeded" (reproduced live at 16425/17318 tokens). Surface it here,
+  // where the model can still act, by telling it to compact.
+  const pressure = await describeContextPressure(historyText, t, ctl);
+  if (pressure) return recordProcessedPrompt(historyText, `${t}\n\n${pressure}`);
+
   return null;
+}
+
+/**
+ * Returns a directive when the conversation is close to (or past) the usable
+ * context budget, otherwise null. Honors the user's `tools.contextLength`
+ * setting, clamped to what the model is actually loaded with — a setting larger
+ * than the real window is worse than useless, since it defers action until after
+ * the hard limit is already breached.
+ */
+async function describeContextPressure(
+  historyText: string,
+  currentText: string,
+  ctl?: any,
+): Promise<string | null> {
+  try {
+    const modelWindow = await getContextWindow(ctl);
+    const configured = readNumericSetting(ctl, "contextLength");
+    const window = configured && configured > 0
+      ? Math.min(configured, modelWindow)
+      : modelWindow;
+
+    // buildPromptBudgetReport's default trigger is 50% of the window, but the
+    // hard budget is PROMPT_BUDGET_RATIO (0.30) of it — so the default "near
+    // limit" line sits ABOVE the hard limit and can only be crossed once the
+    // prompt already overflowed. As an early warning it was unreachable. Warn
+    // at a fraction of the hard limit instead, which is genuinely earlier.
+    const hardLimit = hardPromptBudgetLimit(window);
+    const trigger = Math.max(256, Math.floor(hardLimit * CONTEXT_PRESSURE_TRIGGER_RATIO));
+    const report = buildPromptBudgetReport(historyText, currentText, window, trigger);
+
+    // Once the prompt is ALREADY over the limit, appending a directive makes it
+    // larger at the worst possible moment. That case belongs to LM Studio's
+    // native rolling window, and vibeLM must not replace the user turn there.
+    if (report.overflow) return null;
+
+    // Before the wall, there is still room to act, and this is the window that
+    // was previously unused: nothing read nearLimit, so a long session sailed
+    // past it and died at the hard limit instead.
+    if (report.nearLimit) {
+      return `[CONTEXT PRESSURE: about ${report.estimatedTokens} tokens used of a ${window}-token window. Call compact_context soon to summarize progress and free room, and prefer small tool results (for example debug_capture_state with includeDOM false and no screenshot).]`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Exposes the bridge handover buffer so its size bounds can be asserted. */
+export function getBridgeHandoverForTest(): string[] {
+  return [..._bridgeHandover];
+}
+
+/** Exposes the window the pressure check will use, so tests can size input against it. */
+export async function getEffectiveContextWindowForTest(ctl?: any): Promise<number> {
+  const modelWindow = await getContextWindow(ctl);
+  const configured = readNumericSetting(ctl, "contextLength");
+  return configured && configured > 0 ? Math.min(configured, modelWindow) : modelWindow;
+}
+
+/** Reads a numeric plugin setting, tolerating both bare and `tools.`-prefixed keys. */
+function readNumericSetting(ctl: any, key: string): number | null {
+  try {
+    const cfg = ctl?.getPluginConfig?.();
+    if (!cfg?.get) return null;
+    const v = cfg.get(`tools.${key}`) ?? cfg.get(key);
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 // The pinned "head" of a cut-the-middle retention strategy. When the host rolls raw history it drops
