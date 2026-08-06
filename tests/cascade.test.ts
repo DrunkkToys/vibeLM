@@ -1944,3 +1944,66 @@ describe("debug tools", () => {
     }
   });
 });
+
+// An abandoned plan used to be restored into runtime state forever, so the pinned spine put the old
+// goal and its pending steps — plus "[If a step was in progress, continue it]" — ahead of every new
+// request. Reproduced live in LM Studio: a leftover three-step "survey src/" plan hijacked three
+// consecutive fresh chats across two models before its last step happened to be marked done.
+describe("stale plan carry-forward", () => {
+  // The size-ratio guard infers conversation identity from message length, so a long first message
+  // in a new chat after a short previous chat reads as "same conversation". These are the exact live
+  // numbers that carried a stale plan into a fresh chat: 0.3 * 1531 = 459, and the new prompt was 622.
+  it("recognizes a fresh chat by structure even when the size ratio says otherwise", async () => {
+    const { historyHasPriorAssistantTurns } = await import("../src/toolsProvider");
+    const msg = (role: string, text: string) => ({ getRole: () => role, getText: () => text });
+    const chat = (msgs: any[]) => ({ getLength: () => msgs.length, at: (i: number) => msgs[i] });
+
+    const longFirstPrompt = "x".repeat(622);
+    assert.equal(historyHasPriorAssistantTurns(chat([msg("user", longFirstPrompt)])), false);
+    assert.equal(
+      historyHasPriorAssistantTurns(chat([msg("user", "hi"), msg("assistant", "hello")])),
+      true,
+    );
+  });
+
+  it("counts tool traffic as a prior turn when the role is unavailable", async () => {
+    const { historyHasPriorAssistantTurns } = await import("../src/toolsProvider");
+    const withTools = {
+      getLength: () => 1,
+      at: () => ({ getText: () => "", getToolCallRequests: () => [{ name: "read_file" }], getToolCallResults: () => [] }),
+    };
+    assert.equal(historyHasPriorAssistantTurns(withTools), true);
+  });
+
+  it("fails safe to the previous behavior when the history shape cannot be read", async () => {
+    const { historyHasPriorAssistantTurns } = await import("../src/toolsProvider");
+    assert.equal(historyHasPriorAssistantTurns(null), true);
+    assert.equal(historyHasPriorAssistantTurns(undefined), true);
+    assert.equal(historyHasPriorAssistantTurns({}), true);
+    assert.equal(historyHasPriorAssistantTurns({ getLength: () => { throw new Error("boom"); }, at: () => null }), true);
+  });
+
+  // The plugin process outlives chats, so this is the path a new chat actually takes. Both live
+  // reproductions went through here, not the bootstrap branch.
+  it("treats the opening turn of a fresh chat as a different conversation whatever the sizes say", async () => {
+    const { looksLikeDifferentConversation } = await import("../src/toolsProvider");
+    // Short previous chat disabled the guard entirely: 0 <= MIN_SUBSTANTIAL_HISTORY_CHARS.
+    assert.equal(looksLikeDifferentConversation(0, 98, "what is 17 multiplied by 23?", false), true);
+    // Long opening message cleared the 30% threshold: 0.3 * 1531 = 459 < 622.
+    assert.equal(looksLikeDifferentConversation(1531, 622, "x".repeat(622), false), true);
+  });
+
+  it("keeps an ongoing conversation intact when a turn has already run", async () => {
+    const { looksLikeDifferentConversation } = await import("../src/toolsProvider");
+    assert.equal(looksLikeDifferentConversation(1531, 622, "x".repeat(622), true), false);
+    // A dramatic shrink with prior turns is still a roll, not a new chat, unless size says otherwise.
+    assert.equal(looksLikeDifferentConversation(10000, 100, "short", true), true);
+  });
+
+  it("lets the managed-context marker outrank the fresh-chat signal", async () => {
+    const { looksLikeDifferentConversation } = await import("../src/toolsProvider");
+    // vibeLM re-injects the marker when it rolls, so its presence means same conversation.
+    assert.equal(looksLikeDifferentConversation(10000, 100, "[vibeLM:managed-context] rolled", false), false);
+  });
+
+});
