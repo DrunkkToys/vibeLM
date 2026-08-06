@@ -43,6 +43,55 @@ echo "▸ Copying dist/ to install dir..."
 cp -r "$SOURCE_DIR/dist" "$INSTALL_DIR/dist"
 echo "  ✓ dist/ copied"
 
+# 5b. Drop devDependencies from the install.
+# `lms dev --install` copies node_modules wholesale, so the test toolchain (Playwright,
+# TypeScript, tsx, esbuild) ships to every user — ~18MB of Playwright alone. production.js
+# requires only @lmstudio/sdk, mathjs, ws and zod at runtime, so anything outside the
+# production dependency closure is dead weight.
+#
+# Fail-safe: if the closure cannot be computed, nothing is deleted and the build continues.
+echo "▸ Pruning devDependencies from install..."
+KEEP_LIST="$(cd "$SOURCE_DIR" && npm ls --omit=dev --all --parseable 2>/dev/null \
+  | sed "s|.*/node_modules/||" \
+  | grep -v "^/" \
+  | awk -F/ '{if (substr($1,1,1)=="@") print $1"/"$2; else print $1}' \
+  | sort -u)" || true
+
+if [ -z "$KEEP_LIST" ] || [ ! -d "$INSTALL_DIR/node_modules" ]; then
+  echo "  ⚠ skipped (no production closure or no node_modules) — nothing deleted"
+else
+  BEFORE_KB=$(du -sk "$INSTALL_DIR/node_modules" | cut -f1)
+  DROPPED=0
+
+  # Collect installed top-level packages, expanding @scope/ dirs one level.
+  # npm hoists transitive deps to top level, so this covers the whole tree.
+  INSTALLED_PKGS=()
+  for entry in "$INSTALL_DIR"/node_modules/*/; do
+    [ -d "$entry" ] || continue
+    name=$(basename "${entry%/}")
+    if [ "${name#@}" != "$name" ]; then
+      for sub in "$entry"*/; do
+        [ -d "$sub" ] || continue
+        INSTALLED_PKGS+=("$name/$(basename "${sub%/}")")
+      done
+    else
+      INSTALLED_PKGS+=("$name")
+    fi
+  done
+
+  for pkg in ${INSTALLED_PKGS+"${INSTALLED_PKGS[@]}"}; do
+    if ! printf '%s\n' "$KEEP_LIST" | grep -qxF "$pkg"; then
+      rm -rf "${INSTALL_DIR:?}/node_modules/${pkg:?}"
+      DROPPED=$((DROPPED + 1))
+    fi
+  done
+  # Empty scope dirs and .bin entries pointing at removed packages are now dangling.
+  find "$INSTALL_DIR/node_modules" -maxdepth 1 -type d -name '@*' -empty -delete 2>/dev/null || true
+  find "$INSTALL_DIR/node_modules/.bin" -maxdepth 1 -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+  AFTER_KB=$(du -sk "$INSTALL_DIR/node_modules" | cut -f1)
+  echo "  ✓ removed $DROPPED dev package(s): $((BEFORE_KB / 1024))MB → $((AFTER_KB / 1024))MB"
+fi
+
 # 6. Seed runtime config.json in DATA_DIR (outside INSTALL_DIR, so reinstalls never touch it).
 echo "▸ Preserving config.json..."
 mkdir -p "$DATA_DIR"
