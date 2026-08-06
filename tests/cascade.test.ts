@@ -197,6 +197,32 @@ describe("vibeLM Cascade Integration", () => {
     assert.ok(toolNames.includes("amend"), "amend must remain exposed");
   });
 
+  it("bounds each bridge handover entry so one long paste cannot blow the tick's context", async () => {
+    const { preprocessMessage, getBridgeHandoverForTest } = await import("../src/toolsProvider") as any;
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "" }),
+    };
+    // The buffer was capped at 5 entries but not by size. Five long messages
+    // produced a summarize prompt big enough to fail the tick outright with
+    // "Context size has been exceeded" (observed live in LM Studio's plugin log).
+    const huge = "y".repeat(50_000);
+    for (let i = 0; i < 5; i++) await preprocessMessage(huge, ctl);
+
+    const buf: string[] = getBridgeHandoverForTest();
+    assert(buf.length <= 5, `handover keeps at most 5 entries, got ${buf.length}`);
+    for (const entry of buf) {
+      assert(
+        entry.length < 10_000,
+        `each handover entry must be bounded, got ${entry.length} chars`,
+      );
+    }
+    assert(
+      buf.join("\n\n").length < 60_000,
+      `whole handover buffer must stay bounded, got ${buf.join("\n\n").length} chars`,
+    );
+  });
+
   it("keeps disabled tools out of the unattended vibe_bridge capability set", async () => {
     const { resolveBridgeTickToolNames } = await import("../src/toolsProvider");
     const enabled = resolveBridgeTickToolNames(["vibe_bridge", "read_file", "get_plan"]);
@@ -290,6 +316,49 @@ describe("vibeLM Cascade Integration", () => {
     };
     const processed = await preprocessMessage("continue the benchmark", ctl);
     assert.equal(processed, null, "vibeLM must not replace the user turn before native rollingWindow can run");
+  });
+
+  it("warns the model to compact once context pressure is real but before overflow", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const contextWindow = 32768;
+    // Sit between the pressure trigger (0.75 of the hard budget) and the hard
+    // budget itself, so there is still room to act. This band used to be
+    // unreachable, because the default warning line sat ABOVE the hard limit,
+    // so a long session ran straight into "Context size has been exceeded".
+    // The window is read from the provider so the sizing holds whether or not
+    // a live LM Studio instance is reachable.
+    const { getEffectiveContextWindowForTest } = await import("../src/toolsProvider") as any;
+    const baseCtl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      getModelContextWindow: () => contextWindow,
+    };
+    const w: number = await getEffectiveContextWindowForTest(baseCtl);
+    const hardLimitTokens = Math.max(512, Math.floor(w * 0.30));
+    const targetTokens = Math.floor(hardLimitTokens * 0.85); // between 0.75 and 1.0
+    const history = "x".repeat(targetTokens * 4);
+    const ctl: any = {
+      ...baseCtl,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => history }),
+    };
+    const processed = await preprocessMessage("continue the benchmark", ctl);
+    assert(processed, "must surface context pressure while the model can still act on it");
+    assert.match(processed!, /CONTEXT PRESSURE/);
+    assert.match(processed!, /compact_context/);
+    assert(
+      processed!.includes("continue the benchmark"),
+      "the user's own turn must be preserved, not replaced",
+    );
+  });
+
+  it("stays silent on a small prompt so ordinary turns are untouched", async () => {
+    const { preprocessMessage } = await import("../src/toolsProvider");
+    const ctl: any = {
+      getWorkingDirectory: () => TEST_DIR,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "user: hi\nassistant: hello\n" }),
+      getModelContextWindow: () => 32768,
+    };
+    const processed = await preprocessMessage("what is 2+2?", ctl);
+    if (processed) assert.doesNotMatch(processed, /CONTEXT PRESSURE/);
   });
 
   it("reasoningDirectiveFor maps effort + arch to each family's native thinking control", async () => {
