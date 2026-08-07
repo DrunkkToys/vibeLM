@@ -1953,6 +1953,43 @@ describe("debug tools", () => {
 // had just asked. Combined with steps the model never marked done and a plugin that restarts between
 // turns, that deadlocked a chat: three different follow-ups, one of them "Phase 1 is finished, do not
 // summarise it again", each returned a byte-identical reply re-reporting the first request.
+// The goal-only-plan directive fires on every goal-like turn while steps are empty. That is wanted —
+// models otherwise skip create_plan entirely. What deadlocked a chat live was its wording: "Before
+// using any other tool ... Do not skip straight to other tools" tells a model that answers in prose
+// to keep not-acting, nothing ever adds steps, and the next turn produces the same directive. Three
+// consecutive requests each returned "I'll create a plan ... then execute each step", zero tool calls.
+describe("goal-only plan directive escape", () => {
+  const TMP = resolve(tmpdir(), `vibelm-goalonly-${process.pid}`);
+
+  it("asks for a plan without ever forbidding the model from acting", async () => {
+    const { preprocessMessage, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    mkdirSync(TMP, { recursive: true });
+    const ctl: any = {
+      getWorkingDirectory: () => TMP,
+      pullHistory: async () => ({ getSystemPrompt: () => "", toString: () => "Turn 1: build a weather cli" }),
+    };
+    await resolveSessionStateFromHistory(ctl, true);
+
+    // Every goal-like turn while steps are empty looks like the first one, because a goal-only plan
+    // is not carried across the plugin restart that happens between turns. So both turns must be
+    // actionable, not just a later one.
+    for (const message of [
+      "build me a quick weather cli that prints the weather",
+      "also add a caching layer to the weather cli",
+    ]) {
+      const processed = await preprocessMessage(message, ctl);
+      assert.ok(processed, "a goal-like turn must produce a directive, not pass through silently");
+      assert.match(processed as string, /create_plan/, "create_plan must still be requested");
+      assert.doesNotMatch(
+        processed as string,
+        /Do not skip straight to other tools/,
+        "the directive must not forbid tool use — that is the deadlock",
+      );
+      assert.match(processed as string, /act on this turn/i, "the directive must require acting");
+    }
+  });
+});
+
 describe("resume trailer priority", () => {
   const isContinueTrailer = (s: string) => s.startsWith("[If a step was in progress");
 

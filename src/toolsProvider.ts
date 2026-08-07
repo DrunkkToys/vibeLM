@@ -3499,13 +3499,25 @@ async function preprocessMessageCore(text: string, ctl?: PromptPreprocessorContr
   // Left alone, models reproducibly skip straight to bash_terminal/file tools without ever calling
   // create_plan (caught live across every real session in session-log.jsonl — none contained a
   // create_plan call). That leaves plan.steps permanently empty, which starves vibe_bridge's tick
-  // loop (it keys off plan.steps to build its directive) of any guidance at all. Force the directive
-  // on every goal-like turn until steps actually exist.
+  // loop (it keys off plan.steps to build its directive) of any guidance at all. So the directive
+  // still fires on every goal-like turn while steps are empty.
+  //
+  // What it must never do is forbid acting. The original wording ended "Do not skip straight to other
+  // tools without a plan", which a model that answers in prose rather than tool calls obeys by doing
+  // nothing at all. Nothing then adds steps, so the next goal-like turn produces the same directive,
+  // and the conversation cannot move. Reproduced live: four consecutive requests each came back as
+  // "I'll create a plan ... then execute each step" — 56-93 tokens, zero tool calls.
+  //
+  // A "have we already asked?" check cannot fix this: a goal-only plan has steps.length === 0, so
+  // planWorthCarryingForward rejects it on every plugin restart (which happens between turns), the
+  // plan is re-seeded from the current message, and every turn looks like the first one. The wording
+  // itself has to leave a way forward, so it now requires action either way — plan first if the work
+  // is multi-step, but execute regardless, and never answer with a description instead of a call.
   if (activeSessionState.plan && activeSessionState.plan.steps.length === 0 && isGoalLikeMessage(t)) {
     const plan = activeSessionState.plan;
     return recordProcessedPrompt(
       historyText,
-      `[Latest user request — prioritize this over recapping completed work: "${t}"]\n[Goal recorded: "${plan.goal}". Before using any other tool, call create_plan({ goal: "${plan.goal}", steps: [...] }) to break this request into concrete steps, THEN execute each step with your other tools. Do not skip straight to other tools without a plan.]`,
+      `[Latest user request — prioritize this over recapping completed work: "${t}"]\n[Goal recorded: "${plan.goal}". If this needs several steps, call create_plan({ goal: "${plan.goal}", steps: [...] }) first and then execute each step with your other tools. Either way, act on this turn: call the tools the request asks for. Do not reply with a description of what you are about to do.]`,
     );
   }
 
