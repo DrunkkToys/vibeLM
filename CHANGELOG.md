@@ -5,6 +5,45 @@ All notable changes to vibeLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.18] - 2026-08-07
+
+### Fixed
+- **Context overflow is now deferred to LM Studio's native rolling window** instead of replacing the
+  user turn with a vibeLM handoff once the prompt is already over budget. The host's own rollover
+  drops the oldest turns; vibeLM no longer injects an unbounded replacement text at the worst moment.
+- **The `tools.contextLength` setting is actually read now.** It was defined in `config.ts` and
+  promised to truncate older messages, but no code ever consumed it — a configured budget silently
+  never applied. It now drives the prompt-budget math, clamped to the model's real loaded context.
+- **A context-pressure directive now fires before the hard limit** (at 75% of the prompt budget)
+  telling the model to call `compact_context`. A long session previously sailed past `nearLimit`
+  (nothing read it) and died with LM Studio's "Context size has been exceeded"; an unattended
+  `vibe_bridge` tick could fail the same way.
+- **`clear_memories` honours its tags.** It previously advertised the `tags` parameter and rejected
+  it in the implementation, so a model asked to clear one tag called it twice — once with tags
+  (rejected), once without (total wipe) — destroying 1510 memories and the entire session log.
+  Tag-scoped deletion now works via `deleteMemoriesByTags`, and the index-rebuild bug (byte offsets
+  pushed per line-end instead of line-start) that made reads come back empty after a restart is fixed.
+- **`amend` calls are recorded in session-log.jsonl.** `amend` was defined with a bare `tool({...})`
+  instead of the `wrapTool(tool({...}), name)` pattern every other tool uses, so it skipped the
+  turn-entry logging path — a full 37-tool run showed `amend` succeeding in the UI while the log
+  contained zero traces of it.
+- **The CDP debug adapter works against a real application.** Attach, capture state, execute
+  interactions, and CSS hotfixes now function on a live target (verified with a real browser):
+  repeated debug operations are safe to repeat, `debug_apply_hotfix` only advertises the patch type
+  it implements, and `ws` is declared as a runtime dependency so the adapter can actually connect.
+- **Plans no longer leak across chats or override the user.** A leftover plan from a previous chat no
+  longer hijacks the next one; a pinned plan no longer overrides the user's current request; and the
+  goal-only plan directive no longer forbids the model from acting.
+- **The installed plugin no longer ships devDependencies** (Playwright and friends were previously
+  included in the published artifact).
+- **CI runs on PRs that don't target main.** A base-filtered `pull_request` trigger meant stacked
+  PRs showed zero checks until they were reopened.
+
+### Changed
+- **Docs:** the README now documents the debugging tools and the settings table matches the real
+  config schema (`tools.contextLength`, `tools.maxOrchestratorTurns`, etc.); the debug_apply_hotfix
+  and clear_memories settings descriptions match their actual behavior.
+
 ## [0.2.17] - 2026-07-30
 
 ### Fixed
