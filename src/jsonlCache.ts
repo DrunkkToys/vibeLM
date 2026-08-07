@@ -21,6 +21,13 @@ export class JsonlCache {
     this.rebuildIndex();
   }
 
+  // byteOffsets holds the START byte of each line — the convention append()/appendBatch() use, and the
+  // one readLineByIndex()/readLineRange() read back (they slice from byteOffsets[i] up to
+  // byteOffsets[i+1]). This used to push the position of each NEWLINE instead, i.e. the end of the
+  // line, so a rebuilt index was off by a whole line: reading the last line of a file returned just
+  // the trailing "\n" and reads came back empty. It affected every path that rebuilds — the
+  // constructor over an existing file, and compact() — which means a restarted process read its own
+  // log wrongly.
   private rebuildIndex(): void {
     this.byteOffsets = [];
     this.count = 0;
@@ -30,14 +37,18 @@ export class JsonlCache {
       const fd = openSync(this.path, "r");
       const buf = Buffer.alloc(Math.min(SCAN_BUFFER_SIZE, size));
       let fileOffset = 0;
+      let lineStart = 0;
       while (fileOffset < size) {
         const toRead = Math.min(buf.length, size - fileOffset);
         const bytesRead = readSync(fd, buf, 0, toRead, fileOffset);
         if (bytesRead === 0) break;
         for (let i = 0; i < bytesRead; i++) {
           if (buf[i] === 0x0a) {
-            this.byteOffsets.push(fileOffset + i);
+            // A line is only counted once its terminator is seen, so a partially written trailing
+            // line is ignored rather than indexed at an offset that cannot be read back.
+            this.byteOffsets.push(lineStart);
             this.count++;
+            lineStart = fileOffset + i + 1;
           }
         }
         fileOffset += bytesRead;
@@ -213,6 +224,48 @@ export class JsonlCache {
     appendFileSync(tmp, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
     renameSync(tmp, this.path);
     this.rebuildIndex();
+  }
+
+  /**
+   * Remove `mem` entries carrying any of the given tags, keeping every other line — including turns,
+   * summaries, and memories that do not match. Returns how many entries were removed.
+   *
+   * Append-only storage does not prevent this: the file is rewritten without the matching lines, the
+   * same way compact() already rewrites it.
+   */
+  deleteMemoriesByTags(tags: string[]): number {
+    const wanted = new Set(tags.filter((t) => typeof t === "string" && t.length > 0));
+    if (wanted.size === 0) return 0;
+
+    const lines = this.readLineRange(0, this.count);
+    const kept: string[] = [];
+    let removed = 0;
+    for (const line of lines) {
+      let entry: JsonlEntry | null = null;
+      try {
+        entry = JSON.parse(line) as JsonlEntry;
+      } catch {
+        // Unparseable lines are data we cannot classify — never drop them.
+        kept.push(line);
+        continue;
+      }
+      const entryTags = Array.isArray(entry?.tags) ? (entry.tags as unknown[]) : [];
+      const matches = entry?.type === "mem"
+        && entryTags.some((t) => typeof t === "string" && wanted.has(t));
+      if (matches) {
+        removed++;
+        continue;
+      }
+      kept.push(line);
+    }
+
+    if (removed > 0) {
+      const tmp = this.path + ".tmp";
+      writeFileSync(tmp, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
+      renameSync(tmp, this.path);
+      this.rebuildIndex();
+    }
+    return removed;
   }
 
   clear(): void {

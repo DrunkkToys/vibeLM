@@ -1958,6 +1958,82 @@ describe("debug tools", () => {
 // using any other tool ... Do not skip straight to other tools" tells a model that answers in prose
 // to keep not-acting, nothing ever adds steps, and the next turn produces the same directive. Three
 // consecutive requests each returned "I'll create a plan ... then execute each step", zero tool calls.
+// clear_memories advertised a `tags` filter it did not implement, and rejected it with the text
+// "Omit tags to clear all." A model asked to clear one tag called it twice — with tags (rejected),
+// then without (total wipe) — destroying 1510 memories and the entire session log. The failure
+// message actively recommended the destructive path.
+// byteOffsets holds the START of each line, which is what append() writes and readLineRange() reads.
+// rebuildIndex() pushed the NEWLINE position instead, so any rebuilt index was off by a line and the
+// last line read back as just "\n". That hit the constructor over an existing file — so a restarted
+// process misread its own log — and compact().
+describe("jsonl index rebuild", () => {
+  it("indexes an existing file so every line reads back", async () => {
+    const { JsonlCache } = await import("../src/jsonlCache");
+    const dir = resolve(tmpdir(), `vibelm-jsonl-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const p = resolve(dir, "x.jsonl");
+
+    const first = new JsonlCache(p);
+    first.append({ type: "mem", tags: ["a"], content: "one" });
+    first.append({ type: "mem", tags: ["b"], content: "two" });
+
+    // Reopening forces rebuildIndex over a non-empty file.
+    const reopened = new JsonlCache(p);
+    assert.equal(reopened.totalLines(), 2, "both lines must be counted");
+    const tail = reopened.readTail(10) as any[];
+    assert.equal(tail.length, 2, "both lines must read back after a rebuild");
+    assert.equal(tail[1].content, "two", "the final line must not read back as an empty newline");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("clear_memories tag scoping", () => {
+  const mkLog = async (dir: string) => {
+    const { SessionLog } = await import("../src/sessionLog");
+    mkdirSync(dir, { recursive: true });
+    return new SessionLog(resolve(dir, "session-log.jsonl"));
+  };
+
+  it("deletes only the tagged memories and leaves everything else", async () => {
+    const dir = resolve(tmpdir(), `vibelm-clear-${process.pid}-a`);
+    const log = await mkLog(dir);
+    log.saveMemory(["keep"], "keep me");
+    log.saveMemory(["scratch"], "drop me");
+    log.saveMemory(["scratch", "other"], "drop me too");
+
+    const removed = log.deleteMemoriesByTags(["scratch"]);
+    assert.equal(removed, 2, "both scratch-tagged memories should go");
+
+    const left = log.readRecentMemories(50).map((m: any) => m.content);
+    assert.ok(left.includes("keep me"), "untagged-for-deletion memory must survive");
+    assert.ok(!left.includes("drop me"), "tagged memory must be gone");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("is a no-op for tags that match nothing, rather than clearing everything", async () => {
+    const dir = resolve(tmpdir(), `vibelm-clear-${process.pid}-b`);
+    const log = await mkLog(dir);
+    log.saveMemory(["keep"], "survivor");
+
+    assert.equal(log.deleteMemoriesByTags(["no-such-tag"]), 0);
+    assert.equal(log.deleteMemoriesByTags([]), 0, "an empty tag list must not wipe the store");
+    assert.equal(log.readRecentMemories(50).length, 1, "nothing should have been deleted");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("is idempotent on repeat invocation", async () => {
+    const dir = resolve(tmpdir(), `vibelm-clear-${process.pid}-c`);
+    const log = await mkLog(dir);
+    log.saveMemory(["scratch"], "gone");
+    log.saveMemory(["keep"], "stays");
+
+    assert.equal(log.deleteMemoriesByTags(["scratch"]), 1);
+    assert.equal(log.deleteMemoriesByTags(["scratch"]), 0, "second call must remove nothing further");
+    assert.equal(log.readRecentMemories(50).length, 1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("goal-only plan directive escape", () => {
   const TMP = resolve(tmpdir(), `vibelm-goalonly-${process.pid}`);
 
