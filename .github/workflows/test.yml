@@ -4,8 +4,17 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  # Deliberately unfiltered by base branch. With `branches: [main]` here, a PR opened against any
+  # other base — a stacked PR on top of another fix branch — matched nothing and silently showed no
+  # checks at all. Retargeting it to main afterwards did not help either: changing a base emits
+  # `pull_request: edited`, which is not one of the default activity types (opened, synchronize,
+  # reopened), so nothing re-ran and the PR sat at zero checks looking hung. Only closing and
+  # reopening it produced checks. Running on every PR regardless of base costs one extra run per
+  # stacked PR and removes the trap.
+  #
+  # `types:` is intentionally left at its default. Adding `edited` would also fire CI on every title
+  # and description edit.
   pull_request:
-    branches: [main]
 
 jobs:
   test:
