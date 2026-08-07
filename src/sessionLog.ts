@@ -301,6 +301,11 @@ export class SessionLog {
     this.jsonl.compact();
   }
 
+  /** Delete only the memories carrying any of these tags. Turns and other memories survive. */
+  deleteMemoriesByTags(tags: string[]): number {
+    return this.jsonl.deleteMemoriesByTags(tags);
+  }
+
   clear(): void {
     this.jsonl.clear();
     this.workingWindow = [];

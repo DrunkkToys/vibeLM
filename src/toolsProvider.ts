@@ -2840,19 +2840,29 @@ NOTE: Use search_memory to find specific entries. This can be limited by workspa
 
   const clearMemoriesTool = wrapTool(tool({
     name: "clear_memories",
-    description: text`Deletes ALL memory entries. This is irreversible.
-USE WHEN: you need to reset the memory knowledge base completely.
-EXAMPLE: clear_memories()
-NOTE: This deletes everything. There is no undo. Use save_memory to re-add important entries after.`,
+    description: text`Deletes memory entries. Irreversible — there is no undo.
+USE WHEN: you need to drop a set of memories, or reset the knowledge base completely.
+EXAMPLE: clear_memories({ tags: ["scratch"] })
+NOTE: Pass tags to delete ONLY the memories carrying them. Calling it with no tags erases the ENTIRE session log — every memory AND the recorded turn history — so prefer tags unless a full reset is genuinely wanted.`,
     parameters: {
-      tags: z.array(z.string().max(50)).optional().describe("If provided, only delete entries matching ANY of these tags"),
+      tags: z.array(z.string().max(50)).optional().describe("If provided, only delete entries matching ANY of these tags. Omit ONLY when a full wipe is intended."),
     },
+    // The tags argument used to be advertised here and rejected in the implementation, with the
+    // failure text reading "Omit tags to clear all." A model asked to clear one tag therefore called
+    // it twice — once with tags (rejected), once without (total wipe) — and destroyed the whole store.
+    // Observed live: 1510 memory entries and the entire session log lost to that exact sequence.
+    // Append-only storage was never the obstacle; the file is rewritten without the matching lines,
+    // exactly as compact() already does.
     implementation: async ({ tags }) => {
       if (tags && tags.length > 0) {
-        return fail("Tag-specific clear not supported with append-only JSONL. Omit tags to clear all.");
+        const deletedCount = getSessionLog().deleteMemoriesByTags(tags);
+        return ok({
+          deletedCount,
+          message: `Deleted ${deletedCount} memor${deletedCount === 1 ? "y" : "ies"} tagged ${tags.join(", ")}. All other memories and the turn history were left intact.`,
+        });
       }
       getSessionLog().clear();
-      return ok({ deletedCount: -1, message: "Session log cleared." });
+      return ok({ deletedCount: -1, message: "Session log cleared — all memories and turn history erased." });
     },
   }), "clear_memories");
 
