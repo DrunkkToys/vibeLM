@@ -74,12 +74,27 @@ describe("vibeLM Cascade Integration", () => {
   });
 
   it("blocks LM Studio Hub publishing unless this exact commit has the matching release tag", () => {
+    const cwd = resolve(import.meta.dirname, "..");
     const result = spawnSync(process.execPath, ["scripts/verify-hub-release.mjs"], {
-      cwd: resolve(import.meta.dirname, ".."),
+      cwd,
       encoding: "utf8",
     });
-    assert.notEqual(result.status, 0, "an untagged development commit must not be publishable to Hub");
-    assert.match(`${result.stdout}\n${result.stderr}`, /release tag|tagged commit/i);
+    const version = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8")).version;
+    const onTaggedCommit = (() => {
+      try {
+        const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
+        const tagged = spawnSync("git", ["rev-list", "-n", "1", `v${version}`], { cwd, encoding: "utf8" }).stdout.trim();
+        return tagged !== "" && head === tagged;
+      } catch {
+        return false;
+      }
+    })();
+    if (onTaggedCommit) {
+      assert.equal(result.status, 0, "the tagged release commit must be publishable to Hub");
+    } else {
+      assert.notEqual(result.status, 0, "an untagged development commit must not be publishable to Hub");
+      assert.match(`${result.stdout}\n${result.stderr}`, /release tag|tagged commit/i);
+    }
   });
 
   after(() => {
