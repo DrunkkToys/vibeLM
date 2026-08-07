@@ -63,7 +63,7 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
   {
     name: "clear_memories",
     displayName: "Clear Memories",
-    subtitle: "Enable clearing the memory store for a fresh start.",
+    subtitle: "Enable deleting memories: pass tags to clear only those entries, or call with no tags for a full wipe.",
     defaultEnabled: false,
   },
   {
@@ -219,7 +219,7 @@ export const TOOL_TOGGLES: ToolToggleDefinition[] = [
   {
     name: "debug_apply_hotfix",
     displayName: "Debug: Apply Hotfix",
-    subtitle: "Enable live code/CSS/DOM patches to verify fixes at runtime.",
+    subtitle: "Enable live CSS hotfixes to verify fixes at runtime (CSS injection only).",
     defaultEnabled: false,
   },
 ];
