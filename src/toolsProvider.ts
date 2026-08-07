@@ -2347,7 +2347,10 @@ NOTE: Call with exactly an empty object: {}. Do not add an empty-string key or p
     },
   }), "get_current_datetime");
 
-  const amendTool = tool({
+  // wrapTool below already increments turnCounter (and exempts "amend" from the max-turns check by
+  // name) before calling this implementation, so this body must not increment it a second time — it
+  // only needs to read the value wrapTool has already set.
+  const amendTool = wrapTool(tool({
     name: "amend",
     description: text`Return the best available answer, progress update, or handoff summary to the user.
 USE WHEN: the task is complete, blocked, out of budget, or you need to hand off partial progress clearly.
@@ -2357,7 +2360,6 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
       text: z.string().min(1).max(100000).describe("Your complete final response to the user"),
     },
     implementation: async ({ text }) => {
-      activeSessionState.turnCounter++;
       const atTurnCap = activeMaxOrchestratorTurns > 0 && activeSessionState.turnCounter >= activeMaxOrchestratorTurns;
       if (!atTurnCap && /let me know|what next|how can i assist|would you like|tell me what|happy to help|if you'd like|let me know if/i.test(text)) {
         return {
@@ -2396,7 +2398,7 @@ EXAMPLE: amend({ text: "Here is the current status and the next blocker..." })`,
         data: { text: sanitizedText },
       };
     },
-  });
+  }), "amend");
 
   const createPlanTool = wrapTool(tool({
     name: "create_plan",

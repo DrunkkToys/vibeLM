@@ -145,6 +145,42 @@ describe("vibeLM Cascade Integration", () => {
     assert.equal(result.data.text, "Here is the completed result.");
   });
 
+  // amend was defined with a bare tool({...}) instead of wrapTool(tool({...}), "amend") like every
+  // other tool, so it never went through wrapTool's logging path. Every other tool call is written to
+  // session-log.jsonl as a turn entry; amend calls were invisible to it. Live-observed: a full 37-tool
+  // one-session run showed "amend" succeeding in the LM Studio UI, but grepping the session log for
+  // it, across the log's entire history, returned zero matches.
+  it("logs amend calls to the session log like every other tool", async () => {
+    const { toolsProvider } = await import("../src/toolsProvider");
+    const logPath = resolve(CONFIG_DIR, "session-log.jsonl");
+    const before = existsSync(logPath) ? readFileSync(logPath, "utf-8").split("\n").filter(Boolean).length : 0;
+
+    const tools = await toolsProvider({ getWorkingDirectory: () => TEST_DIR } as any);
+    const amend = tools.find((t: any) => t.name === "amend");
+    await amend.implementation({ text: "Logged amend call for the regression test." });
+
+    const lines = readFileSync(logPath, "utf-8").split("\n").filter(Boolean);
+    const newEntries = lines.slice(before).map((l) => JSON.parse(l));
+    const amendTurn = newEntries.find((e) => e.type === "turn" && e.content === "amend");
+    assert.ok(amendTurn, "amend must produce a turn entry in session-log.jsonl, the same as every other tool");
+  });
+
+  // wrapTool increments turnCounter once before calling the wrapped implementation. amend's own body
+  // used to increment it again, which would have double-counted every amend call once it went through
+  // wrapTool. The fix removed amend's own increment; this pins that it happens exactly once.
+  it("increments turnCounter exactly once per amend call, not twice", async () => {
+    const { toolsProvider, resolveSessionStateFromHistory } = await import("../src/toolsProvider");
+    const ctl: any = { getWorkingDirectory: () => TEST_DIR };
+    const state = await resolveSessionStateFromHistory(ctl, true);
+    const before = state.turnCounter;
+
+    const tools = await toolsProvider(ctl);
+    const amend = tools.find((t: any) => t.name === "amend");
+    await amend.implementation({ text: "Turn counter regression probe." });
+
+    assert.equal(state.turnCounter, before + 1, "amend must advance the turn counter by exactly one");
+  });
+
   it("should reject passive handoffs via amend before turn cap", async () => {
     const { toolsProvider } = await import("../src/toolsProvider");
     const tools = await toolsProvider(makeCtl({ maxOrchestratorTurns: 50 }));
