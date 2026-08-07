@@ -38,6 +38,7 @@ It doesn't pretend local models behave like hosted frontier systems — it makes
 | **Response control** | `amend` |
 | **Planning** | `create_plan`, `update_plan_step`, `get_plan` — structured multi-step execution, enforced before `amend` can close out |
 | **Autonomy** | `vibe_bridge` — self-recalling autonomous loop for keep-alive sessions |
+| **Debugging** | `debug_attach_target`, `debug_capture_state`, `debug_execute_interaction`, `debug_apply_hotfix` — drive a running app over Chrome DevTools Protocol |
 
 ## Plan Execution
 
@@ -92,9 +93,9 @@ In LM Studio plugin settings (`tools.*`):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `tools.maxEffectiveContextTokens` | number | `0` | Optional hard cap on the budgeting window. `0` = use the model's actual loaded context length (read automatically). Raise it only if your machine can't sustain even the configured length. |
-| `tools.reasoningEffort` | select | `off` | Calibrates model thinking: `off`/`low`/`medium`/`high`, each level a distinct directive. gpt-oss uses native Harmony tiers (`off` floors to `low`, Harmony has no lower tier), Qwen uses the `/no_think`·`/think` switch with a graduated brief/moderate/thorough qualifier appended, others get a graduated natural-language nudge. |
-| `tools.compactionTriggerPercent` | number | `30` | How full the context gets (% of the loaded window) before vibeLM auto-compacts older history into memory (10–90). Higher keeps more live context; lower compacts earlier. |
+| `tools.maxOrchestratorTurns` | number | `50` | Hard cap on how many tool turns the agent can use before it must stop and respond (0–100). `0` disables the cap. |
+| `tools.contextLength` | number | `0` | Token budget used to decide when the session is running out of room. As it fills, the agent is told to call `compact_context` to summarize and shed history before the model hard-fails. Clamped to the loaded model's actual context length, so setting it higher than the model supports has no effect. `0` = use the model's own context length. |
+| `tools.reasoningEffort` | select | `off` | Calibrates model thinking: `off`/`low`/`medium`/`high`, each level a distinct directive. gpt-oss uses native Harmony tiers, Qwen uses the `/no_think`·`/think` switch, others get an equivalent natural-language directive. |
 | `tools.maxThinkingSteps` | number | `8` | Max prediction rounds per unattended `vibe_bridge` tick, so a model stuck reasoning without calling a tool can't run unbounded (1–50). |
 | `tools.vibe_bridge` | boolean | `false` | Enable the tool and auto-start it with the settings below |
 | `tools.vibe_bridge_prompt` | string | `"Check progress to reach your goal, if you are failing adjust trajectory."` | Default injection prompt |
@@ -102,6 +103,40 @@ In LM Studio plugin settings (`tools.*`):
 | `tools.vibe_bridge_maxDuration` | number | `21600` | Max total runtime in seconds (0=unlimited) |
 
 Each keep-alive tick can call only the curated tools that are also explicitly enabled in plugin settings (explore/list/read/write/append/search files, save/search memory, web fetch/search). `bash_terminal` is intentionally excluded from unattended ticks until it has a command allowlist (see Security below). Each tick is capped at `Max Thinking Steps` prediction rounds (default 8, configurable via `tools.maxThinkingSteps`) and a 3-minute timeout, so a model stuck reasoning without calling a tool is canceled and counted as a failed tick rather than blocking subsequent ticks indefinitely.
+
+## Debugging a Running App
+
+Four tools let the model inspect and drive a live application over the Chrome DevTools Protocol, so it can see what an app is actually doing instead of guessing from source.
+
+The target must already expose a CDP endpoint. For an Electron app or a Chromium browser that means launching it with a debug port:
+
+```bash
+open -a "Some App" --args --remote-debugging-port=19222
+curl -s http://localhost:19222/json | head   # should list a page target
+```
+
+```js
+debug_attach_target({ targetType: "web", identifier: "My App", cdpPort: 19222 })
+debug_capture_state({ includeDOM: true, domDepth: 2 })
+debug_execute_interaction({ action: "focus", selector: "textarea" })
+debug_apply_hotfix({ patchType: "css_inject", payload: "textarea { outline: 4px solid magenta; }" })
+```
+
+| Tool | Notes |
+|---|---|
+| `debug_attach_target` | `targetType` is `web`, `desktop` or `mobile`. `identifier` is a URL, page title, PID, binary path or bundle ID. `cdpPort` defaults to `9222`. Matching is exact — if the identifier matches no target, the call fails and lists what is available rather than silently attaching to the wrong app. |
+| `debug_capture_state` | Returns a compact page summary (title, url, headings, buttons, inputs, visible text), console logs and network errors. `includeDOM` (default `true`), `domDepth` (default `4`), `logTailLines` (default `50`), `includeScreenshot` (default **`false`**). |
+| `debug_execute_interaction` | `action` is `click`, `type`, `scroll`, `focus` or `key_combination`. Prefer `selector` over `coordinates`. A selector matching no element returns `ok: false` with the selector named. |
+| `debug_apply_hotfix` | `css_inject` only. Injects a `<style>` element, so a page reload reverts it. |
+
+Things worth knowing before you rely on it:
+
+- **Screenshots are off by default and should usually stay off.** On a real application a single screenshot ran to ~691,500 characters — roughly 173k tokens, far past most local context windows. Turn it on only for a small target.
+- **Keep `domDepth` small.** The full tree of a real app does not fit in context. `capture_state` walks shallower automatically if the requested depth is too large, and says so in `notes`.
+- **`css_inject` is the only hotfix.** Running arbitrary JavaScript, mutating the DOM directly and overriding environment variables are deliberately unsupported — edit the source with `write_file` and reload the target instead.
+- **Injected CSS still obeys the cascade.** The tool confirms the rule was injected, not that it won; a more specific rule in the app can outrank it.
+- **Desktop targets cannot be hotfixed** — `applyHotfix` returns an error pointing you at the source files.
+- Debug tools are excluded from unattended `vibe_bridge` ticks.
 
 ## How It Works
 
