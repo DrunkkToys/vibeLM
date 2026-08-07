@@ -3701,6 +3701,33 @@ export async function preprocessMessage(text: string, ctl?: PromptPreprocessorCo
   // directive was captured), so inject it whenever it's non-null.
   if (!rehydrationBlocks && !spine) return result;
   const preserved = [spine, ...(rehydrationBlocks ?? [])].filter(Boolean).join("\n\n");
-  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${preserved}\n\n[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]`;
+  const rehydrated = `${MANAGED_CONTEXT_MARKER}\n[Session resumed from saved state. Here is the previous context that was preserved:]\n\n${preserved}\n\n${resumeTrailerFor(text)}`;
   return result ? `${rehydrated}\n\n${result}` : rehydrated;
+}
+
+/**
+ * Trailer that closes the rehydration block.
+ *
+ * "Continue the step in progress, do not restart" is right when the user is waving the session on
+ * ("keep going", "next step", or an empty turn). It is wrong when they have asked for something
+ * specific: the pinned goal then sits above their message and outranks it.
+ *
+ * That produced a deadlock, reproduced live. The preprocessor forces `create_plan` on the first
+ * goal-like message; the model did the work but never called `update_plan_step`, so every step
+ * stayed `pending`; the plugin restarts between turns, so state reloads from disk and the spine
+ * re-pins on every turn. Three different follow-up prompts — one of them literally "Phase 1 is
+ * finished, do not summarise it again" — each produced a byte-identical reply re-reporting the
+ * first request, with zero tool calls. The only exit is `isCompletedPlan`, which needs an
+ * `update_plan_step` call the wedge itself prevents.
+ *
+ * So when the user has made a substantive request, the preserved state is demoted to reference
+ * material and the model is pointed at `update_plan_step` — which lets a finished-but-unmarked plan
+ * complete and stop pinning itself.
+ */
+export function resumeTrailerFor(text: string): string {
+  const trimmed = text.trim();
+  const wavingOn = trimmed.length === 0 || CONTINUATION_PATTERN.test(trimmed);
+  return wavingOn
+    ? "[If a step was in progress, continue it — do not restart. Otherwise proceed with the request below.]"
+    : "[The above is context only. The request below is the user's current instruction and takes priority over the earlier goal — do what it asks, not the earlier goal. If the earlier plan's steps are already finished, call update_plan_step to mark them done.]";
 }

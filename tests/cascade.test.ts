@@ -1949,6 +1949,44 @@ describe("debug tools", () => {
 // goal and its pending steps — plus "[If a step was in progress, continue it]" — ahead of every new
 // request. Reproduced live in LM Studio: a leftover three-step "survey src/" plan hijacked three
 // consecutive fresh chats across two models before its last step happened to be marked done.
+// A pinned plan used to close its block with "continue it — do not restart" no matter what the user
+// had just asked. Combined with steps the model never marked done and a plugin that restarts between
+// turns, that deadlocked a chat: three different follow-ups, one of them "Phase 1 is finished, do not
+// summarise it again", each returned a byte-identical reply re-reporting the first request.
+describe("resume trailer priority", () => {
+  const isContinueTrailer = (s: string) => s.startsWith("[If a step was in progress");
+
+  it("keeps continuing the plan when the user is just waving the session on", async () => {
+    const { resumeTrailerFor } = await import("../src/toolsProvider");
+    for (const t of ["keep going", "continue", "next step", "carry on", "go ahead"]) {
+      assert.equal(isContinueTrailer(resumeTrailerFor(t)), true, t);
+    }
+  });
+
+  it("demotes the pinned plan to context when the user asks for something specific", async () => {
+    const { resumeTrailerFor } = await import("../src/toolsProvider");
+    // The exact prompts that deadlocked live.
+    const wedged = [
+      "Phase 2. Make exactly these six tool calls in order, then report each result: 1) write_file",
+      "Phase 1 is finished, do not summarise it again. Execute Phase 2 NOW by actually calling the tools.",
+      "What is 17 multiplied by 23?",
+    ];
+    for (const t of wedged) {
+      const out = resumeTrailerFor(t);
+      assert.equal(isContinueTrailer(out), false, t);
+      assert.match(out, /takes priority over the earlier goal/);
+      // Points at the call that lets a finished-but-unmarked plan complete and stop pinning.
+      assert.match(out, /update_plan_step/);
+    }
+  });
+
+  it("treats an empty or whitespace-only turn as waving on, not as a new request", async () => {
+    const { resumeTrailerFor } = await import("../src/toolsProvider");
+    assert.equal(isContinueTrailer(resumeTrailerFor("")), true);
+    assert.equal(isContinueTrailer(resumeTrailerFor("   \n\t ")), true);
+  });
+});
+
 describe("stale plan carry-forward", () => {
   // The size-ratio guard infers conversation identity from message length, so a long first message
   // in a new chat after a short previous chat reads as "same conversation". These are the exact live
